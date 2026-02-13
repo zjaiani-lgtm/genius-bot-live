@@ -1,3 +1,4 @@
+# main.py
 import os
 import time
 import logging
@@ -38,10 +39,34 @@ def _pick_symbols() -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _excel_boot_check(excel_path: str):
+    exists = os.path.exists(excel_path)
+    log.info(f"EXCEL_CHECK | exists={exists} path={excel_path}")
+
+    if not exists:
+        return
+
+    try:
+        size = os.path.getsize(excel_path)
+        log.info(f"EXCEL_CHECK | size_bytes={size}")
+
+        with open(excel_path, "rb") as f:
+            head = f.read(32)
+
+        log.info(f"EXCEL_CHECK | head={head!r}")
+
+        # .xlsx/.xlsm should be a zip container, usually starts with PK
+        if not head.startswith(b"PK"):
+            # Common Git LFS pointer starts with text "version https://git-lfs.github.com/spec/v1"
+            # or sometimes other text headers.
+            log.warning("EXCEL_CHECK_WARN | file does not look like a real .xlsx/.xlsm (missing 'PK' zip header).")
+    except Exception as e:
+        log.warning(f"EXCEL_CHECK_WARN | could not inspect file: {e}")
+
+
 def _calc_amount(exchange, symbol: str, quote_per_trade: float) -> float:
     """
     Simple sizing: amount = quote_per_trade / last_price
-    Falls back to a conservative default if price fetch fails.
     """
     try:
         t = exchange.fetch_ticker(symbol)
@@ -52,7 +77,7 @@ def _calc_amount(exchange, symbol: str, quote_per_trade: float) -> float:
     except Exception as e:
         log.warning(f"SIZING_WARN | symbol={symbol} err={e}")
 
-    # fallback (very conservative; adjust if needed)
+    # fallback conservative amount
     return 0.001
 
 
@@ -68,7 +93,11 @@ def main():
     log.info(f"BOOT | RUN_MODE={run_mode} AUTO_TRADING={auto_trading} LOOP_SECONDS={loop_seconds} EXCEL={excel_path}")
     log.info(f"BOOT | SYMBOLS={symbols} BOT_QUOTE_PER_TRADE={quote_per_trade}")
 
+    _excel_boot_check(excel_path)
+
     reader = ExcelReader(excel_path)
+
+    # This will now throw more accurate errors if engine missing or file invalid
     validate_schema(reader)
 
     # Exchange selection
@@ -77,6 +106,7 @@ def main():
         api_secret = _env("BINANCE_API_SECRET")
         if not api_key or not api_secret:
             raise RuntimeError("LIVE mode requires BINANCE_API_KEY and BINANCE_API_SECRET")
+
         exchange = create_exchange(api_key, api_secret)
     else:
         exchange = VirtualWallet()
@@ -114,11 +144,11 @@ def main():
             # If Excel provides SYMBOL use it, else run across BOT_SYMBOLS
             target_symbols = [decision.get("SYMBOL")] if decision.get("SYMBOL") else symbols
 
-            # Execute
             if action in ("BUY", "SELL") and auto_trading:
                 for sym in target_symbols:
                     if not sym:
                         continue
+
                     amount = _calc_amount(exchange, sym, quote_per_trade)
                     if amount <= 0:
                         log.warning(f"SKIP | symbol={sym} amount_invalid={amount}")
