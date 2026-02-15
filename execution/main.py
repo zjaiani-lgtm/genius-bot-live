@@ -9,30 +9,8 @@ from execution.db.repository import get_system_state, update_system_state, log_e
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
-from execution.genius_safe_config_loader import load_config_from_excel
-
 
 logger = logging.getLogger("gbm")
-# === SAFE AUTO-WIRE CONFIG ===
-from pathlib import Path
-
-try:
-    EXCEL_PATH = Path(__file__).resolve().parents[1] / \
-        "DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY_HIGH_ALPHA_AUTOWIRE.xlsx"
-
-    config_auto = load_config_from_excel(str(EXCEL_PATH))
-
-    RISK_PER_TRADE = config_auto["RISK_PER_TRADE"]
-    AI_BUY_MIN = config_auto["AI_CONFIDENCE_BUY_MIN"]
-    AI_SELL_MIN = config_auto["AI_CONFIDENCE_SELL_MIN"]
-
-    logger.info(
-        f"AUTO_WIRE | risk={RISK_PER_TRADE} "
-        f"buy_min={AI_BUY_MIN} sell_min={AI_SELL_MIN}"
-    )
-
-except Exception as e:
-    logger.error(f"AUTO_WIRE failed: {e}")
 
 
 def _bootstrap_state_if_needed() -> None:
@@ -160,5 +138,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
