@@ -9,6 +9,8 @@ from execution.db.repository import get_system_state, update_system_state, log_e
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
+from execution.genius_safe_config_loader import load_config_from_excel
+
 
 logger = logging.getLogger("gbm")
 
@@ -138,3 +140,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
