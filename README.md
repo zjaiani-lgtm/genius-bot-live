@@ -1,4 +1,4 @@
-# GENIUS BOT MAN — Execution Worker
+# genius-bot-live — Execution Worker
 
 This repository contains ONLY the Execution Layer.
 
