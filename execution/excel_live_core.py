@@ -123,8 +123,15 @@ class ExcelLiveCore:
         volconf_w = w.get("volume confirmation", 0.15)
         struct_w = w.get("structure validation", 0.20)
 
-        # map risk_state to numeric (OK=1, REDUCE=0.5, KILL=0)
-        risk_num = 1.0 if inp.risk_state == "OK" else (0.5 if inp.risk_state == "REDUCE" else 0.0)
+        # --- INSTITUTIONAL RISK REBALANCE ---
+# OK = full risk
+# REDUCE = moderated (was too punitive before)
+# KILL = hard stop
+risk_num = (
+    1.0 if inp.risk_state == "OK"
+    else (0.7 if inp.risk_state == "REDUCE" else 0.0)
+)
+
 
         # map volatility to numeric (LOW=0.8, NORMAL=1.0, EXTREME=0.0)
         vol_num = 1.0 if inp.volatility_regime == "NORMAL" else (0.8 if inp.volatility_regime == "LOW" else 0.0)
