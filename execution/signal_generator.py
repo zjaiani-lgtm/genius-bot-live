@@ -14,22 +14,63 @@ from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
 
-TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m")
-CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
-COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
+# -----------------------------
+# ENV HELPERS
+# -----------------------------
+def _env_str(*keys: str, default: str = "") -> str:
+    for k in keys:
+        v = os.getenv(k)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
 
-ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
+
+def _env_int(*keys: str, default: int) -> int:
+    s = _env_str(*keys, default=str(default))
+    try:
+        return int(s)
+    except Exception:
+        return default
+
+
+def _env_float(*keys: str, default: float) -> float:
+    s = _env_str(*keys, default=str(default))
+    try:
+        return float(s)
+    except Exception:
+        return default
+
+
+def _env_bool(*keys: str, default: bool = False) -> bool:
+    s = _env_str(*keys, default=("true" if default else "false")).lower()
+    return s in ("1", "true", "yes", "y", "on")
+
+
+# -----------------------------
+# CONFIG (supports both naming styles)
+# -----------------------------
+TIMEFRAME = _env_str("BOT_TIMEFRAME", "TIMEFRAME", default="15m")
+CANDLE_LIMIT = _env_int("BOT_CANDLE_LIMIT", "CANDLE_LIMIT", default=80)
+COOLDOWN_SECONDS = _env_int("BOT_SIGNAL_COOLDOWN_SECONDS", "BOT_COOLDOWN_SECONDS", default=180)
+
+# Your env uses AUTO_TRADING=true; legacy uses ALLOW_LIVE_SIGNALS=true
+ALLOW_LIVE_SIGNALS = _env_bool("ALLOW_LIVE_SIGNALS", "AUTO_TRADING", default=False)
 
 # USDT per trade (prevents NOTIONAL issues when you size in quote)
-BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
+BOT_QUOTE_PER_TRADE = _env_float("BOT_QUOTE_PER_TRADE", default=15.0)
 
-BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
+BLOCK_SIGNALS_WHEN_ACTIVE_OCO = _env_bool("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", default=True)
 
-GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
-GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
+GEN_DEBUG = _env_bool("GEN_DEBUG", default=True)
+GEN_LOG_EVERY_TICK = _env_bool("GEN_LOG_EVERY_TICK", default=True)
+XRAY_DEBUG = _env_bool("XRAY_DEBUG", default=True)  # turn off if you want
 
-# ---- Excel model path (sanitized) ----
-EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
+# ---- Excel model path (supports EXCEL_MODEL_PATH and your EXCEL_PATH) ----
+EXCEL_MODEL_PATH = _env_str(
+    "EXCEL_MODEL_PATH",
+    "EXCEL_PATH",
+    default="/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
+).strip()
 
 # sanitize common misconfig like: EXCEL_MODEL_PATH=EXCEL_MODEL_PATH=/opt/render/...xlsx
 if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
@@ -39,9 +80,8 @@ _last_emit_ts: float = 0.0
 _last_signature: Optional[Tuple[str, str]] = None  # reserved (if you later want de-dup)
 
 # ---- Exchange (Binance) ----
-# For public fetch_ohlcv, keys are not required, but for LIVE execution elsewhere they usually are.
-BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
+BINANCE_API_KEY = _env_str("BINANCE_API_KEY", default="")
+BINANCE_API_SECRET = _env_str("BINANCE_API_SECRET", default="")
 
 EXCHANGE = ccxt.binance({
     "enableRateLimit": True,
@@ -58,12 +98,7 @@ def _now_utc_iso() -> str:
 
 
 def _parse_symbols() -> List[str]:
-    raw = os.getenv("BOT_SYMBOLS", "").strip()
-    if not raw:
-        raw = os.getenv("SYMBOL_WHITELIST", "").strip()
-    if not raw:
-        raw = os.getenv("BOT_SYMBOL", "BTC/USDT").strip()
-
+    raw = _env_str("BOT_SYMBOLS", "SYMBOL_WHITELIST", "BOT_SYMBOL", default="BTC/USDT")
     syms = []
     for s in raw.split(","):
         s = s.strip()
@@ -318,6 +353,24 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"last={last:.6f} ma20={ma20:.6f} outbox={outbox_path}"
             )
 
+            # ===== STRATEGY X-RAY (SAFE) =====
+            if XRAY_DEBUG:
+                try:
+                    logger.info(
+                        "[XRAY] symbol=%s conf=%.3f trend=%.3f volScore=%.3f volReg=%s risk=%s strat=%s activeOCO=%s allowLive=%s",
+                        symbol,
+                        float(conf),
+                        float(trend),
+                        float(vol_score),
+                        vol_reg,
+                        risk,
+                        decision.get("active_strategy"),
+                        str(active_oco),
+                        str(ALLOW_LIVE_SIGNALS),
+                    )
+                except Exception as e:
+                    logger.exception("[XRAY] FAIL | symbol=%s err=%s", symbol, e)
+
         # Protective SELL if active OCO and risk is KILL
         if active_oco and risk == "KILL":
             signal_id = str(uuid.uuid4())
@@ -352,7 +405,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # Safety: don't emit live trades if not allowed
         if not ALLOW_LIVE_SIGNALS:
             if GEN_DEBUG:
-                logger.info(f"[GEN] BLOCKED_BY_ENV | symbol={symbol} reason=ALLOW_LIVE_SIGNALS=false")
+                logger.info(f"[GEN] BLOCKED_BY_ENV | symbol={symbol} reason=ALLOW_LIVE_SIGNALS/AUTO_TRADING=false")
             continue
 
         # build TRADE signal
@@ -384,7 +437,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 # -----------------------------
 # COMPATIBILITY ENTRYPOINTS
 # -----------------------------
-
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     """
     Backwards-compatible entrypoint expected by bootstrap:
