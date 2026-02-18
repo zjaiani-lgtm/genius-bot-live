@@ -179,10 +179,36 @@ risk_num = (
         volband_ok = self._vol_allowed(inp.volatility_regime)
 
         # "Active Strategy" (minimal mapping): YES if core gates mostly OK
-        active_strategy = "YES" if (trend_ok and struct_ok and vol_ok and conf_ok and risk_ok and volband_ok) else "NO"
+       # --- SOFT STRATEGY GATE (institutional) ---
+gate_components = [
+    trend_ok,
+    struct_ok,
+    vol_ok,
+    conf_ok,
+    risk_ok,
+    volband_ok,
+]
+
+gate_score = sum(1.0 for g in gate_components if g) / len(gate_components)
+
+# HARD PASS still strongest
+if gate_score >= 0.84:
+    active_strategy = "YES"
+elif gate_score >= 0.67 and ai_score >= 0.52:
+    active_strategy = "YES"
+else:
+    active_strategy = "NO"
+
 
         # Mirrors: IF(AND(B2="ALLOW",C2="YES",A2>0.6),"EXECUTE","STAND_BY")
-        final_trade_decision = "EXECUTE" if (macro_gate == "ALLOW" and active_strategy == "YES" and ai_score > 0.60) else "STAND_BY"
+        # --- ADAPTIVE EXECUTION THRESHOLD ---
+AI_EXEC_THRESHOLD = 0.55  # was 0.60 (too restrictive)
+
+final_trade_decision = "EXECUTE" if (
+    macro_gate == "ALLOW"
+    and active_strategy == "YES"
+    and ai_score > AI_EXEC_THRESHOLD
+) else "STAND_BY"
 
         return {
             "ai_score": ai_score,
