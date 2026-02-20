@@ -20,13 +20,16 @@ COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
 
-# USDT per trade (prevents NOTIONAL issues when you size in quote)
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
 # ---- Risk/Edge gates ----
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
+# FIX: default lowered to 0.45 for 15m reality (still overrideable via env)
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.45"))
+
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.70"))
+
+# FIX: default lowered to match your core conf math (0.65 typical)
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.64"))
 
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
@@ -34,26 +37,23 @@ ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
+# FIX: relax ATR vs TP sanity factor (0.75 -> 0.50)
+ATR_TO_TP_SANITY_FACTOR = float(os.getenv("ATR_TO_TP_SANITY_FACTOR", "0.50"))
+
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
-
-# Extra verbosity toggles (safe defaults)
 GEN_LOG_REASONS = os.getenv("GEN_LOG_REASONS", "true").strip().lower() == "true"
 GEN_LOG_LOCAL_GATES = os.getenv("GEN_LOG_LOCAL_GATES", "true").strip().lower() == "true"
 
-# ---- Excel model path ----
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
-
-# sanitize common misconfig like: EXCEL_MODEL_PATH=EXCEL_MODEL_PATH=/opt/render/...xlsx
 if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
     EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
 
 _last_emit_ts: float = 0.0
-_last_signature: Optional[Tuple[str, str]] = None  # reserved (if you later want de-dup)
+_last_signature: Optional[Tuple[str, str]] = None
 
-# ---- Exchange (Binance) ----
 BINANCE_API_KEY = os.getenv("BINANCE_API_KEY", "").strip()
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "").strip()
 
@@ -63,7 +63,6 @@ EXCHANGE = ccxt.binance({
     "secret": BINANCE_API_SECRET,
 })
 
-# Load Excel core once
 _CORE: Optional[ExcelLiveCore] = None
 
 
@@ -94,29 +93,20 @@ def _has_active_oco(symbol: str) -> bool:
     try:
         return has_active_oco_for_symbol(symbol)
     except Exception as e:
-        # safe default: assume active_oco to avoid uncontrolled trades
         logger.warning(f"[GEN] ACTIVE_OCO_CHECK_FAIL | symbol={symbol} err={e} -> assume active_oco=True")
         return True
 
 
 def _resolve_excel_path(env_path: str) -> str:
-    """
-    Resolve excel file path robustly:
-    - uses env_path if exists
-    - falls back to /var/data and /opt/render assets
-    - provides strong debug context if nothing found
-    """
     candidates = [
         env_path,
         "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
         "/opt/render/project/src/assets/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
     ]
-
     for p in candidates:
         if p and os.path.exists(p):
             return p
 
-    # strong debug info
     try:
         assets_list = os.listdir("/opt/render/project/src/assets")
     except Exception:
@@ -128,8 +118,7 @@ def _resolve_excel_path(env_path: str) -> str:
         var_data_list = []
 
     raise FileNotFoundError(
-        f"EXCEL_MODEL_NOT_FOUND | env={env_path} | "
-        f"assets={assets_list} | var_data={var_data_list}"
+        f"EXCEL_MODEL_NOT_FOUND | env={env_path} | assets={assets_list} | var_data={var_data_list}"
     )
 
 
@@ -138,12 +127,10 @@ def _core() -> ExcelLiveCore:
     if _CORE is None:
         resolved = _resolve_excel_path(EXCEL_MODEL_PATH)
         logger.info(
-            f"[GEN] EXCEL_PATH | env={EXCEL_MODEL_PATH} resolved={resolved} "
-            f"exists_env={os.path.exists(EXCEL_MODEL_PATH)}"
+            f"[GEN] EXCEL_PATH | env={EXCEL_MODEL_PATH} resolved={resolved} exists_env={os.path.exists(EXCEL_MODEL_PATH)}"
         )
         _CORE = ExcelLiveCore(resolved)
         logger.info(f"[GEN] EXCEL_CORE_LOADED | path={resolved}")
-        # print core version if present
         try:
             v = getattr(__import__("execution.excel_live_core", fromlist=["CORE_VERSION"]), "CORE_VERSION", None)
             if v:
@@ -190,7 +177,6 @@ def _vol_regime(atr_pct: float) -> str:
 
 
 def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
-    """Fee-aware edge gate."""
     if atr_pct < MIN_MOVE_PCT:
         return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
 
@@ -205,15 +191,19 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
-    if atr_pct < (assumed_gross_edge * 0.75):
-        return False, f"ATR_BELOW_TP atr%={atr_pct:.2f} < 0.75*TP_PCT={assumed_gross_edge*0.75:.2f}"
+    # FIX: relax feasibility requirement
+    if atr_pct < (assumed_gross_edge * ATR_TO_TP_SANITY_FACTOR):
+        return False, (
+            f"ATR_BELOW_TP atr%={atr_pct:.2f} < "
+            f"{ATR_TO_TP_SANITY_FACTOR:.2f}*TP_PCT={assumed_gross_edge*ATR_TO_TP_SANITY_FACTOR:.2f}"
+        )
 
     return True, "OK"
 
 
 def _trend_strength(last: float, ma20: float) -> float:
     gap_pct = _pct(last, ma20)
-    x = (gap_pct / 1.0)  # 1% scale
+    x = (gap_pct / 1.0)
     return max(0.0, min(1.0, 0.5 + (x * 0.4)))
 
 
@@ -229,13 +219,17 @@ def _structure_ok(closes: List[float]) -> bool:
 
 
 def _volume_score(vols: List[float]) -> float:
+    """
+    FIX: use average of last 3 volumes (smoother, less noisy),
+    so we don't get permanently tiny scores when last candle is thin.
+    """
     if len(vols) < 20:
         return 0.0
-    v_last = vols[-1]
-    v_avg = sum(vols[-20:]) / 20.0
-    if v_avg <= 0:
+    v_last3 = sum(vols[-3:]) / 3.0
+    v_avg20 = sum(vols[-20:]) / 20.0
+    if v_avg20 <= 0:
         return 0.0
-    ratio = v_last / v_avg
+    ratio = v_last3 / v_avg20
     return max(0.0, min(1.0, ratio / 2.0))
 
 
@@ -248,7 +242,6 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
     cond1 = 1.0 if last > ma20 else 0.0
     cond2 = 1.0 if last > prev else 0.0
     cond3 = 1.0 if atrp < 2.0 else 0.0
-
     return (0.45 * cond1) + (0.35 * cond2) + (0.20 * cond3)
 
 
@@ -272,11 +265,7 @@ def _emit(signal: Dict[str, Any], outbox_path: str) -> None:
 
 
 def _get_outbox_path() -> str:
-    return (
-        os.getenv("OUTBOX_PATH")
-        or os.getenv("SIGNAL_OUTBOX_PATH")
-        or "/var/data/signal_outbox.json"
-    )
+    return os.getenv("OUTBOX_PATH") or os.getenv("SIGNAL_OUTBOX_PATH") or "/var/data/signal_outbox.json"
 
 
 def _log_local_gates(symbol: str, *, active_oco: bool, cooldown_ok: bool, allow_live: bool,
@@ -292,11 +281,6 @@ def _log_local_gates(symbol: str, *, active_oco: bool, cooldown_ok: bool, allow_
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
-    """
-    Excel Live Core based generator:
-    - If no active OCO: emits TRADE only when final_trade_decision == EXECUTE.
-    - If active OCO: can emit SELL if risk_state == KILL (protective override).
-    """
     outbox_path = _get_outbox_path()
 
     cd_ok = _cooldown_ok()
@@ -337,7 +321,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         vol_score = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv)
 
-        # First pass ai_score without risk (risk uses ai_score)
+        # First pass ai_score without risk
         tmp_inp = CoreInputs(
             trend_strength=trend,
             structure_ok=struct_ok,
@@ -369,7 +353,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"last={last:.6f} ma20={ma20:.6f} outbox={outbox_path}"
             )
 
-        # ✅ THIS IS THE KEY: print culprit booleans + thresholds
         if GEN_DEBUG and GEN_LOG_REASONS:
             try:
                 logger.info(f"[GEN] STRAT_REASONS | symbol={symbol} reasons={decision.get('reasons')}")
@@ -399,9 +382,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             _emit(sig, outbox_path)
             return sig
 
-        # If active OCO → we do not open new TRADE (risk-first)
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
-            # still log gates to understand why no new trades happen
             ma_gap_abs = abs(_pct(last, ma20))
             ok_edge, edge_reason = _edge_ok(atrp)
             _log_local_gates(
@@ -416,7 +397,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             continue
 
-        # TRADE only if final decision says EXECUTE
         if decision["final_trade_decision"] != "EXECUTE":
             ma_gap_abs = abs(_pct(last, ma20))
             ok_edge, edge_reason = _edge_ok(atrp)
@@ -432,114 +412,58 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             continue
 
-        # -----------------------------
-        # EXTRA LIVE GUARDS (fee-aware)
-        # -----------------------------
-
-        # 1) Avoid chop: require distance from MA
+        # EXTRA LIVE GUARDS
         ma_gap_abs = abs(_pct(last, ma20))
         if ma_gap_abs < MA_GAP_PCT:
             if GEN_DEBUG:
-                logger.info(
-                    f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}"
-                )
+                logger.info(f"[GEN] BLOCKED_BY_MA_GAP | symbol={symbol} gap%={ma_gap_abs:.3f} < MA_GAP_PCT={MA_GAP_PCT:.3f}")
             ok_edge, edge_reason = _edge_ok(atrp)
-            _log_local_gates(
-                symbol,
-                active_oco=active_oco,
-                cooldown_ok=True,
-                allow_live=ALLOW_LIVE_SIGNALS,
-                ma_gap_abs=ma_gap_abs,
-                conf=conf,
-                edge_ok=ok_edge,
-                edge_reason=edge_reason,
-            )
+            _log_local_gates(symbol, active_oco=active_oco, cooldown_ok=True, allow_live=ALLOW_LIVE_SIGNALS,
+                             ma_gap_abs=ma_gap_abs, conf=conf, edge_ok=ok_edge, edge_reason=edge_reason)
             continue
 
-        # 2) Confidence floor (extra check)
         if conf < BUY_CONFIDENCE_MIN:
             if GEN_DEBUG:
-                logger.info(
-                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
-                )
+                logger.info(f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}")
             ok_edge, edge_reason = _edge_ok(atrp)
-            _log_local_gates(
-                symbol,
-                active_oco=active_oco,
-                cooldown_ok=True,
-                allow_live=ALLOW_LIVE_SIGNALS,
-                ma_gap_abs=ma_gap_abs,
-                conf=conf,
-                edge_ok=ok_edge,
-                edge_reason=edge_reason,
-            )
+            _log_local_gates(symbol, active_oco=active_oco, cooldown_ok=True, allow_live=ALLOW_LIVE_SIGNALS,
+                             ma_gap_abs=ma_gap_abs, conf=conf, edge_ok=ok_edge, edge_reason=edge_reason)
             continue
 
-        # 3) Fee-aware edge gate
         ok_edge, edge_reason = _edge_ok(atrp)
         if not ok_edge:
             if GEN_DEBUG:
                 logger.info(f"[GEN] BLOCKED_BY_EDGE | symbol={symbol} reason={edge_reason}")
-            _log_local_gates(
-                symbol,
-                active_oco=active_oco,
-                cooldown_ok=True,
-                allow_live=ALLOW_LIVE_SIGNALS,
-                ma_gap_abs=ma_gap_abs,
-                conf=conf,
-                edge_ok=ok_edge,
-                edge_reason=edge_reason,
-            )
+            _log_local_gates(symbol, active_oco=active_oco, cooldown_ok=True, allow_live=ALLOW_LIVE_SIGNALS,
+                             ma_gap_abs=ma_gap_abs, conf=conf, edge_ok=ok_edge, edge_reason=edge_reason)
             continue
 
-        # Safety: don't emit live trades if not allowed
         if not ALLOW_LIVE_SIGNALS:
             if GEN_DEBUG:
                 logger.info(f"[GEN] BLOCKED_BY_ENV | symbol={symbol} reason=ALLOW_LIVE_SIGNALS=false")
-            _log_local_gates(
-                symbol,
-                active_oco=active_oco,
-                cooldown_ok=True,
-                allow_live=ALLOW_LIVE_SIGNALS,
-                ma_gap_abs=ma_gap_abs,
-                conf=conf,
-                edge_ok=ok_edge,
-                edge_reason=edge_reason,
-            )
+            _log_local_gates(symbol, active_oco=active_oco, cooldown_ok=True, allow_live=ALLOW_LIVE_SIGNALS,
+                             ma_gap_abs=ma_gap_abs, conf=conf, edge_ok=ok_edge, edge_reason=edge_reason)
             continue
 
-        # build TRADE signal
         signal_id = str(uuid.uuid4())
         sig = {
             "signal_id": signal_id,
             "ts_utc": _now_utc_iso(),
             "certified_signal": True,
             "final_verdict": "TRADE",
-            "meta": {
-                "source": "DYZEN_EXCEL_LIVE_CORE",
-                "symbol": symbol,
-                "decision": decision,
-            },
+            "meta": {"source": "DYZEN_EXCEL_LIVE_CORE", "symbol": symbol, "decision": decision},
             "execution": {
                 "symbol": symbol,
                 "direction": "LONG",
                 "entry": {"type": "MARKET"},
-                "quote_amount": BOT_QUOTE_PER_TRADE,  # size in USDT (helps NOTIONAL)
+                "quote_amount": BOT_QUOTE_PER_TRADE,
             }
         }
-
         _emit(sig, outbox_path)
         return sig
 
     return None
 
 
-# -----------------------------
-# COMPATIBILITY ENTRYPOINTS
-# -----------------------------
-
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
-    """
-    Backwards-compatible entrypoint expected by bootstrap.
-    """
     return generate_signal()
