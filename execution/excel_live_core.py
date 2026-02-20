@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import re
-import math
 from dataclasses import dataclass
 from typing import Any, Dict, Tuple, Optional
 
@@ -39,6 +38,20 @@ def _parse_threshold_cell(s: Any) -> Optional[float]:
     return float(m.group(1))
 
 
+def _env_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return default
+    return _safe_float(v, default)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 @dataclass
 class CoreInputs:
     trend_strength: float          # 0..1
@@ -59,6 +72,14 @@ class ExcelLiveCore:
     - WEIGHT_THRESHOLD_MATRIX (weights + thresholds)
     - LIVE_MACRO_RISK_GATE (ALLOW/BLOCK logic)
     - AI_MASTER_LIVE_DECISION (EXECUTE/STAND_BY logic)
+
+    FIX (2026-02-20):
+    - Adds a "soft" escape hatch for volume confirmation when AI is very strong.
+      Default behavior:
+        - volume_ok = volume_score >= vol_th
+      Soft override (enabled by default):
+        - if ai_score >= 0.75 and all other gates pass,
+          allow volume_score >= (vol_th - 0.10)
     """
 
     def __init__(self, workbook_path: str):
@@ -68,8 +89,21 @@ class ExcelLiveCore:
         # data_only=False because we DON'T rely on Excel formula calc.
         # We compute outputs ourselves.
         self.wb = openpyxl.load_workbook(workbook_path, data_only=False)
-
         self.weights, self.thresholds = self._load_weight_threshold_matrix()
+
+        # --- soft-volume override settings (ENV-configurable) ---
+        # Enable/disable the fix:
+        self.enable_soft_volume_override = _env_bool("ENABLE_SOFT_VOLUME_OVERRIDE", True)
+
+        # AI score required to allow soft override:
+        self.soft_volume_ai_min = _env_float("SOFT_VOLUME_AI_MIN", 0.75)
+
+        # How much to reduce volume threshold by, in score units (0..1):
+        # Example: vol_th=0.50, soften=0.10 => allow down to 0.40 when AI strong
+        self.soft_volume_relax = _env_float("SOFT_VOLUME_RELAX", 0.10)
+
+        # Optional: require volatility regime not EXTREME for override (safe default True)
+        self.soft_volume_require_volband = _env_bool("SOFT_VOLUME_REQUIRE_VOLBAND", True)
 
     def _load_weight_threshold_matrix(self) -> Tuple[Dict[str, float], Dict[str, Any]]:
         ws = self.wb["WEIGHT_THRESHOLD_MATRIX"]
@@ -89,7 +123,6 @@ class ExcelLiveCore:
             comp_str = str(comp).strip().lower()
             weights[comp_str] = _safe_float(w, 0.0)
 
-            # store raw threshold + parsed numeric if exists
             thresholds[comp_str] = {
                 "raw": th,
                 "num": _parse_threshold_cell(th),
@@ -115,7 +148,6 @@ class ExcelLiveCore:
         # Weighted sum based on matrix
         w = self.weights
 
-        # Note: keys here match (lower-cased) Component names in the matrix.
         trend_w = w.get("trend strength", 0.25)
         vol_w = w.get("volatility regime", 0.10)
         conf_w = w.get("confidence score", 0.15)
@@ -140,7 +172,6 @@ class ExcelLiveCore:
             vol_num * vol_w
         )
 
-        # normalize to 0..1 (weights sum already ~1, but clamp anyway)
         return _clamp(total, 0.0, 1.0)
 
     def decide(self, inp: CoreInputs) -> Dict[str, Any]:
@@ -163,15 +194,36 @@ class ExcelLiveCore:
         vol_th = (self.thresholds.get("volume confirmation", {}) or {}).get("num", 0.50) or 0.50
         conf_th = (self.thresholds.get("confidence score", {}) or {}).get("num", 0.64) or 0.64
 
-        # Gates
+        # Base gates
         trend_ok = inp.trend_strength >= float(trend_th)
-        vol_ok = inp.volume_score >= float(vol_th)
         conf_ok = inp.confidence_score >= float(conf_th)
         struct_ok = bool(inp.structure_ok)
         risk_ok = inp.risk_state != "KILL"
         volband_ok = self._vol_allowed(inp.volatility_regime)
 
-        # "Active Strategy" (minimal mapping): YES if core gates mostly OK
+        # --- Volume gate (strict) ---
+        vol_ok_strict = inp.volume_score >= float(vol_th)
+
+        # --- Soft override logic (fix) ---
+        vol_ok_soft = False
+        soft_vol_th = float(vol_th)
+
+        if self.enable_soft_volume_override:
+            soft_vol_th = _clamp(float(vol_th) - float(self.soft_volume_relax), 0.0, 1.0)
+
+            # Soft override allowed only when:
+            # - AI score very strong
+            # - other core gates pass (so we do NOT open floodgates)
+            # - optionally require volband_ok (default True)
+            other_gates_ok = (trend_ok and conf_ok and struct_ok and risk_ok)
+            volband_req_ok = (volband_ok if self.soft_volume_require_volband else True)
+
+            if other_gates_ok and volband_req_ok and ai_score >= float(self.soft_volume_ai_min):
+                vol_ok_soft = inp.volume_score >= soft_vol_th
+
+        vol_ok = vol_ok_strict or vol_ok_soft
+
+        # "Active Strategy"
         active_strategy = "YES" if (trend_ok and struct_ok and vol_ok and conf_ok and risk_ok and volband_ok) else "NO"
 
         # Mirrors: IF(AND(B2="ALLOW",C2="YES",A2>0.6),"EXECUTE","STAND_BY")
@@ -184,16 +236,31 @@ class ExcelLiveCore:
             "final_trade_decision": final_trade_decision,
             "reasons": {
                 "trend_strength": inp.trend_strength,
+                "trend_th": float(trend_th),
                 "trend_ok": trend_ok,
+
                 "structure_ok": struct_ok,
+
                 "volume_score": inp.volume_score,
+                "volume_th": float(vol_th),
+                "volume_th_soft": float(soft_vol_th),
+                "volume_ok_strict": vol_ok_strict,
+                "volume_ok_soft": vol_ok_soft,
                 "volume_ok": vol_ok,
+
                 "confidence_score": inp.confidence_score,
+                "conf_th": float(conf_th),
                 "confidence_ok": conf_ok,
+
                 "risk_state": inp.risk_state,
                 "risk_ok": risk_ok,
+
                 "volatility_regime": inp.volatility_regime,
                 "volband_ok": volband_ok,
+
+                "soft_volume_override_enabled": bool(self.enable_soft_volume_override),
+                "soft_volume_ai_min": float(self.soft_volume_ai_min),
+                "soft_volume_relax": float(self.soft_volume_relax),
+                "soft_volume_require_volband": bool(self.soft_volume_require_volband),
             }
         }
-
