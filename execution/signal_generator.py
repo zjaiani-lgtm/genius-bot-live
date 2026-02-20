@@ -24,13 +24,8 @@ BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 # -----------------------------
 # SAFETY / EDGE GATES
 # -----------------------------
-# Your env currently has MIN_MOVE_PCT=0.70 (too strict for 15m on majors).
-# FIX: default lowered to 0.45.
 DEFAULT_MIN_MOVE_PCT = 0.45
-
-# If true -> ignore env MIN_MOVE_PCT and use DEFAULT_MIN_MOVE_PCT (emergency rescue switch)
 HARD_OVERRIDE_MIN_MOVE_PCT = os.getenv("HARD_OVERRIDE_MIN_MOVE_PCT", "false").strip().lower() == "true"
-
 if HARD_OVERRIDE_MIN_MOVE_PCT:
     MIN_MOVE_PCT = DEFAULT_MIN_MOVE_PCT
 else:
@@ -55,13 +50,19 @@ GEN_LOG_REASONS = os.getenv("GEN_LOG_REASONS", "true").strip().lower() == "true"
 GEN_LOG_LOCAL_GATES = os.getenv("GEN_LOG_LOCAL_GATES", "true").strip().lower() == "true"
 
 # -----------------------------
-# VOLUME RECALIBRATION (KEY FIX)
+# VOLUME RECALIBRATION (already working for SOL)
 # -----------------------------
-# Raw volume_score you see: 0.10..0.24. Excel expects 0.4/0.5 -> always False.
-# We rescale + floor to map "normal market" volumes into a usable 0..1 score.
-VOLUME_SCORE_SCALE = float(os.getenv("VOLUME_SCORE_SCALE", "2.5"))   # 2.0..4.0 typical
-VOLUME_SCORE_FLOOR = float(os.getenv("VOLUME_SCORE_FLOOR", "0.20"))  # 0.15..0.30 typical
+VOLUME_SCORE_SCALE = float(os.getenv("VOLUME_SCORE_SCALE", "2.5"))
+VOLUME_SCORE_FLOOR = float(os.getenv("VOLUME_SCORE_FLOOR", "0.20"))
 VOLUME_SCORE_CAP = float(os.getenv("VOLUME_SCORE_CAP", "1.00"))
+
+# -----------------------------
+# STRUCTURE SOFT OVERRIDE (NEW KEY FIX)
+# -----------------------------
+STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
+STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.68"))
+STRUCT_SOFT_MIN_MA_GAP = float(os.getenv("STRUCT_SOFT_MIN_MA_GAP", "0.25"))
+STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "2"))  # last N closes rising
 
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
 if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
@@ -222,7 +223,7 @@ def _trend_strength(last: float, ma20: float) -> float:
     return max(0.0, min(1.0, 0.5 + (x * 0.4)))
 
 
-def _structure_ok(closes: List[float]) -> bool:
+def _structure_ok_strict(closes: List[float]) -> bool:
     if len(closes) < 10:
         return False
     last = closes[-1]
@@ -231,6 +232,39 @@ def _structure_ok(closes: List[float]) -> bool:
     last5 = closes[-5:]
     last10 = closes[-10:]
     return (last > ma20) and (last > prev) and (sum(last5) / 5.0 > sum(last10) / 10.0)
+
+
+def _structure_ok_soft(closes: List[float], last: float, ma20: float, trend_strength: float) -> Tuple[bool, str]:
+    """
+    Soft structure override:
+    If strict structure fails but market is clearly trending and price is cleanly away from MA,
+    allow structure_ok=True to avoid perma-standby.
+
+    Returns: (ok, reason)
+    """
+    if not STRUCT_SOFT_OVERRIDE:
+        return False, "disabled"
+
+    ma_gap_abs = abs(_pct(last, ma20))
+    if trend_strength < STRUCT_SOFT_MIN_TREND:
+        return False, f"trend<{STRUCT_SOFT_MIN_TREND:.2f}"
+
+    if ma_gap_abs < STRUCT_SOFT_MIN_MA_GAP:
+        return False, f"ma_gap<{STRUCT_SOFT_MIN_MA_GAP:.2f}"
+
+    n = max(1, STRUCT_SOFT_REQUIRE_LAST_UP)
+    ok_up = True
+    for i in range(1, n + 1):
+        if len(closes) < (i + 1):
+            ok_up = False
+            break
+        if closes[-i] <= closes[-i - 1]:
+            ok_up = False
+            break
+    if not ok_up:
+        return False, f"last_up<{n}"
+
+    return True, f"SOFT_OK trend>={STRUCT_SOFT_MIN_TREND:.2f} ma_gap>={STRUCT_SOFT_MIN_MA_GAP:.2f} last_up={n}"
 
 
 def _volume_score_raw(vols: List[float]) -> float:
@@ -245,11 +279,6 @@ def _volume_score_raw(vols: List[float]) -> float:
 
 
 def _volume_score(vols: List[float]) -> float:
-    """
-    KEY FIX:
-    - compute raw score
-    - rescale + floor so Excel volume_ok isn't permanently false
-    """
     raw = _volume_score_raw(vols)
     scaled = raw * VOLUME_SCORE_SCALE
     floored = max(VOLUME_SCORE_FLOOR, scaled)
@@ -340,9 +369,20 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         vol_reg = _vol_regime(atrp)
 
         trend = _trend_strength(last, ma20)
-        struct_ok = _structure_ok(closes)
 
-        # KEY: use recalibrated volume score
+        # strict structure first
+        struct_ok = _structure_ok_strict(closes)
+
+        # SOFT structure override if strict fails
+        struct_soft_ok = False
+        struct_soft_reason = ""
+        if not struct_ok:
+            struct_soft_ok, struct_soft_reason = _structure_ok_soft(closes, last, ma20, trend)
+            if struct_soft_ok:
+                struct_ok = True
+                if GEN_DEBUG:
+                    logger.info(f"[GEN] STRUCT_OVERRIDE | symbol={symbol} applied=True reason={struct_soft_reason}")
+
         vol_score = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv)
 
@@ -383,7 +423,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             except Exception as e:
                 logger.warning(f"[GEN] STRAT_REASONS_FAIL | symbol={symbol} err={e}")
 
-        # Protective SELL if active OCO and risk is KILL
         if active_oco and risk == "KILL":
             signal_id = str(uuid.uuid4())
             sig = {
@@ -409,31 +448,15 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
             ma_gap_abs = abs(_pct(last, ma20))
             ok_edge, edge_reason = _edge_ok(atrp)
-            _log_local_gates(
-                symbol,
-                active_oco=active_oco,
-                cooldown_ok=True,
-                allow_live=ALLOW_LIVE_SIGNALS,
-                ma_gap_abs=ma_gap_abs,
-                conf=conf,
-                edge_ok=ok_edge,
-                edge_reason=edge_reason,
-            )
+            _log_local_gates(symbol, active_oco=active_oco, cooldown_ok=True, allow_live=ALLOW_LIVE_SIGNALS,
+                             ma_gap_abs=ma_gap_abs, conf=conf, edge_ok=ok_edge, edge_reason=edge_reason)
             continue
 
         if decision["final_trade_decision"] != "EXECUTE":
             ma_gap_abs = abs(_pct(last, ma20))
             ok_edge, edge_reason = _edge_ok(atrp)
-            _log_local_gates(
-                symbol,
-                active_oco=active_oco,
-                cooldown_ok=True,
-                allow_live=ALLOW_LIVE_SIGNALS,
-                ma_gap_abs=ma_gap_abs,
-                conf=conf,
-                edge_ok=ok_edge,
-                edge_reason=edge_reason,
-            )
+            _log_local_gates(symbol, active_oco=active_oco, cooldown_ok=True, allow_live=ALLOW_LIVE_SIGNALS,
+                             ma_gap_abs=ma_gap_abs, conf=conf, edge_ok=ok_edge, edge_reason=edge_reason)
             continue
 
         ma_gap_abs = abs(_pct(last, ma20))
