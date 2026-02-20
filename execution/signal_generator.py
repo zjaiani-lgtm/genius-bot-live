@@ -19,16 +19,24 @@ CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
 COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
-
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 
-# ---- Risk/Edge gates ----
-# FIX: default lowered to 0.45 for 15m reality (still overrideable via env)
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.45"))
+# -----------------------------
+# SAFETY / EDGE GATES
+# -----------------------------
+# Your env currently has MIN_MOVE_PCT=0.70 (too strict for 15m on majors).
+# FIX: default lowered to 0.45.
+DEFAULT_MIN_MOVE_PCT = 0.45
+
+# If true -> ignore env MIN_MOVE_PCT and use DEFAULT_MIN_MOVE_PCT (emergency rescue switch)
+HARD_OVERRIDE_MIN_MOVE_PCT = os.getenv("HARD_OVERRIDE_MIN_MOVE_PCT", "false").strip().lower() == "true"
+
+if HARD_OVERRIDE_MIN_MOVE_PCT:
+    MIN_MOVE_PCT = DEFAULT_MIN_MOVE_PCT
+else:
+    MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", str(DEFAULT_MIN_MOVE_PCT)))
 
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
-
-# FIX: default lowered to match your core conf math (0.65 typical)
 BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.64"))
 
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
@@ -37,7 +45,6 @@ ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
-# FIX: relax ATR vs TP sanity factor (0.75 -> 0.50)
 ATR_TO_TP_SANITY_FACTOR = float(os.getenv("ATR_TO_TP_SANITY_FACTOR", "0.50"))
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
@@ -46,6 +53,15 @@ GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
 GEN_LOG_REASONS = os.getenv("GEN_LOG_REASONS", "true").strip().lower() == "true"
 GEN_LOG_LOCAL_GATES = os.getenv("GEN_LOG_LOCAL_GATES", "true").strip().lower() == "true"
+
+# -----------------------------
+# VOLUME RECALIBRATION (KEY FIX)
+# -----------------------------
+# Raw volume_score you see: 0.10..0.24. Excel expects 0.4/0.5 -> always False.
+# We rescale + floor to map "normal market" volumes into a usable 0..1 score.
+VOLUME_SCORE_SCALE = float(os.getenv("VOLUME_SCORE_SCALE", "2.5"))   # 2.0..4.0 typical
+VOLUME_SCORE_FLOOR = float(os.getenv("VOLUME_SCORE_FLOOR", "0.20"))  # 0.15..0.30 typical
+VOLUME_SCORE_CAP = float(os.getenv("VOLUME_SCORE_CAP", "1.00"))
 
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
 if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
@@ -191,7 +207,6 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
-    # FIX: relax feasibility requirement
     if atr_pct < (assumed_gross_edge * ATR_TO_TP_SANITY_FACTOR):
         return False, (
             f"ATR_BELOW_TP atr%={atr_pct:.2f} < "
@@ -218,11 +233,7 @@ def _structure_ok(closes: List[float]) -> bool:
     return (last > ma20) and (last > prev) and (sum(last5) / 5.0 > sum(last10) / 10.0)
 
 
-def _volume_score(vols: List[float]) -> float:
-    """
-    FIX: use average of last 3 volumes (smoother, less noisy),
-    so we don't get permanently tiny scores when last candle is thin.
-    """
+def _volume_score_raw(vols: List[float]) -> float:
     if len(vols) < 20:
         return 0.0
     v_last3 = sum(vols[-3:]) / 3.0
@@ -231,6 +242,18 @@ def _volume_score(vols: List[float]) -> float:
         return 0.0
     ratio = v_last3 / v_avg20
     return max(0.0, min(1.0, ratio / 2.0))
+
+
+def _volume_score(vols: List[float]) -> float:
+    """
+    KEY FIX:
+    - compute raw score
+    - rescale + floor so Excel volume_ok isn't permanently false
+    """
+    raw = _volume_score_raw(vols)
+    scaled = raw * VOLUME_SCORE_SCALE
+    floored = max(VOLUME_SCORE_FLOOR, scaled)
+    return max(0.0, min(VOLUME_SCORE_CAP, floored))
 
 
 def _confidence_score(closes: List[float], ohlcv: List[List[float]]) -> float:
@@ -318,10 +341,11 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         trend = _trend_strength(last, ma20)
         struct_ok = _structure_ok(closes)
+
+        # KEY: use recalibrated volume score
         vol_score = _volume_score(vols)
         conf = _confidence_score(closes, ohlcv)
 
-        # First pass ai_score without risk
         tmp_inp = CoreInputs(
             trend_strength=trend,
             structure_ok=struct_ok,
@@ -412,7 +436,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             continue
 
-        # EXTRA LIVE GUARDS
         ma_gap_abs = abs(_pct(last, ma20))
         if ma_gap_abs < MA_GAP_PCT:
             if GEN_DEBUG:
