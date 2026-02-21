@@ -15,6 +15,11 @@ from execution.db.repository import (
     signal_id_already_executed,
     mark_signal_id_executed,
     has_active_oco_for_symbol,
+
+    # ✅ NEW (performance tracking)
+    open_trade,
+    get_trade,
+    close_trade,
 )
 
 from execution.kill_switch import is_kill_switch_active
@@ -65,10 +70,8 @@ class ExecutionEngine:
         self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.998"))
 
         # ---- New protective gates (Execution side) ----
-        # Spread gate: if too wide, MARKET entry gets eaten.
         self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.12"))  # 0.12% default
 
-        # Fee-aware net gate (Execution side)
         self.estimated_roundtrip_fee_pct = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
         self.estimated_slippage_pct = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
         self.min_net_profit_pct = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
@@ -140,7 +143,30 @@ class ExecutionEngine:
         return True, "OK"
 
     # ----------------------------
-    # OCO reconcile
+    # PnL helpers (NEW)
+    # ----------------------------
+    @staticmethod
+    def _exit_price_from_order(o: Dict[str, Any], fallback: float = 0.0) -> float:
+        try:
+            v = float(o.get("average") or o.get("price") or 0.0)
+            return v if v > 0 else float(fallback or 0.0)
+        except Exception:
+            return float(fallback or 0.0)
+
+    @staticmethod
+    def _calc_pnl(quote_in: float, entry: float, exitp: float, qty: float) -> Tuple[float, float]:
+        """
+        Approx realized PnL:
+          pnl_quote = (exit - entry) * qty
+          pnl_pct   = pnl_quote / quote_in * 100
+        (fees not included here; you can enhance later using order fee fields)
+        """
+        pnl_quote = (float(exitp) - float(entry)) * float(qty)
+        pnl_pct = (pnl_quote / float(quote_in) * 100.0) if float(quote_in) else 0.0
+        return float(pnl_quote), float(pnl_pct)
+
+    # ----------------------------
+    # OCO reconcile (UPDATED: closes trades)
     # ----------------------------
     def reconcile_oco(self) -> None:
         if self.mode not in ("LIVE", "TESTNET"):
@@ -179,19 +205,48 @@ class ExecutionEngine:
                     f"tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}"
                 )
 
+                # ---- SL filled ----
                 if sl_status in CLOSED:
                     set_oco_status(link_id, "CLOSED_SL")
+
+                    tr = get_trade(signal_id)
+                    exitp = self._exit_price_from_order(sl, fallback=float(sl_stop_price))
+
+                    if tr:
+                        # (signal_id, symbol, qty, quote_in, entry_price, opened_at, exit_price, closed_at, outcome, pnl_quote, pnl_pct)
+                        _, _, qty, quote_in, entry_price, *_ = tr
+                        pnl_quote, pnl_pct = self._calc_pnl(float(quote_in), float(entry_price), float(exitp), float(qty))
+                        close_trade(signal_id, exit_price=float(exitp), outcome="SL", pnl_quote=float(pnl_quote), pnl_pct=float(pnl_pct))
+                        log_event("TRADE_CLOSED", f"{signal_id} {symbol} SL exit={exitp} pnl_quote={pnl_quote:.4f} pnl_pct={pnl_pct:.3f}")
+                    else:
+                        log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} SL filled but trade row missing")
+
                     log_event("OCO_CLOSED", f"{signal_id} SL_FILLED sl={sl_order_id} tp={tp_order_id} tp_status={tp_status}")
                     continue
 
+                # ---- TP filled ----
                 if tp_status in CLOSED:
                     set_oco_status(link_id, "CLOSED_TP")
+
+                    tr = get_trade(signal_id)
+                    exitp = self._exit_price_from_order(tp, fallback=float(tp_price))
+
+                    if tr:
+                        _, _, qty, quote_in, entry_price, *_ = tr
+                        pnl_quote, pnl_pct = self._calc_pnl(float(quote_in), float(entry_price), float(exitp), float(qty))
+                        close_trade(signal_id, exit_price=float(exitp), outcome="TP", pnl_quote=float(pnl_quote), pnl_pct=float(pnl_pct))
+                        log_event("TRADE_CLOSED", f"{signal_id} {symbol} TP exit={exitp} pnl_quote={pnl_quote:.4f} pnl_pct={pnl_pct:.3f}")
+                    else:
+                        log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} TP filled but trade row missing")
+
                     log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id} sl_status={sl_status}")
                     continue
 
+                # One canceled but the other open: ignore (exchange might be processing)
                 if (tp_status in CANCELED and sl_status == "open") or (sl_status in CANCELED and tp_status == "open"):
                     continue
 
+                # Both canceled -> failed
                 if tp_status in CANCELED and sl_status in CANCELED:
                     set_oco_status(link_id, "FAILED")
                     log_event("OCO_FAILED", f"{signal_id} tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}")
@@ -606,6 +661,19 @@ class ExecutionEngine:
                 sl_limit_price=float(sl_limit_price),
                 amount=float(sell_amount),
             )
+
+            # ✅ NEW: record trade entry (for ROI/Winrate later)
+            try:
+                open_trade(
+                    signal_id=signal_id,
+                    symbol=str(symbol),
+                    qty=float(sell_amount),
+                    quote_in=float(quote_amount),
+                    entry_price=float(buy_avg),
+                )
+                log_event("TRADE_RECORDED", f"{signal_id} {symbol} entry={buy_avg} qty={sell_amount} quote_in={quote_amount}")
+            except Exception as e:
+                logger.warning(f"TRADE_RECORD_FAIL | id={signal_id} symbol={symbol} err={e}")
 
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
 
