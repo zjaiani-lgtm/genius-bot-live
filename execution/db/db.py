@@ -11,7 +11,7 @@ def init_db():
     conn = get_connection()
     cur = conn.cursor()
 
-    # positions
+    # positions (legacy)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS positions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,7 +71,7 @@ def init_db():
     )
     """)
 
-    # ✅ executed signals (idempotency) — DEDUPE BY signal_id
+    # executed signals (idempotency)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS executed_signals (
         signal_id TEXT PRIMARY KEY,
@@ -79,6 +79,24 @@ def init_db():
         action TEXT,
         symbol TEXT,
         executed_at TEXT NOT NULL
+    )
+    """)
+
+    # ✅ NEW: trades table (realized performance)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trades (
+        signal_id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        qty REAL NOT NULL,
+        quote_in REAL NOT NULL,
+        entry_price REAL NOT NULL,
+        opened_at TEXT NOT NULL,
+
+        exit_price REAL,
+        closed_at TEXT,
+        outcome TEXT,            -- TP / SL / MANUAL / UNKNOWN
+        pnl_quote REAL,          -- realized in quote currency approx
+        pnl_pct REAL             -- pnl_quote / quote_in * 100
     )
     """)
 
