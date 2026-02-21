@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional, Dict, Any, Tuple
 from execution.db.db import get_connection
 
 # ---------------- SYSTEM STATE ----------------
@@ -39,7 +40,7 @@ def update_system_state(status=None, startup_sync_ok=None, kill_switch=None):
     conn.commit()
     conn.close()
 
-# ---------------- POSITIONS ----------------
+# ---------------- POSITIONS (legacy) ----------------
 
 def get_open_positions():
     conn = get_connection()
@@ -174,11 +175,6 @@ def list_active_oco_links(limit: int = 50):
     return rows
 
 def has_active_oco_for_symbol(symbol: str) -> bool:
-    """
-    True თუ მოცემულ symbol-ზე (მაგ: BTC/USDT) არსებობს ACTIVE OCO.
-    ეს გვჭირდება multi-symbol გენერატორში, რომ 1 აქტიურმა OCO-მ
-    არ დაბლოკოს სხვა ქოინებზე სიგნალების გენერაცია.
-    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
@@ -225,3 +221,102 @@ def mark_signal_id_executed(signal_id: str, signal_hash: str = None, action: str
     )
     conn.commit()
     conn.close()
+
+# ---------------- TRADES (NEW) ----------------
+
+def open_trade(signal_id: str, symbol: str, qty: float, quote_in: float, entry_price: float):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO trades
+        (signal_id, symbol, qty, quote_in, entry_price, opened_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(signal_id),
+            str(symbol),
+            float(qty),
+            float(quote_in),
+            float(entry_price),
+            datetime.utcnow().isoformat()
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def get_trade(signal_id: str) -> Optional[Tuple]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT signal_id, symbol, qty, quote_in, entry_price, opened_at, exit_price, closed_at, outcome, pnl_quote, pnl_pct
+        FROM trades
+        WHERE signal_id = ?
+        LIMIT 1
+        """,
+        (str(signal_id),)
+    )
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+def close_trade(signal_id: str, exit_price: float, outcome: str, pnl_quote: float, pnl_pct: float):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE trades
+        SET exit_price=?, closed_at=?, outcome=?, pnl_quote=?, pnl_pct=?
+        WHERE signal_id=?
+        """,
+        (
+            float(exit_price),
+            datetime.utcnow().isoformat(),
+            str(outcome),
+            float(pnl_quote),
+            float(pnl_pct),
+            str(signal_id),
+        )
+    )
+    conn.commit()
+    conn.close()
+
+def get_trade_stats() -> Dict[str, Any]:
+    conn = get_connection()
+    cur = conn.cursor()
+
+    # only closed trades
+    cur.execute("SELECT COUNT(*), COALESCE(SUM(pnl_quote),0), COALESCE(SUM(quote_in),0) FROM trades WHERE closed_at IS NOT NULL")
+    n, pnl_sum, quote_sum = cur.fetchone()
+
+    cur.execute("SELECT COUNT(*) FROM trades WHERE closed_at IS NOT NULL AND pnl_quote > 0")
+    wins = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM trades WHERE closed_at IS NOT NULL AND pnl_quote < 0")
+    losses = cur.fetchone()[0]
+
+    cur.execute("SELECT COALESCE(SUM(pnl_quote),0) FROM trades WHERE closed_at IS NOT NULL AND pnl_quote > 0")
+    gross_profit = cur.fetchone()[0]
+
+    cur.execute("SELECT COALESCE(ABS(SUM(pnl_quote)),0) FROM trades WHERE closed_at IS NOT NULL AND pnl_quote < 0")
+    gross_loss = cur.fetchone()[0]
+
+    conn.close()
+
+    roi_pct = (float(pnl_sum) / float(quote_sum) * 100.0) if quote_sum else 0.0
+    winrate = (float(wins) / float(n) * 100.0) if n else 0.0
+    profit_factor = (float(gross_profit) / float(gross_loss)) if gross_loss else (float('inf') if gross_profit > 0 else 0.0)
+
+    return {
+        "closed_trades": int(n),
+        "wins": int(wins),
+        "losses": int(losses),
+        "winrate_pct": float(winrate),
+        "pnl_quote_sum": float(pnl_sum),
+        "quote_in_sum": float(quote_sum),
+        "roi_pct": float(roi_pct),
+        "gross_profit": float(gross_profit),
+        "gross_loss": float(gross_loss),
+        "profit_factor": float(profit_factor),
+    }
