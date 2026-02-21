@@ -5,7 +5,7 @@ import logging
 from typing import Optional, Dict, Any
 
 from execution.db.db import init_db
-from execution.db.repository import get_system_state, update_system_state, log_event
+from execution.db.repository import get_system_state, update_system_state, log_event, get_trade_stats,
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
@@ -62,6 +62,33 @@ def _safe_pop_next_signal(outbox_path: str) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
         return None
+
+def _run_performance_report_safe() -> None:
+    try:
+        s = get_trade_stats()
+        # ლოგში მოკლე და სასარგებლო summary
+        logger.info(
+            "PERF_REPORT | closed=%s wins=%s losses=%s winrate=%.2f%% roi=%.2f%% pnl=%.4f quote_in=%.4f pf=%.3f",
+            s.get("closed_trades", 0),
+            s.get("wins", 0),
+            s.get("losses", 0),
+            float(s.get("winrate_pct", 0.0)),
+            float(s.get("roi_pct", 0.0)),
+            float(s.get("pnl_quote_sum", 0.0)),
+            float(s.get("quote_in_sum", 0.0)),
+            float(s.get("profit_factor", 0.0)),
+        )
+        # სურვილის შემთხვევაში DB audit log-შიც ჩაწერე:
+        try:
+            log_event(
+                "PERF_REPORT",
+                f"closed={s.get('closed_trades',0)} winrate={float(s.get('winrate_pct',0.0)):.2f}% "
+                f"roi={float(s.get('roi_pct',0.0)):.2f}% pnl={float(s.get('pnl_quote_sum',0.0)):.4f}"
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning(f"PERF_REPORT_FAIL | err={e}")
 
 
 def main():
