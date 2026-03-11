@@ -1,4 +1,3 @@
-# execution/main.py
 import os
 import time
 import logging
@@ -9,11 +8,12 @@ from execution.db.repository import (
     get_system_state,
     update_system_state,
     log_event,
-    get_trade_stats,  # ✅ report stats
+    get_trade_stats,
 )
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
+from execution.telegram_notifier import notify_performance_snapshot
 
 logger = logging.getLogger("gbm")
 
@@ -69,7 +69,7 @@ def _safe_pop_next_signal(outbox_path: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _run_performance_report_safe() -> None:
+def _run_performance_report_safe(send_telegram: bool = False) -> None:
     try:
         s = get_trade_stats()
         logger.info(
@@ -86,7 +86,6 @@ def _run_performance_report_safe() -> None:
             float(s.get("open_quote_in_sum", 0.0)),
         )
 
-        # optional: store compact snapshot in audit_log
         try:
             log_event(
                 "PERF_REPORT",
@@ -100,6 +99,12 @@ def _run_performance_report_safe() -> None:
         except Exception:
             pass
 
+        if send_telegram:
+            try:
+                notify_performance_snapshot(s)
+            except Exception as e:
+                logger.warning(f"TG_NOTIFY_PERF_FAIL | err={e}")
+
     except Exception as e:
         logger.warning(f"PERF_REPORT_FAIL | err={e}")
 
@@ -111,9 +116,11 @@ def main():
     outbox_path = os.getenv("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
     sleep_s = float(os.getenv("LOOP_SLEEP_SECONDS", "10"))
 
-    # ✅ every 60 seconds by default (set REPORT_EVERY_SECONDS=0 to disable)
     report_every_s = int(os.getenv("REPORT_EVERY_SECONDS", "60"))
+    telegram_report_every_s = int(os.getenv("TELEGRAM_REPORT_EVERY_SECONDS", "1800"))
+
     last_report_ts = 0.0
+    last_tg_report_ts = 0.0
 
     init_db()
     _bootstrap_state_if_needed()
@@ -131,10 +138,10 @@ def main():
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
     logger.info(f"REPORT_EVERY_SECONDS={report_every_s}")
+    logger.info(f"TELEGRAM_REPORT_EVERY_SECONDS={telegram_report_every_s}")
 
     while True:
         try:
-            # 0) ABSOLUTE KILL SWITCH (before everything)
             if is_kill_switch_active():
                 logger.warning("KILL_SWITCH_ACTIVE | worker will not generate/pop/execute signals")
                 try:
@@ -144,13 +151,11 @@ def main():
                 time.sleep(sleep_s)
                 continue
 
-            # 1) reconcile OCO
             try:
                 engine.reconcile_oco()
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_LOOP_WARN | err={e}")
 
-            # 2) generate (optional)
             if generate_once is not None:
                 try:
                     created = generate_once(outbox_path)
@@ -163,7 +168,6 @@ def main():
                     except Exception:
                         pass
 
-            # 3) pop + execute
             sig = _safe_pop_next_signal(outbox_path)
             if sig:
                 logger.info(f"Signal received | id={sig.get('signal_id')} | verdict={sig.get('final_verdict')}")
@@ -171,11 +175,15 @@ def main():
             else:
                 logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
 
-            # 4) ✅ auto performance report
             now = time.time()
+
             if report_every_s > 0 and (now - last_report_ts) >= report_every_s:
-                _run_performance_report_safe()
+                _run_performance_report_safe(send_telegram=False)
                 last_report_ts = now
+
+            if telegram_report_every_s > 0 and (now - last_tg_report_ts) >= telegram_report_every_s:
+                _run_performance_report_safe(send_telegram=True)
+                last_tg_report_ts = now
 
         except Exception as e:
             logger.exception(f"WORKER_LOOP_ERROR | err={e}")
