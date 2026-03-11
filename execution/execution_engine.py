@@ -20,10 +20,14 @@ from execution.db.repository import (
     get_trade,
     get_open_trade_for_symbol,
     close_trade,
+    get_trade_stats,
 )
-
 from execution.kill_switch import is_kill_switch_active
 from execution.virtual_wallet import simulate_market_entry
+from execution.telegram_notifier import (
+    notify_signal_created,
+    notify_trade_closed,
+)
 
 logger = logging.getLogger("gbm")
 
@@ -199,9 +203,35 @@ class ExecutionEngine:
                         pnl_quote, pnl_pct = self._calc_net_pnl(
                             float(quote_in), float(entry_price), float(exitp), float(qty)
                         )
-                        close_trade(signal_id, exit_price=float(exitp), outcome="SL", pnl_quote=float(pnl_quote), pnl_pct=float(pnl_pct))
-                        log_event("TRADE_CLOSED", f"{signal_id} {symbol} SL exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}")
-                        logger.info(f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=SL exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}")
+                        close_trade(
+                            signal_id,
+                            exit_price=float(exitp),
+                            outcome="SL",
+                            pnl_quote=float(pnl_quote),
+                            pnl_pct=float(pnl_pct),
+                        )
+                        log_event(
+                            "TRADE_CLOSED",
+                            f"{signal_id} {symbol} SL exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
+                        )
+                        logger.info(
+                            f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=SL "
+                            f"exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
+                        )
+
+                        try:
+                            stats = get_trade_stats()
+                            notify_trade_closed(
+                                symbol=str(symbol),
+                                entry_price=float(entry_price),
+                                exit_price=float(exitp),
+                                pnl_quote=float(pnl_quote),
+                                pnl_pct=float(pnl_pct),
+                                outcome="SL",
+                                stats=stats,
+                            )
+                        except Exception as e:
+                            logger.warning(f"TG_NOTIFY_CLOSE_FAIL | id={signal_id} outcome=SL err={e}")
                     else:
                         log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} SL filled but trade row missing")
                         logger.warning(f"TRADE_CLOSE_WARN | id={signal_id} symbol={symbol} SL filled but trade missing")
@@ -220,9 +250,35 @@ class ExecutionEngine:
                         pnl_quote, pnl_pct = self._calc_net_pnl(
                             float(quote_in), float(entry_price), float(exitp), float(qty)
                         )
-                        close_trade(signal_id, exit_price=float(exitp), outcome="TP", pnl_quote=float(pnl_quote), pnl_pct=float(pnl_pct))
-                        log_event("TRADE_CLOSED", f"{signal_id} {symbol} TP exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}")
-                        logger.info(f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=TP exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}")
+                        close_trade(
+                            signal_id,
+                            exit_price=float(exitp),
+                            outcome="TP",
+                            pnl_quote=float(pnl_quote),
+                            pnl_pct=float(pnl_pct),
+                        )
+                        log_event(
+                            "TRADE_CLOSED",
+                            f"{signal_id} {symbol} TP exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
+                        )
+                        logger.info(
+                            f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=TP "
+                            f"exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
+                        )
+
+                        try:
+                            stats = get_trade_stats()
+                            notify_trade_closed(
+                                symbol=str(symbol),
+                                entry_price=float(entry_price),
+                                exit_price=float(exitp),
+                                pnl_quote=float(pnl_quote),
+                                pnl_pct=float(pnl_pct),
+                                outcome="TP",
+                                stats=stats,
+                            )
+                        except Exception as e:
+                            logger.warning(f"TG_NOTIFY_CLOSE_FAIL | id={signal_id} outcome=TP err={e}")
                     else:
                         log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} TP filled but trade row missing")
                         logger.warning(f"TRADE_CLOSE_WARN | id={signal_id} symbol={symbol} TP filled but trade missing")
@@ -335,6 +391,20 @@ class ExecutionEngine:
                     f"TRADE_CLOSED | id={trade_signal_id} symbol={symbol} outcome=MANUAL_SELL "
                     f"exit={avg} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
                 )
+
+                try:
+                    stats = get_trade_stats()
+                    notify_trade_closed(
+                        symbol=str(symbol),
+                        entry_price=float(entry_price),
+                        exit_price=float(avg),
+                        pnl_quote=float(pnl_quote),
+                        pnl_pct=float(pnl_pct),
+                        outcome="MANUAL_SELL",
+                        stats=stats,
+                    )
+                except Exception as e:
+                    logger.warning(f"TG_NOTIFY_CLOSE_FAIL | id={trade_signal_id} outcome=MANUAL_SELL err={e}")
 
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_LIVE", symbol=str(symbol))
 
@@ -573,6 +643,19 @@ class ExecutionEngine:
             )
 
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
+
+            try:
+                notify_signal_created(
+                    symbol=str(symbol),
+                    entry_price=float(buy_avg),
+                    quote_amount=float(quote_amount),
+                    tp_price=float(tp_price),
+                    sl_price=float(sl_stop),
+                    verdict="BUY",
+                    mode=self.mode,
+                )
+            except Exception as e:
+                logger.warning(f"TG_NOTIFY_SIGNAL_FAIL | id={signal_id} err={e}")
 
         except LiveTradingBlocked as e:
             msg = f"EXEC_REJECT | LIVE_BLOCKED | id={signal_id} reason={e}"
