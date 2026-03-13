@@ -583,6 +583,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     )
                 continue
 
+        logger.info("ADAPTIVE CODE LOADED")
+        
         adaptive_conf = BUY_CONFIDENCE_MIN
 
         adaptive_conf -= atr_percent * 0.15
