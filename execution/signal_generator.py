@@ -591,6 +591,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         adaptive_conf = max(0.30, min(adaptive_conf, 0.70))
 
+        logger.info(
+            f"[GEN] ADAPTIVE | symbol={symbol} conf={conf:.3f} adaptive_conf={adaptive_conf:.3f}"
+        )
+
         if conf < adaptive_conf:
 
             
