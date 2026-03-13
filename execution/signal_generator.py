@@ -583,10 +583,20 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     )
                 continue
 
-        if conf < BUY_CONFIDENCE_MIN:
+        adaptive_conf = BUY_CONFIDENCE_MIN
+
+        adaptive_conf -= atr_percent * 0.2
+        adaptive_conf -= (vRatio - 1) * 0.1
+        adaptive_conf -= abs(trend) * 0.3
+
+        adaptive_conf = max(0.30, min(adaptive_conf, 0.70))
+
+        if conf < adaptive_conf:
+
+            
             if GEN_DEBUG:
                 logger.info(
-                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
+                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} adaptive_conf={adaptive_conf:.3f}"
                 )
             continue
 
