@@ -576,9 +576,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         if USE_MA_FILTERS:
             ma20 = _sma(closes, 20)
             ma_gap_abs = abs(_pct(last, ma20))
-
-            logger.info("ADAPTIVE CODE LOADED")
-            
             if ma_gap_abs < MA_GAP_PCT:
                 if GEN_DEBUG:
                     logger.info(
@@ -586,25 +583,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     )
                 continue
 
-        
-        adaptive_conf = BUY_CONFIDENCE_MIN
-
-        adaptive_conf -= atr_percent * 0.15
-        adaptive_conf -= (vRatio - 1) * 0.08
-        adaptive_conf -= abs(trend) * 0.08
-
-        adaptive_conf = max(0.45, min(adaptive_conf, 0.70))
-
-        logger.info(
-            f"[GEN] ADAPTIVE | symbol={symbol} conf={conf:.3f} adaptive_conf={adaptive_conf:.3f}"
-        )
-
-        if conf < adaptive_conf:
-
-            
+        if conf < BUY_CONFIDENCE_MIN:
             if GEN_DEBUG:
                 logger.info(
-                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} adaptive_conf={adaptive_conf:.3f}"
+                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
                 )
             continue
 
