@@ -576,6 +576,9 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         if USE_MA_FILTERS:
             ma20 = _sma(closes, 20)
             ma_gap_abs = abs(_pct(last, ma20))
+
+            logger.info("ADAPTIVE CODE LOADED")
+            
             if ma_gap_abs < MA_GAP_PCT:
                 if GEN_DEBUG:
                     logger.info(
@@ -583,7 +586,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     )
                 continue
 
-        logger.info("ADAPTIVE CODE LOADED")
         
         adaptive_conf = BUY_CONFIDENCE_MIN
 
