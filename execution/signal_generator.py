@@ -585,11 +585,11 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         adaptive_conf = BUY_CONFIDENCE_MIN
 
-        adaptive_conf -= atr_percent * 0.2
-        adaptive_conf -= (vRatio - 1) * 0.1
-        adaptive_conf -= abs(trend) * 0.3
+        adaptive_conf -= atr_percent * 0.15
+        adaptive_conf -= (vRatio - 1) * 0.08
+        adaptive_conf -= abs(trend) * 0.08
 
-        adaptive_conf = max(0.30, min(adaptive_conf, 0.70))
+        adaptive_conf = max(0.45, min(adaptive_conf, 0.70))
 
         logger.info(
             f"[GEN] ADAPTIVE | symbol={symbol} conf={conf:.3f} adaptive_conf={adaptive_conf:.3f}"
