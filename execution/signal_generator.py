@@ -509,6 +509,40 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         )
         decision = core.decide(inp)
 
+        global pause_until
+        global consecutive_losses
+
+        # -------------------------------
+        # LOSS PROTECTION CHECK
+        # -------------------------------
+
+        if pause_until:
+
+            if datetime.now() < pause_until:
+                logger.info("Trading paused - cooldown active")
+                return None
+
+            # ბოლო სანთლები
+            recent = candles[-RESUME_AFTER_GREEN_CANDLES:]
+
+            green = all(c["close"] > c["open"] for c in recent)
+
+            last = candles[-1]
+
+            body_pct = abs(last["close"] - last["open"]) / last["open"] * 100
+
+            if green or body_pct >= STRONG_CANDLE_PCT:
+
+                logger.info("Market recovered → trading resumed")
+
+                pause_until = None
+
+            else:
+
+                logger.info("Waiting for recovery candles")
+
+                return None
+
         if GEN_DEBUG:
             logger.info(
                 f"[GEN] CORE_DECISION | symbol={symbol} ai={decision['ai_score']:.3f} macro={decision['macro_gate']} "
