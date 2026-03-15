@@ -14,6 +14,18 @@ from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
 
+# ---------------------------------
+# LOSS PROTECTION SYSTEM
+# ---------------------------------
+
+LOSS_COOLDOWN_MINUTES = int(os.getenv("LOSS_COOLDOWN_MINUTES", 30))
+RESUME_AFTER_GREEN_CANDLES = int(os.getenv("RESUME_AFTER_GREEN_CANDLES", "3"))
+STRONG_CANDLE_PCT = float(os.getenv("STRONG_CANDLE_PCT", "0.5"))
+
+pause_until = None
+consecutive_losses = 0
+
+
 # -----------------------------
 # ENV
 # -----------------------------
