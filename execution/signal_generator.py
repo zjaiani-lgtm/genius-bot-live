@@ -513,7 +513,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         global consecutive_losses
 
         consecutive_losses = 3
-        print("TEST MODE: forcing 3 losses")
+        logger.info("TEST MODE: forcing 3 losses")
 
 
         # -------------------------
