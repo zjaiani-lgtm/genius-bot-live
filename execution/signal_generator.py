@@ -512,9 +512,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         global pause_until
         global consecutive_losses
 
-        consecutive_losses = 3
-        logger.info("TEST MODE: forcing 3 losses")
-
 
         # -------------------------
         # LOSS DETECTION
