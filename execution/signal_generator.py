@@ -512,6 +512,29 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         global pause_until
         global consecutive_losses
 
+        # -------------------------
+        # LOSS DETECTION
+        # -------------------------
+
+
+            if decision.get("pnl", 0) < 0:
+                consecutive_losses += 1
+                logger.info(f"Loss detected. Consecutive losses: {consecutive_losses}")
+            else:
+                consecutive_losses = 0
+
+
+        if consecutive_losses >= 3:
+
+            pause_until = datetime.now() + timedelta(minutes=LOSS_COOLDOWN_MINUTES)
+
+            logger.warning(
+                f"Max consecutive losses reached → pausing trading for {LOSS_COOLDOWN_MINUTES} minutes"
+            )
+
+            consecutive_losses = 0
+            return None
+
         # -------------------------------
         # LOSS PROTECTION CHECK
         # -------------------------------
