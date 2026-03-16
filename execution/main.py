@@ -9,11 +9,17 @@ from execution.db.repository import (
     update_system_state,
     log_event,
     get_trade_stats,
+    get_closed_trades,
 )
 from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
-from execution.telegram_notifier import notify_performance_snapshot
+from execution.telegram_notifier import (
+    notify_performance_snapshot,
+    build_daily_stats_from_closed_trades,
+    notify_daily_close_summary,
+    _now_dt,
+)
 
 logger = logging.getLogger("gbm")
 
@@ -89,12 +95,12 @@ def _run_performance_report_safe(send_telegram: bool = False) -> None:
         try:
             log_event(
                 "PERF_REPORT",
-                f"closed={s.get('closed_trades',0)} "
-                f"winrate={float(s.get('winrate_pct',0.0)):.2f}% "
-                f"roi={float(s.get('roi_pct',0.0)):.2f}% "
-                f"pnl={float(s.get('pnl_quote_sum',0.0)):.4f} "
-                f"open={s.get('open_trades',0)} "
-                f"open_quote_in={float(s.get('open_quote_in_sum',0.0)):.4f}"
+                f"closed={s.get('closed_trades', 0)} "
+                f"winrate={float(s.get('winrate_pct', 0.0)):.2f}% "
+                f"roi={float(s.get('roi_pct', 0.0)):.2f}% "
+                f"pnl={float(s.get('pnl_quote_sum', 0.0)):.4f} "
+                f"open={s.get('open_trades', 0)} "
+                f"open_quote_in={float(s.get('open_quote_in_sum', 0.0)):.4f}"
             )
         except Exception:
             pass
@@ -121,6 +127,7 @@ def main():
 
     last_report_ts = 0.0
     last_tg_report_ts = 0.0
+    last_daily_summary_date = None
 
     init_db()
     _bootstrap_state_if_needed()
@@ -184,6 +191,45 @@ def main():
             if telegram_report_every_s > 0 and (now - last_tg_report_ts) >= telegram_report_every_s:
                 _run_performance_report_safe(send_telegram=True)
                 last_tg_report_ts = now
+
+            try:
+                now_local = _now_dt()
+                today_str = now_local.date().isoformat()
+
+                if (
+                    now_local.hour == 23
+                    and now_local.minute == 59
+                    and last_daily_summary_date != today_str
+                ):
+                    closed_trades = get_closed_trades()
+                    daily_stats = build_daily_stats_from_closed_trades(
+                        closed_trades,
+                        target_dt=now_local,
+                    )
+                    notify_daily_close_summary(daily_stats)
+                    last_daily_summary_date = today_str
+
+                    logger.info(
+                        "DAILY_SUMMARY_SENT | date=%s closed=%s pnl=%.4f",
+                        today_str,
+                        daily_stats.get("closed_trades", 0),
+                        float(daily_stats.get("pnl_quote_sum", 0.0)),
+                    )
+
+                    try:
+                        log_event(
+                            "DAILY_SUMMARY_SENT",
+                            f"date={today_str} "
+                            f"closed={daily_stats.get('closed_trades', 0)} "
+                            f"wins={daily_stats.get('wins', 0)} "
+                            f"losses={daily_stats.get('losses', 0)} "
+                            f"pnl={float(daily_stats.get('pnl_quote_sum', 0.0)):.4f}"
+                        )
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.warning(f"DAILY_SUMMARY_FAIL | err={e}")
 
         except Exception as e:
             logger.exception(f"WORKER_LOOP_ERROR | err={e}")
