@@ -1,7 +1,8 @@
 import os
 import logging
 from datetime import datetime
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -20,6 +21,9 @@ TELEGRAM_CHAT_IDS = [
     if x.strip()
 ]
 TELEGRAM_PARSE_MODE = os.getenv("TELEGRAM_PARSE_MODE", "HTML").strip().upper()
+
+# Default timezone for all Telegram notifications
+TELEGRAM_TIMEZONE = os.getenv("TELEGRAM_TIMEZONE", "Asia/Tbilisi").strip()
 
 
 def _is_ready() -> bool:
@@ -113,7 +117,12 @@ def _outcome_title(outcome: str) -> str:
 
 
 def _now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        tz = ZoneInfo(TELEGRAM_TIMEZONE)
+        return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        logger.warning("TZ_FALLBACK | timezone=%s err=%s", TELEGRAM_TIMEZONE, e)
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def notify_signal_created(
