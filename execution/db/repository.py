@@ -227,6 +227,35 @@ def close_trade(signal_id: str, exit_price: float, outcome: str, pnl_quote: floa
     )
 
 
+def get_closed_trades() -> List[Dict[str, Any]]:
+    rows = _fetchall(
+        """
+        SELECT signal_id, symbol, qty, quote_in, entry_price, opened_at,
+               exit_price, closed_at, outcome, pnl_quote, pnl_pct
+        FROM trades
+        WHERE closed_at IS NOT NULL
+        ORDER BY closed_at DESC
+        """
+    )
+
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        result.append({
+            "signal_id": row[0],
+            "symbol": row[1],
+            "qty": row[2],
+            "quote_in": row[3],
+            "entry_price": row[4],
+            "opened_at": row[5],
+            "exit_price": row[6],
+            "closed_at": row[7],
+            "outcome": row[8],
+            "pnl_quote": row[9],
+            "pnl_pct": row[10],
+        })
+    return result
+
+
 def get_trade_stats() -> Dict[str, Any]:
     row = _fetchone(
         """
