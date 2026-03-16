@@ -14,18 +14,6 @@ from execution.excel_live_core import ExcelLiveCore, CoreInputs
 
 logger = logging.getLogger("gbm")
 
-# ---------------------------------
-# LOSS PROTECTION SYSTEM
-# ---------------------------------
-
-LOSS_COOLDOWN_MINUTES = int(os.getenv("LOSS_COOLDOWN_MINUTES", 30))
-RESUME_AFTER_GREEN_CANDLES = int(os.getenv("RESUME_AFTER_GREEN_CANDLES", "3"))
-STRONG_CANDLE_PCT = float(os.getenv("STRONG_CANDLE_PCT", "0.5"))
-
-pause_until = None
-consecutive_losses = 0
-
-
 # -----------------------------
 # ENV
 # -----------------------------
@@ -508,64 +496,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             volatility_regime=vol_reg,
         )
         decision = core.decide(inp)
-
-        global pause_until
-        global consecutive_losses
-
-
-        # -------------------------
-        # LOSS DETECTION
-        # -------------------------
-
-
-        if decision.get("pnl", 0) < 0:
-            consecutive_losses += 1
-            logger.info(f"Loss detected. Consecutive losses: {consecutive_losses}")
-        else:
-            consecutive_losses = 0
-
-
-        if consecutive_losses >= 3:
-
-            pause_until = datetime.now() + timedelta(minutes=LOSS_COOLDOWN_MINUTES)
-
-            logger.warning(
-                f"Max consecutive losses reached → pausing trading for {LOSS_COOLDOWN_MINUTES} minutes"
-            )
-
-        consecutive_losses = 0
-        return None
-
-        # -------------------------------
-        # LOSS PROTECTION CHECK
-        # -------------------------------
-
-        if pause_until:
-
-            if datetime.now() < pause_until:
-                logger.info("Trading paused - cooldown active")
-                return None
-
-            # ბოლო სანთლები
-            recent = candles[-RESUME_AFTER_GREEN_CANDLES:]
-
-            green = all(c["close"] > c["open"] for c in recent)
-
-            last = candles[-1]
-
-            body_pct = abs(last["close"] - last["open"]) / last["open"] * 100
-
-            if green or body_pct >= STRONG_CANDLE_PCT:
-
-                logger.info("Market recovered → trading resumed")
-
-                pause_until = None
-
-            else:
-
-                logger.info("Waiting for recovery candles")
-
-                return None
 
         if GEN_DEBUG:
             logger.info(
