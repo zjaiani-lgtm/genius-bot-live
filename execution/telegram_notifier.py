@@ -114,9 +114,9 @@ def _fmt_plain(v: Any, digits: int = 2) -> str:
 def _outcome_title(outcome: str) -> str:
     x = str(outcome or "").upper()
     if x == "TP":
-        return "✅ <b>TRADE CLOSED — TP HIT</b>"
+        return "✅ <b>!!SELL!! TRADE CLOSED — TP HIT</b>"
     if x == "SL":
-        return "🛑 <b>TRADE CLOSED — SL HIT</b>"
+        return "🛑 <b>!!SELL!! TRADE CLOSED — SL HIT</b>"
     if x == "MANUAL_SELL":
         return "📤 <b>TRADE CLOSED — MANUAL SELL</b>"
     return f"📦 <b>TRADE CLOSED — {_escape_html(x)}</b>"
