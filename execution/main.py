@@ -3,6 +3,8 @@ import time
 import logging
 from typing import Optional, Dict, Any
 
+from regime_engine import MarketRegimeEngine
+
 from execution.db.db import init_db
 from execution.db.repository import (
     get_system_state,
@@ -175,12 +177,37 @@ def main():
                     except Exception:
                         pass
 
-            sig = _safe_pop_next_signal(outbox_path)
-            if sig:
-                logger.info(f"Signal received | id={sig.get('signal_id')} | verdict={sig.get('final_verdict')}")
-                engine.execute_signal(sig)
-            else:
-                logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
+
+                sig = _safe_pop_next_signal(outbox_path)
+
+                if sig:
+                    logger.info(f"Signal received | id={sig.get('signal_id')} | verdict={sig.get('final_verdict')}")
+
+                    # 🔥 1. detect regime
+                    regime_engine = MarketRegimeEngine(os.environ)
+
+                    trend = float(sig.get("trend", 0) or 0)
+                    vol = float(sig.get("vol_score", 0) or 0)
+
+                    regime = regime_engine.detect_regime(trend, vol)
+                    adaptive = regime_engine.apply(regime)
+
+                    logger.info(f"[AUTO] Regime={regime} trend={trend:.3f} vol={vol:.3f}")
+
+                    # ❌ 2. skip bad market
+                    if adaptive.get("SKIP_TRADING"):
+                    logger.warning("[AUTO] ❌ Skip trade (SIDEWAYS)")
+                    continue
+
+                    # 🔥 3. APPLY (safe version)
+                    sig["adaptive"] = adaptive   # 👈 ეს უკეთესია ვიდრე runtime_config
+
+                    logger.info(f"[AUTO] Applied params: {adaptive}")
+
+                    # 🚀 4. EXECUTE
+                    engine.execute_signal(sig)
+                else:
+                    logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
 
             now = time.time()
 
