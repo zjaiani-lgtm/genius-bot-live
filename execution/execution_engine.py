@@ -536,42 +536,153 @@ class ExecutionEngine:
 
         quote_amount = float(quote_amount)
 
-        # ADAPTIVE SIZE
-        if adaptive:
-            quote_amount = float(adaptive.get("QUOTE_SIZE", quote_amount))
-            logger.info(f"[AUTO] Using adaptive quote: {quote_amount}")
+        # ✅ ADAPTIVE QUOTE SIZE
+            if adaptive:
+                quote_amount = float(adaptive.get("QUOTE_SIZE", quote_amount))
+                logger.info(f"[AUTO] Using adaptive quote: {quote_amount}")
 
-        # STATE CHECKS
-        if has_open_trade_for_symbol(str(symbol)):
-            msg = f"EXEC_REJECT | OPEN_TRADE_RACE | id={signal_id} symbol={symbol}"
+            try:
+                if has_open_trade_for_symbol(str(symbol)):
+                    msg = f"EXEC_REJECT | OPEN_TRADE_RACE | id={signal_id} symbol={symbol}"
+                    logger.warning(msg)
+                    log_event("EXEC_REJECT_OPEN_TRADE_RACE", msg)
+                    mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_OPEN_TRADE_RACE", symbol=str(symbol))
+                    return
+
+                if has_active_oco_for_symbol(str(symbol)):
+                    msg = f"EXEC_REJECT | ACTIVE_OCO_RACE | id={signal_id} symbol={symbol}"
+                    logger.warning(msg)
+                    log_event("EXEC_REJECT_ACTIVE_OCO_RACE", msg)
+                    mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_ACTIVE_OCO_RACE", symbol=str(symbol))
+                    return
+            except Exception as e:
+                msg = f"EXEC_BLOCKED | TRADE_STATE_CHECK_FAIL | id={signal_id} symbol={symbol} err={e}"
+                logger.warning(msg)
+                log_event("EXEC_BLOCKED_TRADE_STATE_CHECK_FAIL", msg)
+                return
+
+            min_notional = 0.0
+            try:
+                min_notional = float(self.exchange.get_min_notional(symbol))
+            except Exception:
+                min_notional = 0.0
+
+            if min_notional > 0 and quote_amount < min_notional:
+                msg = f"EXEC_REJECT | MIN_NOTIONAL | id={signal_id} symbol={symbol} quote={quote_amount:.8f} < min_notional={min_notional}"
+                logger.warning(msg)
+                log_event("EXEC_REJECT_MIN_NOTIONAL", msg)
+                mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_MIN_NOTIONAL", symbol=str(symbol))
+                return
+
+            if is_kill_switch_active():
+                logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | BUY_BLOCKED | id={signal_id}")
+                log_event("EXEC_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id} BUY_BLOCKED")
+                return
+
+            buy, buy_avg = self._place_entry_buy(symbol=str(symbol), quote_amount=quote_amount)
+
+            logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
+            log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
+
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
+
+            base_asset = symbol.split("/")[0].upper()
+            free_base = float(self.exchange.fetch_balance_free(base_asset))
+
+            sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
+            if sell_amount <= 0:
+                sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_retry_buffer)
+
+            if sell_amount <= 0:
+                msg = f"OCO_SKIP_NO_FREE_BASE | id={signal_id} free_{base_asset}={free_base}"
+                logger.warning(msg)
+                log_event("OCO_SKIP_NO_FREE_BASE", msg)
+                return
+
+            open_trade(
+                signal_id=signal_id,
+                symbol=str(symbol),
+                qty=float(sell_amount),
+                quote_in=float(quote_amount),
+                entry_price=float(buy_avg),
+            )
+
+            tp_price = float(buy_avg) * (1.0 + tp_pct / 100.0)
+            sl_stop = float(buy_avg) * (1.0 - sl_pct / 100.0)
+            sl_limit = sl_stop * (1.0 - self.sl_limit_gap_pct / 100.0)
+
+            tp_price = self.exchange.floor_price(symbol, tp_price)
+            sl_stop = self.exchange.floor_price(symbol, sl_stop)
+            sl_limit = self.exchange.floor_price(symbol, sl_limit)
+
+            oco = self.exchange.place_oco_sell(
+                symbol=str(symbol),
+                base_amount=float(sell_amount),
+                tp_price=float(tp_price),
+                sl_stop_price=float(sl_stop),
+                sl_limit_price=float(sl_limit),
+            )
+
+            raw = oco.get("raw") or {}
+            orders = raw.get("orders") or []
+            list_order_id = str(raw.get("orderListId") or "")
+
+            tp_order_id = ""
+            sl_order_id = ""
+
+            for x in orders:
+                oid = str(x.get("orderId") or "")
+                typ = str(x.get("type") or "").upper()
+                if typ == "LIMIT_MAKER":
+                    tp_order_id = oid
+                elif typ == "STOP_LOSS_LIMIT":
+                    sl_order_id = oid
+
+            if not tp_order_id or not sl_order_id:
+                reports = raw.get("orderReports") or []
+                for rep in reports:
+                    oid = str(rep.get("orderId") or "")
+                    typ = str(rep.get("type") or "").upper()
+                    if typ == "LIMIT_MAKER" and not tp_order_id:
+                        tp_order_id = oid
+                    elif typ == "STOP_LOSS_LIMIT" and not sl_order_id:
+                        sl_order_id = oid
+
+            create_oco_link(
+                signal_id=signal_id,
+                symbol=str(symbol),
+                base_asset=base_asset,
+                tp_order_id=str(tp_order_id),
+                sl_order_id=str(sl_order_id),
+                tp_price=float(tp_price),
+                sl_stop_price=float(sl_stop),
+                sl_limit_price=float(sl_limit),
+                amount=float(sell_amount),
+            )
+
+            log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
+
+            try:
+                notify_signal_created(
+                    symbol=str(symbol),
+                    entry_price=float(buy_avg),
+                    quote_amount=float(quote_amount),
+                    tp_price=float(tp_price),
+                    sl_price=float(sl_stop),
+                    verdict="BUY",
+                    mode=self.mode,
+                )
+            except Exception as e:
+                logger.warning(f"TG_NOTIFY_SIGNAL_FAIL | id={signal_id} err={e}")
+
+        except LiveTradingBlocked as e:
+            msg = f"EXEC_REJECT | LIVE_BLOCKED | id={signal_id} reason={e}"
             logger.warning(msg)
-            log_event("EXEC_REJECT_OPEN_TRADE_RACE", msg)
+            log_event("EXEC_REJECT_LIVE_BLOCKED", msg)
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_LIVE_BLOCKED", symbol=str(symbol))
             return
 
-        if has_active_oco_for_symbol(str(symbol)):
-            msg = f"EXEC_REJECT | ACTIVE_OCO_RACE | id={signal_id} symbol={symbol}"
-            logger.warning(msg)
-            log_event("EXEC_REJECT_ACTIVE_OCO_RACE", msg)
+        except Exception as e:
+            logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
+            log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
             return
-
-        if is_kill_switch_active():
-            logger.error(f"KILL_SWITCH_ACTIVE_LAST_GATE | BUY_BLOCKED | id={signal_id}")
-            log_event("EXEC_BLOCKED_KILL_SWITCH_LAST_GATE", f"{signal_id}")
-            return
-
-        # BUY
-        buy, buy_avg = self._place_entry_buy(symbol=str(symbol), quote_amount=quote_amount)
-
-        logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} avg={buy_avg}")
-        log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol}")
-
-        mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
-
-    except LiveTradingBlocked as e:
-        log_event("EXEC_REJECT_LIVE_BLOCKED", f"{signal_id}")
-        return
-
-    except Exception as e:
-        logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
-        log_event("EXEC_LIVE_ERROR", f"{signal_id}")
-        return
