@@ -444,25 +444,22 @@ class ExecutionEngine:
 
     logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-    try:
-        if signal_id_already_executed(signal_id):
-            logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
-            log_event("EXEC_DEDUPED", f"id={signal_id}")
-            return
-    except Exception as e:
-        logger.error(f"EXEC_BLOCKED | idempotency_check_failed | id={signal_id} err={e}")
-        log_event("EXEC_BLOCKED_IDEMPOTENCY_FAIL", f"{signal_id} err={e}")
+    # DEDUP CHECK
+    if signal_id_already_executed(signal_id):
+        logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
+        log_event("EXEC_DEDUPED", f"id={signal_id}")
         return
 
-        state = self._load_system_state()
-        db_status = str(state.get("status") or "").upper()
-        db_kill = bool(state.get("kill_switch"))
-        sync_ok = bool(state.get("startup_sync_ok"))
+    # SYSTEM STATE
+    state = self._load_system_state()
+    db_status = str(state.get("status") or "").upper()
+    db_kill = bool(state.get("kill_switch"))
+    sync_ok = bool(state.get("startup_sync_ok"))
 
-        if self.env_kill_switch or db_kill:
-            logger.warning(f"EXEC_BLOCKED | KILL_SWITCH=ON | id={signal_id}")
-            log_event("EXEC_BLOCKED_KILL_SWITCH", f"{signal_id}")
-            return
+    if self.env_kill_switch or db_kill:
+        logger.warning(f"EXEC_BLOCKED | KILL_SWITCH_ON | id={signal_id}")
+        log_event("EXEC_BLOCKED_KILL_SWITCH", f"{signal_id}")
+        return
 
         if not sync_ok or db_status not in ("ACTIVE", "RUNNING"):
             logger.warning(f"EXEC_BLOCKED | system not ACTIVE/synced | id={signal_id} status={db_status} sync_ok={sync_ok}")
