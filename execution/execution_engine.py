@@ -445,10 +445,10 @@ class ExecutionEngine:
     logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
     try:
-       if signal_id_already_executed(signal_id):
-           logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
-           log_event("EXEC_DEDUPED", f"id={signal_id}")
-        return
+        if signal_id_already_executed(signal_id):
+            logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
+            log_event("EXEC_DEDUPED", f"id={signal_id}")
+            return
     except Exception as e:
         logger.error(f"EXEC_BLOCKED | idempotency_check_failed | id={signal_id} err={e}")
         log_event("EXEC_BLOCKED_IDEMPOTENCY_FAIL", f"{signal_id} err={e}")
