@@ -14,7 +14,7 @@ class MarketRegimeEngine:
     def apply(self, regime):
         if regime == "SIDEWAYS":
             return {
-                "SKIP_TRADING": True,
+                "SKIP_TRADING": False,
                 "QUOTE_SIZE": 0.5
             }
         return {
