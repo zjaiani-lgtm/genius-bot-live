@@ -3,7 +3,7 @@ import time
 import logging
 from typing import Optional, Dict, Any
 
-from regime_engine import MarketRegimeEngine
+from execution.regime_engine import MarketRegimeEngine
 
 from execution.db.db import init_db
 from execution.db.repository import (
