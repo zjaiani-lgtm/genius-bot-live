@@ -599,8 +599,8 @@ class ExecutionEngine:
                 entry_price=float(buy_avg),
             )
 
-            tp_price = float(buy_avg) * (1.0 + self.tp_pct / 100.0)
-            sl_stop = float(buy_avg) * (1.0 - self.sl_pct / 100.0)
+            tp_price = float(buy_avg) * (1.0 + tp_pct / 100.0)
+            sl_stop = float(buy_avg) * (1.0 - sl_pct / 100.0)
             sl_limit = sl_stop * (1.0 - self.sl_limit_gap_pct / 100.0)
 
             tp_price = self.exchange.floor_price(symbol, tp_price)
