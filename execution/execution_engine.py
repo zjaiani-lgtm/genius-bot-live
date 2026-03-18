@@ -446,10 +446,10 @@ class ExecutionEngine:
             logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
             log_event("EXEC_DEDUPED", f"id={signal_id}")
             return
-        except Exception as e:
-            logger.error(f"EXEC_BLOCKED | idempotency_check_failed | id={signal_id} err={e}")
-            log_event("EXEC_BLOCKED_IDEMPOTENCY_FAIL", f"{signal_id} err={e}")
-            return
+    except Exception as e:
+        logger.error(f"EXEC_BLOCKED | idempotency_check_failed | id={signal_id} err={e}")
+        log_event("EXEC_BLOCKED_IDEMPOTENCY_FAIL", f"{signal_id} err={e}")
+        return
 
         state = self._load_system_state()
         db_status = str(state.get("status") or "").upper()
