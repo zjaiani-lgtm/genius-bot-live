@@ -196,8 +196,8 @@ def main():
 
                     # ❌ 2. skip bad market
                     if adaptive.get("SKIP_TRADING"):
-                    logger.warning("[AUTO] ❌ Skip trade (SIDEWAYS)")
-                    continue
+                        logger.warning("[AUTO] ❌ Skip trade (SIDEWAYS)")
+                        continue
 
                     # 🔥 3. APPLY (safe version)
                     sig["adaptive"] = adaptive   # 👈 ეს უკეთესია ვიდრე runtime_config
