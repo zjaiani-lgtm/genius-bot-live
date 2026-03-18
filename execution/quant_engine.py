@@ -24,18 +24,7 @@ def detect_regime(atr_pct):
 # 📈 ENTRY SCORING
 # =========================
 def calculate_entry_score(ai_conf, trend, sma_gap, vol_ratio):
-    sma_norm = clamp(sma_gap / 0.05, 0.0, 1.0)
-    vol_norm = clamp(vol_ratio, 0.0, 1.0)
-
-    score = (
-        ai_conf * 0.4 +
-        trend * 0.3 +
-        sma_norm * 0.2 +
-        vol_norm * 0.1
-    )
-
-    return clamp(score, 0.0, 1.0)
-
+    return 1.0
 
 # =========================
 # 💰 POSITION SIZING
