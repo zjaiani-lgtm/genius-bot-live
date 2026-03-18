@@ -429,6 +429,16 @@ class ExecutionEngine:
         signal_id = str(signal.get("signal_id", "UNKNOWN"))
         verdict = str(signal.get("final_verdict", "")).upper()
 
+    # 🔥 AUTO ADAPTIVE CONFIG
+    adaptive = signal.get("adaptive", {})
+
+    if adaptive:
+    logger.info(f"[AUTO] Using adaptive params: {adaptive}")
+
+    # override config dynamically
+    tp_pct = float(adaptive.get("TP_PCT", self.config.get("TP_PCT", 0)))
+    sl_pct = float(adaptive.get("SL_PCT", self.config.get("SL_PCT", 0)))
+
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
         try:
