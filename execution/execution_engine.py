@@ -533,6 +533,11 @@ class ExecutionEngine:
                 quote_amount = float(position_size) * float(last)
             quote_amount = float(quote_amount)
 
+            # ✅ ADAPTIVE QUOTE SIZE
+            if adaptive:
+                quote_amount = float(adaptive.get("QUOTE_SIZE", quote_amount))
+                logger.info(f"[AUTO] Using adaptive quote: {quote_amount}")
+
             try:
                 if has_open_trade_for_symbol(str(symbol)):
                     msg = f"EXEC_REJECT | OPEN_TRADE_RACE | id={signal_id} symbol={symbol}"
