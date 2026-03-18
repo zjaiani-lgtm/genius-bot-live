@@ -1,10 +1,12 @@
 import time
 
+
 # =========================
 # 🧩 UTILS
 # =========================
 def clamp(value, min_v, max_v):
     return max(min_v, min(value, max_v))
+
 
 # =========================
 # 📊 REGIME DETECTION
@@ -16,6 +18,7 @@ def detect_regime(atr_pct):
         return "NORMAL"
     else:
         return "HIGH"
+
 
 # =========================
 # 📈 ENTRY SCORING
@@ -33,14 +36,19 @@ def calculate_entry_score(ai_conf, trend, sma_gap, vol_ratio):
 
     return clamp(score, 0.0, 1.0)
 
+
 # =========================
 # 💰 POSITION SIZING
 # =========================
 def calculate_position_size(balance, risk_pct, atr_pct):
     risk_amount = balance * (risk_pct / 100.0)
+
     stop_distance = max(atr_pct * 1.5, 0.3)
+
     position_size = risk_amount / stop_distance
+
     return position_size
+
 
 # =========================
 # 🛑 STOP LOSS (ATR BASED)
@@ -48,6 +56,7 @@ def calculate_position_size(balance, risk_pct, atr_pct):
 def compute_stop_loss(entry_price, atr_pct):
     stop_pct = max(atr_pct * 1.5, 0.4)
     return entry_price * (1 - stop_pct / 100.0)
+
 
 # =========================
 # 📉 TRAILING SYSTEM
@@ -57,11 +66,13 @@ def get_base_trailing(score, regime):
         return 0.18 if score < 0.6 else 0.22
     elif regime == "NORMAL":
         return 0.22 if score < 0.6 else 0.26
-    else:
+    else:  # HIGH
         return 0.26 if score < 0.6 else 0.32
+
 
 def time_decay(minutes_open):
     return clamp(1.0 - (minutes_open / 300.0), 0.5, 1.0)
+
 
 # =========================
 # 🧠 TRADE OBJECT
@@ -77,38 +88,48 @@ class Trade:
     def minutes_open(self):
         return (time.time() - self.open_time) / 60.0
 
+
 # =========================
 # 🚪 EXIT ENGINE
 # =========================
 def should_exit(trade, current_profit_pct, atr_pct):
     minutes = trade.minutes_open()
+
     regime = detect_regime(atr_pct)
 
     base_trailing = get_base_trailing(trade.score, regime)
     decay = time_decay(minutes)
+
     trailing = clamp(base_trailing * decay, 0.12, 0.35)
 
+    # update peak profit
     trade.max_profit = max(trade.max_profit, current_profit_pct)
+
     drawdown = trade.max_profit - current_profit_pct
 
+    # 🔴 TRAILING EXIT
     if drawdown >= trailing:
         return True, "TRAILING_EXIT"
 
+    # 🔴 ATR-BASED HARD STOP
     if current_profit_pct <= -1.5 * atr_pct:
         return True, "HARD_STOP"
 
+    # 🔴 SCORE-AWARE TIME EXIT
     max_hold = 120 + trade.score * 120
     if minutes > max_hold:
         return True, "TIME_EXIT"
 
     return False, None
 
+
 # =========================
-# 🧪 TEST
+# 🧪 FULL EXAMPLE
 # =========================
 if __name__ == "__main__":
     balance = 1000
 
+    # mock input (replace with real data)
     ai_conf = 0.65
     trend = 0.60
     sma_gap = 0.03
@@ -116,6 +137,7 @@ if __name__ == "__main__":
     atr_pct = 0.23
     entry_price = 100
 
+    # ENTRY
     score = calculate_entry_score(ai_conf, trend, sma_gap, vol_ratio)
     regime = detect_regime(atr_pct)
 
@@ -126,8 +148,11 @@ if __name__ == "__main__":
 
     print(f"Score: {score:.2f}, Regime: {regime}, Size: {position_size:.4f}, SL: {stop_loss:.2f}")
 
+    # SIMULATION LOOP
     for i in range(1, 300):
         time.sleep(0.01)
+
+        # fake profit curve
         profit = min(1.0, i * 0.01) - max(0, (i - 100)) * 0.01
 
         exit_signal, reason = should_exit(trade, profit, atr_pct)
