@@ -540,9 +540,12 @@ class ExecutionEngine:
             min_notional = float(self.exchange.get_min_notional(symbol) or 5.0)
             env_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "5"))
 
-            adaptive_quote = float(adaptive.get("QUOTE_SIZE", env_quote)) if adaptive else env_quote
+            # 🔥 RISK ENGINE (აქ ჩასვი)
+            balance = float(self.exchange.fetch_balance().get("USDT", {}).get("free", 0))
+            risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
+            risk_amount = balance * (risk_pct / 100.0)
 
-            quote_amount = max(min_notional, adaptive_quote, env_quote)
+            quote_amount = max(min_notional, adaptive_quote, env_quote, risk_amount)
             quote_amount = round(quote_amount, 2)
 
             logger.info(
