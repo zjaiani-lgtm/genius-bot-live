@@ -558,14 +558,32 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             return sig
 
         if open_trade:
-            if GEN_DEBUG:
-                logger.info(f"[GEN] BLOCKED_BY_OPEN_TRADE | symbol={symbol}")
+            # 🧠 SELL LOGIC
+            if trend < -0.2 and momentum < -0.02:
+                signal_id = str(uuid.uuid4())
+                sig = {
+                    "signal_id": signal_id,
+                    "ts_utc": _now_utc_iso(),
+                    "certified_signal": True,
+                    "final_verdict": "SELL",
+                    "meta": {
+                        "source": "GEN_SIGNAL_SELL",
+                        "symbol": symbol,
+                        "reason": "TREND_REVERSAL",
+                        "decision": decision,
+                    },
+                    "execution": {
+                        "symbol": symbol,
+                        "direction": "LONG"
+                    }
+                }
+                emit(sig, outbox_path)
+                return sig
+
             continue
 
         if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
-            if GEN_DEBUG:
-                logger.info(f"[GEN] BLOCKED_BY_ACTIVE_OCO | symbol={symbol}")
-            continue
+            pass
 
         if decision["final_trade_decision"] != "EXECUTE":
             continue
