@@ -446,7 +446,7 @@ class ExecutionEngine:
     if signal_id_already_executed(signal_id):
         logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
         log_event("EXEC_DEDUPED", f"id={signal_id}")
-        return
+            return
 
     # SYSTEM STATE
     state = self._load_system_state()
