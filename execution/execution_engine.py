@@ -536,10 +536,19 @@ class ExecutionEngine:
 
             quote_amount = float(quote_amount)
 
-            # ✅ ADAPTIVE QUOTE SIZE
-            if adaptive:
-                quote_amount = float(adaptive.get("QUOTE_SIZE", quote_amount))
-                logger.info(f"[AUTO] Using adaptive quote: {quote_amount}")
+            # --- SIZE CONTROL FIX ---
+            min_notional = float(self.exchange.get_min_notional(symbol) or 5.0)
+            env_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "5"))
+
+            adaptive_quote = float(adaptive.get("QUOTE_SIZE", env_quote)) if adaptive else env_quote
+
+            quote_amount = max(min_notional, adaptive_quote, env_quote)
+            quote_amount = round(quote_amount, 2)
+
+            logger.info(
+                f"[SIZE_FIX] final_quote={quote_amount} "
+                f"(min_notional={min_notional}, adaptive={adaptive_quote}, env={env_quote})"
+            )
 
             try:
                 if has_open_trade_for_symbol(str(symbol)):
