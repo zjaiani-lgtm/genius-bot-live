@@ -682,8 +682,8 @@ class ExecutionEngine:
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_LIVE_BLOCKED", symbol=str(symbol))
             return
 
-        except Exception as e:
-            logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
-            log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
-            return
+    except Exception as e:
+        logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
+        log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
+        return
             
