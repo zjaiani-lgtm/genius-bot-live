@@ -685,4 +685,4 @@ class ExecutionEngine:
         except Exception as e:
             logger.exception(f"EXEC_LIVE_ERROR | id={signal_id} err={e}")
             log_event("EXEC_LIVE_ERROR", f"{signal_id} err={e}")
-            return
+            
