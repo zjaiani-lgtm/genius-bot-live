@@ -442,11 +442,11 @@ class ExecutionEngine:
 
     logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-    # DEDUP CHECK
-    if signal_id_already_executed(signal_id):
-        logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
-        log_event("EXEC_DEDUPED", f"id={signal_id}")
-        return
+# DEDUP CHECK
+if signal_id_already_executed(signal_id):
+    logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
+    log_event("EXEC_DEDUPED", f"id={signal_id}")
+    return
 
     # SYSTEM STATE
     state = self._load_system_state()
