@@ -502,19 +502,20 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # 🚫 თუ BLOCKED
         if decision["final_trade_decision"] != "EXECUTE":
             logger.info(
-                f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "f"final={decision['final_trade_decision']} ai={decision['ai_score']:.3f}"
+                f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "
+                f"final={decision['final_trade_decision']} ai={decision['ai_score']:.3f}"
              )
             
-             if GEN_DEBUG:
-                 logger.info(
-                     f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "
-                     f"final={decision['final_trade_decision']} "
-                     f"ai={decision['ai_score']:.3f} "
-                     f"risk={risk} volReg={vol_reg} "
-                     f"struct={struct_ok} conf={conf:.3f}"
-                 )
+         if GEN_DEBUG:
+             logger.info(
+                 f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "
+                 f"final={decision['final_trade_decision']} "
+                 f"ai={decision['ai_score']:.3f} "
+                 f"risk={risk} volReg={vol_reg} "
+                 f"struct={struct_ok} conf={conf:.3f}"
+             )
              
-             continue
+         continue
 
          if GEN_DEBUG:
              logger.info(
