@@ -497,6 +497,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         )
         decision = core.decide(inp)
 
+        logger.info(f"[GEN] FINAL_DECISION={decision['final_trade_decision']}")
+        
+
+        if decision["final_trade_decision"] != "EXECUTE":
+            logger.info(f"[GEN] BLOCKED_BY_CORE | symbol={symbol} final={decision['final_trade_decision']} ai={decision['ai_score']:.3f}")
+            continue
+
         if GEN_DEBUG:
             logger.info(
                 f"[GEN] CORE_DECISION | symbol={symbol} ai={decision['ai_score']:.3f} macro={decision['macro_gate']} "
