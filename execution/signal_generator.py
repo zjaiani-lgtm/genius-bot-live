@@ -582,9 +582,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if open_trade:
             # 🚫 BLOCK SELL თუ OCO უკვე აქტიურია
-            if active_oco:
-                continue
-
+            
             # SELL LOGIC
             if trend < -0.2 and mom1 < -0.02:
                 signal_id = str(uuid.uuid4())
