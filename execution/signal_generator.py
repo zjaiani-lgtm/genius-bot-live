@@ -557,9 +557,19 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             _emit(sig, outbox_path)
             return sig
 
+    mom1 = 0.0
+    if len(closes) > 1:
+        mom1 = _momentum(closes, 1)
+
         if open_trade:
-            # 🧠 SELL LOGIC
-            if trend < -0.2 and momentum < -0.02:
+
+            # 🚫 BLOCK SELL თუ OCO უკვე აქტიურია
+            if active_oco:
+                continue
+ 
+            
+            # SELL LOGIC
+            if trend < -0.2 and mom1 < -0.02:
                 signal_id = str(uuid.uuid4())
                 sig = {
                     "signal_id": signal_id,
@@ -580,10 +590,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 emit(sig, outbox_path)
                 return sig
 
-            continue
-
-        if active_oco and BLOCK_SIGNALS_WHEN_ACTIVE_OCO:
-            pass
 
         if decision["final_trade_decision"] != "EXECUTE":
             continue
