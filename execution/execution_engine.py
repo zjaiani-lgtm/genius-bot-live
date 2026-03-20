@@ -571,9 +571,11 @@ class ExecutionEngine:
                 try:
                     active_positions = count_open_trades_for_symbol(symbol)
                 except:
-                    active_positions = 1  # fallback safety
+                    active_positions = 1
+
 
                 if has_active_oco_for_symbol(str(symbol)):
+
                     if not allow_scaling:
                         msg = f"EXEC_REJECT | ACTIVE_OCO (scaling disabled) | id={signal_id} symbol={symbol}"
                         logger.warning(msg)
@@ -586,15 +588,15 @@ class ExecutionEngine:
                         )
                         return
 
-                     if active_positions >= max_positions:
-                         msg = f"EXEC_REJECT | MAX_POSITIONS_REACHED ({active_positions}) | id={signal_id} symbol={symbol}"
-                         logger.warning(msg)
-                         log_event("EXEC_REJECT_MAX_POSITIONS", msg)
-                         mark_signal_id_executed(
-                             signal_id,
-                             signal_hash=signal_hash,
-                             action="REJECT_MAX_POSITIONS",
-                             symbol=str(symbol)
+                    if active_positions >= max_positions:
+                        msg = f"EXEC_REJECT | MAX_POSITIONS_REACHED ({active_positions}) | id={signal_id} symbol={symbol}"
+                        logger.warning(msg)
+                        log_event("EXEC_REJECT_MAX_POSITIONS", msg)
+                        mark_signal_id_executed(
+                            signal_id,
+                            signal_hash=signal_hash,
+                            action="REJECT_MAX_POSITIONS",
+                            symbol=str(symbol)
                         )
                         return
             except Exception as e:
