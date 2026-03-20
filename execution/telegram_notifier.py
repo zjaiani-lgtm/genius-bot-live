@@ -286,6 +286,8 @@ def notify_trade_closed(
     outcome: str,
     stats: Optional[Dict[str, Any]] = None,
 ) -> None:
+    verdict = "SELL"
+
     msg = (
         f"{_outcome_title(outcome)}\n\n"
         f"🪙 <b>Symbol:</b> <code>{_escape_html(symbol)}</code>\n"
@@ -294,6 +296,7 @@ def notify_trade_closed(
         f"💵 <b>PnL:</b> <code>{_fmt_usdt(pnl_quote)}</code>\n"
         f"📈 <b>PnL %:</b> <code>{_fmt_pct(pnl_pct)}</code>\n"
         f"🎯 <b>Outcome:</b> <code>{_escape_html(str(outcome).upper())}</code>\n"
+        f"🧠 <b>Verdict:</b> <code>{_escape_html(verdict)}</code>\n"
         f"🕒 <b>Time:</b> <code>{_now_str()}</code>"
     )
 
