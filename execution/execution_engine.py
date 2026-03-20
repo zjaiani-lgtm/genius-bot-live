@@ -202,21 +202,18 @@ class ExecutionEngine:
                     f"tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}"
                 )
 
-                # --- normalize statuses ---
                 tp_status = (tp_status or "").lower().strip()
                 sl_status = (sl_status or "").lower().strip()
 
                 filled = {"filled", "closed"}
                 canceled_set = {"canceled", "cancelled", "expired", "rejected"}
 
-                # --- safe float ---
                 def _safe_float(x):
                     try:
                         return float(x)
                     except Exception:
                         return None
 
-                # --- prevent double-close ---
                 current_status = status
                 if isinstance(current_status, str):
                     current_status = current_status.strip().upper()
@@ -227,7 +224,6 @@ class ExecutionEngine:
                     logger.debug(f"OCO_ALREADY_CLOSED | link={link_id} status={current_status}")
                     continue
 
-                # --- get trade ---
                 tr = get_trade(signal_id)
                 if not tr:
                     logger.warning(f"TRADE_ROW_MISSING | signal_id={signal_id}")
@@ -242,13 +238,11 @@ class ExecutionEngine:
                     logger.error(f"TRADE_PARSE_FAIL | {signal_id} | {e}")
                     continue
 
-                # --- BOTH FILLED (desync protection) ---
                 if tp_status in filled and sl_status in filled:
                     logger.critical(f"OCO_DESYNC | BOTH_FILLED | {signal_id}")
                     set_oco_status(link_id, "DESYNC")
                     continue
 
-                # --- helper: safe exit price ---
                 def _get_exit_price(order_obj, fallback_price):
                     try:
                         if order_obj:
@@ -268,7 +262,6 @@ class ExecutionEngine:
                     logger.error(f"NO_EXIT_PRICE | signal_id={signal_id}")
                     return None
 
-                # --- TP FILLED ---
                 if tp_status in filled:
                     exitp = _get_exit_price(tp, tp_price)
                     if exitp is None:
@@ -312,7 +305,6 @@ class ExecutionEngine:
 
                     continue
 
-                # --- SL FILLED ---
                 if sl_status in filled:
                     exitp = _get_exit_price(sl, sl_stop_price or sl_limit_price)
                     if exitp is None:
@@ -356,18 +348,13 @@ class ExecutionEngine:
 
                     continue
 
-                # --- BOTH CANCELED ---
                 if tp_status in canceled_set and sl_status in canceled_set:
                     logger.error(f"OCO_BROKEN | link={link_id} signal_id={signal_id}")
                     set_oco_status(link_id, "BROKEN")
                     continue
 
-                # --- UNKNOWN STATE ---
                 if tp_status not in (filled | canceled_set) or sl_status not in (filled | canceled_set):
                     logger.debug(f"OCO_UNKNOWN_STATE | tp={tp_status} sl={sl_status} id={signal_id}")
-
-                # --- STILL OPEN ---
-                # logger.debug(f"OCO_OPEN | link={link_id} id={signal_id}")
 
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
@@ -624,7 +611,12 @@ class ExecutionEngine:
                     msg = f"EXEC_REJECT | OPEN_TRADE_RACE | id={signal_id} symbol={symbol}"
                     logger.warning(msg)
                     log_event("EXEC_REJECT_OPEN_TRADE_RACE", msg)
-                    mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_OPEN_TRADE_RACE", symbol=str(symbol))
+                    mark_signal_id_executed(
+                        signal_id,
+                        signal_hash=signal_hash,
+                        action="REJECT_OPEN_TRADE_RACE",
+                        symbol=str(symbol)
+                    )
                     return
 
                 allow_scaling = os.getenv("ALLOW_POSITION_SCALING", "false").lower() == "true"
@@ -637,7 +629,7 @@ class ExecutionEngine:
                 try:
                     active_positions = count_open_trades_for_symbol(symbol)
                 except Exception:
-                    active_positions = 1
+                    active_positions = 0
 
                 if has_active_oco_for_symbol(str(symbol)):
                     if not allow_scaling:
@@ -679,7 +671,12 @@ class ExecutionEngine:
                 msg = f"EXEC_REJECT | MIN_NOTIONAL | id={signal_id} symbol={symbol} quote={quote_amount:.8f} < min_notional={min_notional}"
                 logger.warning(msg)
                 log_event("EXEC_REJECT_MIN_NOTIONAL", msg)
-                mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_MIN_NOTIONAL", symbol=str(symbol))
+                mark_signal_id_executed(
+                    signal_id,
+                    signal_hash=signal_hash,
+                    action="REJECT_MIN_NOTIONAL",
+                    symbol=str(symbol)
+                )
                 return
 
             if is_kill_switch_active():
@@ -787,7 +784,12 @@ class ExecutionEngine:
             msg = f"EXEC_REJECT | LIVE_BLOCKED | id={signal_id} reason={e}"
             logger.warning(msg)
             log_event("EXEC_REJECT_LIVE_BLOCKED", msg)
-            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="REJECT_LIVE_BLOCKED", symbol=str(symbol))
+            mark_signal_id_executed(
+                signal_id,
+                signal_hash=signal_hash,
+                action="REJECT_LIVE_BLOCKED",
+                symbol=str(symbol)
+            )
             return
 
         except Exception as e:
