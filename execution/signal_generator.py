@@ -498,19 +498,32 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         decision = core.decide(inp)
 
         logger.info(f"[GEN] FINAL_DECISION={decision['final_trade_decision']}")
-        
 
+        # 🚫 თუ BLOCKED
         if decision["final_trade_decision"] != "EXECUTE":
-            logger.info(f"[GEN] BLOCKED_BY_CORE | symbol={symbol} final={decision['final_trade_decision']} ai={decision['ai_score']:.3f}")
-            continue
-
-        if GEN_DEBUG:
             logger.info(
-                f"[GEN] CORE_DECISION | symbol={symbol} ai={decision['ai_score']:.3f} macro={decision['macro_gate']} "
-                f"strat={decision['active_strategy']} final={decision['final_trade_decision']} risk={risk} "
-                f"volReg={vol_reg} atr%={atrp:.2f} last={last:.6f} prev={prev:.6f} "
-                f"dropped_last_candle={dropped} outbox={outbox_path}"
-            )
+                f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "f"final={decision['final_trade_decision']} ai={decision['ai_score']:.3f}"
+             )
+            
+             if GEN_DEBUG:
+                 logger.info(
+                     f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "
+                     f"final={decision['final_trade_decision']} "
+                     f"ai={decision['ai_score']:.3f} "
+                     f"risk={risk} volReg={vol_reg} "
+                     f"struct={struct_ok} conf={conf:.3f}"
+                 )
+             
+             continue
+
+         if GEN_DEBUG:
+             logger.info(
+                 f"[GEN] CORE_DECISION | symbol={symbol} ai={decision['ai_score']:.3f} "
+                 f"macro={decision['macro_gate']} strat={decision['active_strategy']} "
+                 f"final={decision['final_trade_decision']} risk={risk} "
+                 f"volReg={vol_reg} atr%={atrp:.2f} last={last:.6f} prev={prev:.6f} "
+                 f"dropped_last_candle={dropped} outbox={outbox_path}"
+             ) 
 
             mom1_dbg = _momentum(closes, 1)
             mom10 = _momentum(closes, 10)
