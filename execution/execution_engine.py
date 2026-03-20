@@ -21,6 +21,7 @@ from execution.db.repository import (
     get_open_trade_for_symbol,
     close_trade,
     get_trade_stats,
+    count_open_trades_for_symbol,
 )
 from execution.kill_switch import is_kill_switch_active
 from execution.virtual_wallet import simulate_market_entry
@@ -165,19 +166,28 @@ class ExecutionEngine:
         if not rows:
             return
 
-        CLOSED = {"closed", "filled"}
-        CANCELED = {"canceled", "cancelled", "expired", "rejected"}
-
         for r in rows:
             (
-                link_id, signal_id, symbol, base_asset,
-                tp_order_id, sl_order_id,
-                tp_price, sl_stop_price, sl_limit_price,
-                amount, status, created_at, updated_at
+                link_id,
+                signal_id,
+                symbol,
+                base_asset,
+                tp_order_id,
+                sl_order_id,
+                tp_price,
+                sl_stop_price,
+                sl_limit_price,
+                amount,
+                status,
+                created_at,
+                updated_at,
             ) = r
 
             if not tp_order_id or not sl_order_id:
-                logger.warning(f"OCO_RECONCILE_SKIP | link={link_id} missing order ids tp='{tp_order_id}' sl='{sl_order_id}'")
+                logger.warning(
+                    f"OCO_RECONCILE_SKIP | link={link_id} missing order ids "
+                    f"tp='{tp_order_id}' sl='{sl_order_id}'"
+                )
                 continue
 
             try:
@@ -192,107 +202,172 @@ class ExecutionEngine:
                     f"tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}"
                 )
 
-                if sl_status in CLOSED:
-                    set_oco_status(link_id, "CLOSED_SL")
+                # --- normalize statuses ---
+                tp_status = (tp_status or "").lower().strip()
+                sl_status = (sl_status or "").lower().strip()
 
-                    tr = get_trade(signal_id)
-                    exitp = self._exit_price_from_order(sl, fallback=float(sl_stop_price))
+                filled = {"filled", "closed"}
+                canceled_set = {"canceled", "cancelled", "expired", "rejected"}
 
-                    if tr:
-                        _, _, qty, quote_in, entry_price, *_ = tr
-                        pnl_quote, pnl_pct = self._calc_net_pnl(
-                            float(quote_in), float(entry_price), float(exitp), float(qty)
-                        )
-                        close_trade(
-                            signal_id,
-                            exit_price=float(exitp),
-                            outcome="SL",
-                            pnl_quote=float(pnl_quote),
-                            pnl_pct=float(pnl_pct),
-                        )
-                        log_event(
-                            "TRADE_CLOSED",
-                            f"{signal_id} {symbol} SL exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
-                        )
-                        logger.info(
-                            f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=SL "
-                            f"exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
-                        )
+                # --- safe float ---
+                def _safe_float(x):
+                    try:
+                        return float(x)
+                    except Exception:
+                        return None
 
-                        try:
-                            stats = get_trade_stats()
-                            notify_trade_closed(
-                                symbol=str(symbol),
-                                entry_price=float(entry_price),
-                                exit_price=float(exitp),
-                                pnl_quote=float(pnl_quote),
-                                pnl_pct=float(pnl_pct),
-                                outcome="SL",
-                                stats=stats,
-                            )
-                        except Exception as e:
-                            logger.warning(f"TG_NOTIFY_CLOSE_FAIL | id={signal_id} outcome=SL err={e}")
-                    else:
-                        log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} SL filled but trade row missing")
-                        logger.warning(f"TRADE_CLOSE_WARN | id={signal_id} symbol={symbol} SL filled but trade missing")
+                # --- prevent double-close ---
+                current_status = status
+                if isinstance(current_status, str):
+                    current_status = current_status.strip().upper()
+                else:
+                    current_status = ""
 
-                    log_event("OCO_CLOSED", f"{signal_id} SL_FILLED sl={sl_order_id} tp={tp_order_id} tp_status={tp_status}")
+                if current_status in {"CLOSED_TP", "CLOSED_SL"}:
+                    logger.debug(f"OCO_ALREADY_CLOSED | link={link_id} status={current_status}")
                     continue
 
-                if tp_status in CLOSED:
-                    set_oco_status(link_id, "CLOSED_TP")
+                # --- get trade ---
+                tr = get_trade(signal_id)
+                if not tr:
+                    logger.warning(f"TRADE_ROW_MISSING | signal_id={signal_id}")
+                    continue
 
-                    tr = get_trade(signal_id)
-                    exitp = self._exit_price_from_order(tp, fallback=float(tp_price))
+                try:
+                    _, _, qty, quote_in, entry_price, *_ = tr
+                    qty = float(qty)
+                    quote_in = float(quote_in)
+                    entry_price = float(entry_price)
+                except Exception as e:
+                    logger.error(f"TRADE_PARSE_FAIL | {signal_id} | {e}")
+                    continue
 
-                    if tr:
-                        _, _, qty, quote_in, entry_price, *_ = tr
-                        pnl_quote, pnl_pct = self._calc_net_pnl(
-                            float(quote_in), float(entry_price), float(exitp), float(qty)
-                        )
+                # --- BOTH FILLED (desync protection) ---
+                if tp_status in filled and sl_status in filled:
+                    logger.critical(f"OCO_DESYNC | BOTH_FILLED | {signal_id}")
+                    set_oco_status(link_id, "DESYNC")
+                    continue
+
+                # --- helper: safe exit price ---
+                def _get_exit_price(order_obj, fallback_price):
+                    try:
+                        if order_obj:
+                            px = self._exit_price_from_order(
+                                order_obj,
+                                fallback=_safe_float(fallback_price) or 0.0
+                            )
+                            if px:
+                                return float(px)
+                    except Exception as e:
+                        logger.warning(f"EXIT_PRICE_FAIL | fallback used | {e}")
+
+                    fb = _safe_float(fallback_price)
+                    if fb is not None:
+                        return fb
+
+                    logger.error(f"NO_EXIT_PRICE | signal_id={signal_id}")
+                    return None
+
+                # --- TP FILLED ---
+                if tp_status in filled:
+                    exitp = _get_exit_price(tp, tp_price)
+                    if exitp is None:
+                        continue
+
+                    try:
+                        pnl_quote, pnl_pct = self._calc_net_pnl(quote_in, entry_price, exitp, qty)
+                    except Exception as e:
+                        logger.error(f"TP_CALC_FAIL | {signal_id} | {e}")
+                        continue
+
+                    if current_status not in {"CLOSED_TP", "CLOSED_SL"}:
                         close_trade(
                             signal_id,
-                            exit_price=float(exitp),
+                            exit_price=exitp,
                             outcome="TP",
-                            pnl_quote=float(pnl_quote),
-                            pnl_pct=float(pnl_pct),
+                            pnl_quote=pnl_quote,
+                            pnl_pct=pnl_pct,
                         )
-                        log_event(
-                            "TRADE_CLOSED",
-                            f"{signal_id} {symbol} TP exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
-                        )
-                        logger.info(
-                            f"TRADE_CLOSED | id={signal_id} symbol={symbol} outcome=TP "
-                            f"exit={exitp} net_pnl_quote={pnl_quote:.4f} net_pnl_pct={pnl_pct:.3f}"
-                        )
+                        set_oco_status(link_id, "CLOSED_TP")
 
-                        try:
-                            stats = get_trade_stats()
-                            notify_trade_closed(
-                                symbol=str(symbol),
-                                entry_price=float(entry_price),
-                                exit_price=float(exitp),
-                                pnl_quote=float(pnl_quote),
-                                pnl_pct=float(pnl_pct),
-                                outcome="TP",
-                                stats=stats,
-                            )
-                        except Exception as e:
-                            logger.warning(f"TG_NOTIFY_CLOSE_FAIL | id={signal_id} outcome=TP err={e}")
-                    else:
-                        log_event("TRADE_CLOSE_WARN", f"{signal_id} {symbol} TP filled but trade row missing")
-                        logger.warning(f"TRADE_CLOSE_WARN | id={signal_id} symbol={symbol} TP filled but trade missing")
+                    log_event("TRADE_CLOSED", f"{signal_id} {symbol} TP exit={exitp:.6f} pnl={pnl_quote:.4f}")
+                    logger.info(
+                        f"TRADE_CLOSED | id={signal_id} outcome=TP "
+                        f"exit={exitp:.6f} pnl={pnl_quote:.4f}"
+                    )
 
-                    log_event("OCO_CLOSED", f"{signal_id} TP_FILLED tp={tp_order_id} sl={sl_order_id} sl_status={sl_status}")
+                    try:
+                        stats = get_trade_stats()
+                        notify_trade_closed(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            exit_price=exitp,
+                            pnl_quote=pnl_quote,
+                            pnl_pct=pnl_pct,
+                            outcome="TP",
+                            stats=stats,
+                        )
+                    except Exception as e:
+                        logger.warning(f"TG_TP_FAIL | {e}")
+
                     continue
 
-                if (tp_status in CANCELED and sl_status == "open") or (sl_status in CANCELED and tp_status == "open"):
+                # --- SL FILLED ---
+                if sl_status in filled:
+                    exitp = _get_exit_price(sl, sl_stop_price or sl_limit_price)
+                    if exitp is None:
+                        continue
+
+                    try:
+                        pnl_quote, pnl_pct = self._calc_net_pnl(quote_in, entry_price, exitp, qty)
+                    except Exception as e:
+                        logger.error(f"SL_CALC_FAIL | {signal_id} | {e}")
+                        continue
+
+                    if current_status not in {"CLOSED_TP", "CLOSED_SL"}:
+                        close_trade(
+                            signal_id,
+                            exit_price=exitp,
+                            outcome="SL",
+                            pnl_quote=pnl_quote,
+                            pnl_pct=pnl_pct,
+                        )
+                        set_oco_status(link_id, "CLOSED_SL")
+
+                    log_event("TRADE_CLOSED", f"{signal_id} {symbol} SL exit={exitp:.6f} pnl={pnl_quote:.4f}")
+                    logger.info(
+                        f"TRADE_CLOSED | id={signal_id} outcome=SL "
+                        f"exit={exitp:.6f} pnl={pnl_quote:.4f}"
+                    )
+
+                    try:
+                        stats = get_trade_stats()
+                        notify_trade_closed(
+                            symbol=symbol,
+                            entry_price=entry_price,
+                            exit_price=exitp,
+                            pnl_quote=pnl_quote,
+                            pnl_pct=pnl_pct,
+                            outcome="SL",
+                            stats=stats,
+                        )
+                    except Exception as e:
+                        logger.warning(f"TG_SL_FAIL | {e}")
+
                     continue
 
-                if tp_status in CANCELED and sl_status in CANCELED:
-                    set_oco_status(link_id, "FAILED")
-                    log_event("OCO_FAILED", f"{signal_id} tp={tp_order_id}:{tp_status} sl={sl_order_id}:{sl_status}")
+                # --- BOTH CANCELED ---
+                if tp_status in canceled_set and sl_status in canceled_set:
+                    logger.error(f"OCO_BROKEN | link={link_id} signal_id={signal_id}")
+                    set_oco_status(link_id, "BROKEN")
                     continue
+
+                # --- UNKNOWN STATE ---
+                if tp_status not in (filled | canceled_set) or sl_status not in (filled | canceled_set):
+                    logger.debug(f"OCO_UNKNOWN_STATE | tp={tp_status} sl={sl_status} id={signal_id}")
+
+                # --- STILL OPEN ---
+                # logger.debug(f"OCO_OPEN | link={link_id} id={signal_id}")
 
             except Exception as e:
                 logger.warning(f"OCO_RECONCILE_FAIL | link={link_id} symbol={symbol} err={e}")
@@ -429,7 +504,6 @@ class ExecutionEngine:
         signal_id = str(signal.get("signal_id", "UNKNOWN"))
         verdict = str(signal.get("final_verdict", "")).upper()
 
-        # 🔥 AUTO ADAPTIVE CONFIG
         adaptive = signal.get("adaptive", {})
 
         if adaptive:
@@ -442,13 +516,11 @@ class ExecutionEngine:
 
         logger.info(f"EXEC_ENTER | id={signal_id} verdict={verdict} MODE={self.mode} ENV_KILL_SWITCH={self.env_kill_switch}")
 
-        # DEDUP CHECK
         if signal_id_already_executed(signal_id):
             logger.warning(f"EXEC_DEDUPED | duplicate ignored | id={signal_id}")
             log_event("EXEC_DEDUPED", f"id={signal_id}")
             return
 
-        # SYSTEM STATE
         state = self._load_system_state()
         db_status = str(state.get("status") or "").upper()
         db_kill = bool(state.get("kill_switch"))
@@ -484,7 +556,6 @@ class ExecutionEngine:
 
         signal_hash = signal.get("_fingerprint") or signal.get("signal_hash")
 
-        # SELL FLOW
         if verdict == "SELL":
             if not symbol or direction != "LONG":
                 logger.warning(f"EXEC_REJECT | bad SELL payload | id={signal_id}")
@@ -494,13 +565,11 @@ class ExecutionEngine:
             self._execute_sell(signal_id=signal_id, symbol=str(symbol), signal_hash=signal_hash)
             return
 
-        # VALIDATION
         if not symbol or direction != "LONG" or entry_type != "MARKET":
             logger.warning(f"EXEC_REJECT | bad payload | id={signal_id}")
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id}")
             return
 
-        # DEMO MODE
         if self.mode == "DEMO":
             last_price = float(self.price_feed.fetch_ticker(symbol)["last"])
             base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
@@ -513,7 +582,6 @@ class ExecutionEngine:
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_DEMO", symbol=str(symbol))
             return
 
-        # EXCHANGE CHECK
         if self.exchange is None:
             log_event("EXEC_BLOCKED_NO_EXCHANGE", f"{signal_id}")
             logger.warning(f"EXEC_BLOCKED | exchange client not wired | id={signal_id}")
@@ -536,11 +604,9 @@ class ExecutionEngine:
 
             quote_amount = float(quote_amount)
 
-            # --- SIZE CONTROL FIX ---
             min_notional = float(self.exchange.get_min_notional(symbol) or 5.0)
             env_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "5"))
 
-            # 🔥 RISK ENGINE (აქ ჩასვი)
             balance = float(self.exchange.fetch_balance_free("USDT"))
             risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
             risk_amount = balance * (risk_pct / 100.0)
@@ -565,17 +631,15 @@ class ExecutionEngine:
 
                 try:
                     max_positions = int(os.getenv("MAX_POSITIONS_PER_SYMBOL", "1"))
-                except:
+                except Exception:
                     max_positions = 1
 
                 try:
                     active_positions = count_open_trades_for_symbol(symbol)
-                except:
+                except Exception:
                     active_positions = 1
 
-
                 if has_active_oco_for_symbol(str(symbol)):
-
                     if not allow_scaling:
                         msg = f"EXEC_REJECT | ACTIVE_OCO (scaling disabled) | id={signal_id} symbol={symbol}"
                         logger.warning(msg)
