@@ -47,7 +47,11 @@ def get_system_state():
     return _fetchone("SELECT * FROM system_state WHERE id = 1")
 
 
-def update_system_state(status: Optional[str] = None, startup_sync_ok: Optional[int] = None, kill_switch: Optional[int] = None) -> None:
+def update_system_state(
+    status: Optional[str] = None,
+    startup_sync_ok: Optional[int] = None,
+    kill_switch: Optional[int] = None
+) -> None:
     fields = []
     params = []
 
@@ -73,14 +77,31 @@ def update_system_state(status: Optional[str] = None, startup_sync_ok: Optional[
 # executed signals
 # -----------------------
 def signal_id_already_executed(signal_id: str) -> bool:
-    row = _fetchone("SELECT signal_id FROM executed_signals WHERE signal_id = ?", (str(signal_id),))
+    row = _fetchone(
+        "SELECT signal_id FROM executed_signals WHERE signal_id = ?",
+        (str(signal_id),)
+    )
     return row is not None
 
 
-def mark_signal_id_executed(signal_id: str, signal_hash: Optional[str] = None, action: str = "", symbol: str = "") -> None:
+def mark_signal_id_executed(
+    signal_id: str,
+    signal_hash: Optional[str] = None,
+    action: str = "",
+    symbol: str = ""
+) -> None:
     _execute(
-        "INSERT OR REPLACE INTO executed_signals (signal_id, signal_hash, action, symbol, executed_at) VALUES (?, ?, ?, ?, datetime('now'))",
-        (str(signal_id), str(signal_hash) if signal_hash else None, str(action), str(symbol)),
+        """
+        INSERT OR REPLACE INTO executed_signals
+        (signal_id, signal_hash, action, symbol, executed_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        """,
+        (
+            str(signal_id),
+            str(signal_hash) if signal_hash else None,
+            str(action),
+            str(symbol),
+        ),
     )
 
 
@@ -170,6 +191,19 @@ def has_open_trade_for_symbol(symbol: str) -> bool:
         (str(symbol),),
     )
     return row is not None
+
+
+def count_open_trades_for_symbol(symbol: str) -> int:
+    row = _fetchone(
+        """
+        SELECT COUNT(*)
+        FROM trades
+        WHERE UPPER(symbol) = UPPER(?)
+          AND closed_at IS NULL
+        """,
+        (str(symbol),),
+    )
+    return int(row[0] or 0) if row else 0
 
 
 def get_open_trade_for_symbol(symbol: str):
