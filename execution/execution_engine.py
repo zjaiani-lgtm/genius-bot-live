@@ -586,17 +586,17 @@ class ExecutionEngine:
                         )
                         return
 
-                    if active_positions >= max_positions:
-                        msg = f"EXEC_REJECT | MAX_POSITIONS_REACHED ({active_positions}) | id={signal_id} symbol={symbol}"
-                        logger.warning(msg)
-                        log_event("EXEC_REJECT_MAX_POSITIONS", msg)
-                        mark_signal_id_executed(
-                            signal_id,
-                            signal_hash=signal_hash,
-                            action="REJECT_MAX_POSITIONS",
-                            symbol=str(symbol)
-                       )
-                       return
+                     if active_positions >= max_positions:
+                         msg = f"EXEC_REJECT | MAX_POSITIONS_REACHED ({active_positions}) | id={signal_id} symbol={symbol}"
+                         logger.warning(msg)
+                         log_event("EXEC_REJECT_MAX_POSITIONS", msg)
+                         mark_signal_id_executed(
+                             signal_id,
+                             signal_hash=signal_hash,
+                             action="REJECT_MAX_POSITIONS",
+                             symbol=str(symbol)
+                        )
+                        return
             except Exception as e:
                 msg = f"EXEC_BLOCKED | TRADE_STATE_CHECK_FAIL | id={signal_id} symbol={symbol} err={e}"
                 logger.warning(msg)
