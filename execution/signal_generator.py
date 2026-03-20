@@ -505,7 +505,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"dropped_last_candle={dropped} outbox={outbox_path}"
             )
 
-            mom1 = _momentum(closes, 1)
+            mom1_dbg = _momentum(closes, 1)
             mom10 = _momentum(closes, 10)
             slope = _slope_sma(closes)
             ups3 = _ups_count(closes, 3)
@@ -520,7 +520,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 logger.info(
                     f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
                     f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
-                    f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
+                    f"mom1={mom1_dbg:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
                     f"sma5={s5:.6f} sma10={s10:.6f} ma_gap%={ma_gap_abs:.3f} "
                     f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
                 )
@@ -529,7 +529,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 logger.info(
                     f"[GEN] DIAG | symbol={symbol} trend={trend:.3f} conf={conf:.3f} struct={struct_ok} "
                     f"vol_score={vol_score:.3f} struct_reason={struct_reason} "
-                    f"mom1={mom1:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
+                    f"mom1={mom1_dbg:.6f} mom10={mom10:.6f} slope={slope:.6f} ups3={ups3} "
                     f"sma5={s5:.6f} sma10={s10:.6f} sma_gap%={sma_gap_pct:.3f} "
                     f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
                 )
@@ -557,17 +557,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             _emit(sig, outbox_path)
             return sig
 
-    mom1 = 0.0
-    if len(closes) > 1:
-        mom1 = _momentum(closes, 1)
+        mom1 = _momentum(closes, 1) if len(closes) > 1 else 0.0
 
         if open_trade:
-
             # 🚫 BLOCK SELL თუ OCO უკვე აქტიურია
             if active_oco:
                 continue
- 
-            
+
             # SELL LOGIC
             if trend < -0.2 and mom1 < -0.02:
                 signal_id = str(uuid.uuid4())
@@ -584,12 +580,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     },
                     "execution": {
                         "symbol": symbol,
-                        "direction": "LONG"
+                        "direction": "LONG",
                     }
                 }
-                emit(sig, outbox_path)
+                _emit(sig, outbox_path)
                 return sig
 
+            continue
 
         if decision["final_trade_decision"] != "EXECUTE":
             continue
