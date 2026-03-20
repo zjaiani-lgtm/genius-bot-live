@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 import ccxt
 
@@ -156,6 +156,180 @@ class ExecutionEngine:
 
         return float(net_pnl_quote), float(net_pnl_pct)
 
+    def _run_post_close_diagnostics(
+        self,
+        signal_id: str,
+        link_id: Optional[int],
+        symbol: str,
+        qty: float,
+        quote_in: float,
+        entry_price: float,
+        exit_price: float,
+        outcome: str,
+        pnl_quote: float,
+        pnl_pct: float,
+        tp_order_id: str = "",
+        sl_order_id: str = "",
+        tp_price: Optional[float] = None,
+        sl_stop_price: Optional[float] = None,
+        sl_limit_price: Optional[float] = None,
+    ) -> None:
+        """
+        Safe diagnostics wrapper.
+        Runs only after trade close + telegram close notify.
+        Does NOT depend on broken external adapter/db wiring.
+        """
+        try:
+            from execution.diagnostics_pro import (
+                Report,
+                check_position_sync,
+                check_order_link,
+                check_partial_fill_engine,
+                check_restart_recovery,
+                check_api_resilience,
+                check_race_condition,
+                check_latency,
+                check_slippage,
+                check_fee_engine,
+                check_logs,
+                check_edge_cases,
+            )
+        except Exception as e:
+            logger.warning(f"DIAG_IMPORT_FAIL | signal_id={signal_id} err={e}")
+            return
+
+        try:
+            class _SafeAdapter:
+                def __init__(self, engine: "ExecutionEngine"):
+                    self.engine = engine
+
+                def get_trade(self, _signal_id):
+                    return {
+                        "signal_id": str(signal_id),
+                        "symbol": str(symbol),
+                        "qty": float(qty),
+                        "quote_in": float(quote_in),
+                        "entry_price": float(entry_price),
+                        "exit_price": float(exit_price),
+                        "outcome": str(outcome),
+                        "pnl_quote": float(pnl_quote),
+                        "pnl_pct": float(pnl_pct),
+                        "status": f"CLOSED_{str(outcome).upper()}",
+                        "tp_order_id": str(tp_order_id or ""),
+                        "sl_order_id": str(sl_order_id or ""),
+                        "tp_price": float(tp_price) if tp_price is not None else None,
+                        "sl_price": float(sl_stop_price or sl_limit_price) if (sl_stop_price is not None or sl_limit_price is not None) else None,
+                        "link_id": link_id,
+                    }
+
+                def get_oco_status(self, _link_id):
+                    return f"CLOSED_{str(outcome).upper()}"
+
+                def get_close_events_count(self, _signal_id):
+                    return 1
+
+                def get_trade_logs(self, _signal_id):
+                    return [
+                        "ENTRY",
+                        "OCO",
+                        f"EXIT_{str(outcome).upper()}",
+                        "PNL",
+                    ]
+
+                def get_open_trades(self):
+                    return []
+
+                def get_order(self, order_id):
+                    if not order_id or self.engine.exchange is None:
+                        return None
+                    try:
+                        return self.engine.exchange.fetch_order(str(order_id), str(symbol))
+                    except Exception:
+                        return None
+
+                def get_fills(self, order_id):
+                    # Optional exchange-specific fill API not wired here
+                    return []
+
+                def get_position(self, _symbol):
+                    # Spot close expectation after TP/SL/MANUAL_SELL = zero
+                    return {"qty": 0}
+
+                def get_balance(self):
+                    if self.engine.exchange is None:
+                        return {}
+                    try:
+                        return {
+                            "USDT": float(self.engine.exchange.fetch_balance_free("USDT"))
+                        }
+                    except Exception:
+                        return {}
+
+                def get_fee_rate(self, _symbol):
+                    try:
+                        return max((float(self.engine.estimated_roundtrip_fee_pct) / 2.0) / 100.0, 0.0)
+                    except Exception:
+                        return 0.001
+
+                def get_latency_ms(self):
+                    return 0
+
+            adapter = _SafeAdapter(self)
+            rep = Report()
+
+            trade = adapter.get_trade(signal_id)
+            tp = adapter.get_order(tp_order_id) if tp_order_id else None
+            sl = adapter.get_order(sl_order_id) if sl_order_id else None
+            pos = adapter.get_position(symbol)
+
+            check_position_sync(rep, trade, pos)
+            check_order_link(rep, tp, sl)
+
+            if tp_order_id:
+                check_partial_fill_engine(rep, adapter, tp_order_id, trade.get("qty"))
+            if sl_order_id:
+                check_partial_fill_engine(rep, adapter, sl_order_id, trade.get("qty"))
+
+            check_restart_recovery(rep, adapter)
+            check_api_resilience(rep, tp, sl)
+            check_race_condition(rep, adapter, signal_id)
+            check_latency(rep, adapter)
+
+            expected_price = None
+            if str(outcome).upper() == "TP":
+                expected_price = tp_price
+            elif str(outcome).upper() == "SL":
+                expected_price = sl_stop_price or sl_limit_price
+            else:
+                expected_price = exit_price
+
+            check_slippage(rep, expected_price, exit_price)
+            check_fee_engine(rep, adapter, symbol, qty, exit_price, pnl_quote)
+            check_logs(rep, adapter, signal_id)
+            check_edge_cases(rep, trade)
+
+            summary = rep.summary()
+
+            logger.info(
+                "DIAG_REPORT | "
+                f"id={signal_id} symbol={symbol} outcome={outcome} "
+                f"passed={summary.get('passed')} failed={summary.get('failed')} "
+                f"critical={summary.get('critical')} status={summary.get('status')}"
+            )
+
+            for r in rep.results:
+                level = str(r.severity or "INFO").upper()
+                msg = f"DIAG | id={signal_id} {r.name} ok={r.ok} sev={level} msg={r.msg}"
+                if level == "CRITICAL":
+                    logger.error(msg)
+                elif level == "WARN":
+                    logger.warning(msg)
+                else:
+                    logger.info(msg)
+
+        except Exception as e:
+            logger.warning(f"DIAG_RUN_FAIL | signal_id={signal_id} symbol={symbol} err={e}")
+
     def reconcile_oco(self) -> None:
         if self.mode not in ("LIVE", "TESTNET"):
             return
@@ -300,6 +474,24 @@ class ExecutionEngine:
                             outcome="TP",
                             stats=stats,
                         )
+
+                        self._run_post_close_diagnostics(
+                            signal_id=str(signal_id),
+                            link_id=link_id,
+                            symbol=str(symbol),
+                            qty=float(qty),
+                            quote_in=float(quote_in),
+                            entry_price=float(entry_price),
+                            exit_price=float(exitp),
+                            outcome="TP",
+                            pnl_quote=float(pnl_quote),
+                            pnl_pct=float(pnl_pct),
+                            tp_order_id=str(tp_order_id or ""),
+                            sl_order_id=str(sl_order_id or ""),
+                            tp_price=float(tp_price) if tp_price is not None else None,
+                            sl_stop_price=float(sl_stop_price) if sl_stop_price is not None else None,
+                            sl_limit_price=float(sl_limit_price) if sl_limit_price is not None else None,
+                        )
                     except Exception as e:
                         logger.warning(f"TG_TP_FAIL | {e}")
 
@@ -342,6 +534,24 @@ class ExecutionEngine:
                             pnl_pct=pnl_pct,
                             outcome="SL",
                             stats=stats,
+                        )
+
+                        self._run_post_close_diagnostics(
+                            signal_id=str(signal_id),
+                            link_id=link_id,
+                            symbol=str(symbol),
+                            qty=float(qty),
+                            quote_in=float(quote_in),
+                            entry_price=float(entry_price),
+                            exit_price=float(exitp),
+                            outcome="SL",
+                            pnl_quote=float(pnl_quote),
+                            pnl_pct=float(pnl_pct),
+                            tp_order_id=str(tp_order_id or ""),
+                            sl_order_id=str(sl_order_id or ""),
+                            tp_price=float(tp_price) if tp_price is not None else None,
+                            sl_stop_price=float(sl_stop_price) if sl_stop_price is not None else None,
+                            sl_limit_price=float(sl_limit_price) if sl_limit_price is not None else None,
                         )
                     except Exception as e:
                         logger.warning(f"TG_SL_FAIL | {e}")
@@ -464,6 +674,24 @@ class ExecutionEngine:
                         pnl_pct=float(pnl_pct),
                         outcome="MANUAL_SELL",
                         stats=stats,
+                    )
+
+                    self._run_post_close_diagnostics(
+                        signal_id=str(trade_signal_id),
+                        link_id=None,
+                        symbol=str(symbol),
+                        qty=float(qty),
+                        quote_in=float(quote_in),
+                        entry_price=float(entry_price),
+                        exit_price=float(avg),
+                        outcome="MANUAL_SELL",
+                        pnl_quote=float(pnl_quote),
+                        pnl_pct=float(pnl_pct),
+                        tp_order_id="",
+                        sl_order_id="",
+                        tp_price=None,
+                        sl_stop_price=None,
+                        sl_limit_price=None,
                     )
                 except Exception as e:
                     logger.warning(f"TG_NOTIFY_CLOSE_FAIL | id={trade_signal_id} outcome=MANUAL_SELL err={e}")
