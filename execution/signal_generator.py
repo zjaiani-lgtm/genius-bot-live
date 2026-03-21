@@ -482,6 +482,7 @@ def _risk_state(vol_regime: str, ai_score: float) -> str:
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
+    global _consecutive_sl, _sl_pause_until
     outbox_path = _get_outbox_path()
 
     # core singleton — ერთხელ იქმნება, ყველგან გამოიყენება
@@ -599,7 +600,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             return None
         else:
-            global _consecutive_sl
             logger.warning(
                 f"[SL_RECOVERY] PASSED ✅ | reset consecutive_sl={_consecutive_sl}→0 | trading resumed"
             )
