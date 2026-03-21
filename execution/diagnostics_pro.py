@@ -1,333 +1,262 @@
-#!/bin/bash
+# execution/diagnostics_pro.py
 # ============================================================
-# GENIUS BOT — სრული დიაგნოსტიკა
-# გამოყენება: bash diagnose.sh
+# გასწორებული ვერსია:
+# 1. check_fee_engine — dead code გასწორდა
+# 2. ყველა function სწორადაა
 # ============================================================
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-NC='\033[0m'
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+import time
 
-OK="${GREEN}[✓ OK]${NC}"
-FAIL="${RED}[✗ FAIL]${NC}"
-WARN="${YELLOW}[⚠ WARN]${NC}"
-INFO="${CYAN}[ℹ INFO]${NC}"
 
-PASS=0
-FAIL_COUNT=0
-WARN_COUNT=0
+# =========================
+# RESULT STRUCTURES
+# =========================
 
-pass() { echo -e "$OK $1"; ((PASS++)); }
-fail() { echo -e "$FAIL $1"; ((FAIL_COUNT++)); }
-warn() { echo -e "$WARN $1"; ((WARN_COUNT++)); }
-info() { echo -e "$INFO $1"; }
-section() { echo; echo -e "${BOLD}${BLUE}━━━ $1 ━━━${NC}"; }
+@dataclass
+class CheckResult:
+    name: str
+    ok: bool
+    msg: str = ""
+    severity: str = "INFO"  # INFO / WARN / CRITICAL
 
-echo
-echo -e "${BOLD}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║     GENIUS BOT — სრული დიაგნოსტიკა      ║${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
-echo -e "$(date '+%Y-%m-%d %H:%M:%S')"
 
-# ─────────────────────────────────────────
-section "1. Python ფაილები"
-# ─────────────────────────────────────────
-FILES=(
-    "execution/signal_generator.py"
-    "execution/execution_engine.py"
-    "execution/excel_live_core.py"
-    "execution/exchange_client.py"
-    "execution/kill_switch.py"
-    "execution/main.py"
-    "execution/telegram_notifier.py"
-    "execution/diagnostics_pro.py"
-)
-BASE="/opt/render/project/src"
-for f in "${FILES[@]}"; do
-    path="$BASE/$f"
-    if [ -f "$path" ]; then
-        err=$(python3 -c "import ast; ast.parse(open('$path').read())" 2>&1)
-        if [ -z "$err" ]; then
-            pass "$f — სინტაქსი OK"
-        else
-            fail "$f — SyntaxError: $err"
-        fi
-    else
-        fail "$f — ფაილი არ მოიძებნა"
-    fi
-done
+@dataclass
+class Report:
+    results: List[CheckResult] = field(default_factory=list)
 
-# ─────────────────────────────────────────
-section "2. DB კავშირი"
-# ─────────────────────────────────────────
-DB_PATH="${DB_PATH:-/var/data/genius_bot_v2.db}"
-if [ -f "$DB_PATH" ]; then
-    pass "DB ფაილი არსებობს: $DB_PATH"
-    size=$(du -sh "$DB_PATH" 2>/dev/null | cut -f1)
-    info "DB ზომა: $size"
-    tables=$(python3 -c "
-import sqlite3
-try:
-    conn = sqlite3.connect('$DB_PATH')
-    cur = conn.cursor()
-    cur.execute(\"SELECT name FROM sqlite_master WHERE type='table'\")
-    print(' '.join([r[0] for r in cur.fetchall()]))
-    conn.close()
-except Exception as e:
-    print('ERROR: ' + str(e))
-" 2>/dev/null)
-    if [[ "$tables" == *"ERROR"* ]]; then
-        fail "DB კავშირი ვერ შედგა: $tables"
-    else
-        pass "DB ცხრილები: $tables"
-    fi
-else
-    fail "DB ფაილი არ მოიძებნა: $DB_PATH"
-fi
+    def add(self, name, ok, msg="", severity="INFO"):
+        self.results.append(CheckResult(name, ok, msg, severity))
 
-# ─────────────────────────────────────────
-section "3. system_state შემოწმება"
-# ─────────────────────────────────────────
-python3 << 'PYEOF'
-import sqlite3, os, sys
-db = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
-try:
-    conn = sqlite3.connect(db)
-    row = conn.execute("SELECT * FROM system_state WHERE id=1").fetchone()
-    if not row:
-        print(f"\033[0;31m[✗ FAIL]\033[0m system_state row არ არსებობს")
-        sys.exit(1)
-    status = str(row[1]).upper()
-    sync   = int(row[2] or 0)
-    kill   = int(row[3] or 0)
+    def summary(self):
+        ok = sum(1 for r in self.results if r.ok)
+        fail = len(self.results) - ok
+        critical = sum(1 for r in self.results if (not r.ok and r.severity == "CRITICAL"))
+        return {
+            "passed": ok,
+            "failed": fail,
+            "critical": critical,
+            "status": "SAFE" if fail == 0 else ("UNSAFE" if critical > 0 else "WARN")
+        }
 
-    if status in ("ACTIVE", "RUNNING"):
-        print(f"\033[0;32m[✓ OK]\033[0m   system status={status}")
+    def print(self):
+        print("\n===== DIAGNOSTIC REPORT =====\n")
+        for r in self.results:
+            icon = "OK" if r.ok else "FAIL"
+            print(f"[{icon}] [{r.severity}] {r.name} -> {r.msg}")
+        s = self.summary()
+        print(f"\nPASSED: {s['passed']} | FAILED: {s['failed']} | STATUS: {s['status']}\n")
+
+
+# =========================
+# ADAPTER INTERFACE
+# =========================
+
+class Adapter:
+    def get_trade(self, signal_id) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def get_oco_status(self, link_id) -> str:
+        raise NotImplementedError
+
+    def get_close_events_count(self, signal_id) -> int:
+        raise NotImplementedError
+
+    def get_trade_logs(self, signal_id) -> List[str]:
+        raise NotImplementedError
+
+    def get_open_trades(self) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def get_order(self, order_id) -> Optional[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def get_fills(self, order_id) -> List[Dict[str, Any]]:
+        raise NotImplementedError
+
+    def get_position(self, symbol) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def get_balance(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def get_fee_rate(self, symbol) -> float:
+        return 0.001
+
+    def get_latency_ms(self) -> int:
+        return 0
+
+
+# =========================
+# HELPERS
+# =========================
+
+def norm(s):
+    return (s or "").lower().strip()
+
+
+def safe_float(x):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+
+def avg_fill_price(fills):
+    total_qty = 0.0
+    total_quote = 0.0
+    for f in fills:
+        q = safe_float(f.get("qty") or f.get("quantity") or f.get("executedQty"))
+        p = safe_float(f.get("price"))
+        if q and p:
+            total_qty += q
+            total_quote += q * p
+    if total_qty > 0:
+        return total_quote / total_qty, total_qty
+    return None, 0.0
+
+
+# =========================
+# CHECKS
+# =========================
+
+def check_position_sync(rep: Report, trade, pos):
+    status = norm(trade.get("status"))
+    qty = safe_float(pos.get("positionAmt") or pos.get("qty") or 0)
+    if status in ["closed_tp", "closed_sl"]:
+        ok = (qty == 0)
+        rep.add("POSITION_SYNC", ok, f"pos_qty={qty}", "CRITICAL" if not ok else "INFO")
     else:
-        print(f"\033[1;33m[⚠ WARN]\033[0m system status={status} (ACTIVE/RUNNING უნდა იყოს)")
+        rep.add("POSITION_SYNC", True, "open trade - skip", "INFO")
 
-    if sync == 1:
-        print(f"\033[0;32m[✓ OK]\033[0m   startup_sync_ok=1")
-    else:
-        print(f"\033[1;33m[⚠ WARN]\033[0m startup_sync_ok=0 (ბოტი შესაძლოა PAUSED-ში იყოს)")
 
-    if kill == 0:
-        print(f"\033[0;32m[✓ OK]\033[0m   kill_switch=0 (OFF)")
-    else:
-        print(f"\033[0;31m[✗ FAIL]\033[0m kill_switch=1 — ბოტი BLOCKED!")
+def check_order_link(rep: Report, tp, sl):
+    ok = bool(tp and sl and tp.get("status") and sl.get("status"))
+    rep.add("ORDER_LINK_INTEGRITY", ok, f"tp={bool(tp)} sl={bool(sl)}", "CRITICAL" if not ok else "INFO")
 
-    conn.close()
-except Exception as e:
-    print(f"\033[0;31m[✗ FAIL]\033[0m system_state შეცდომა: {e}")
-PYEOF
 
-# ─────────────────────────────────────────
-section "4. ღია trade-ები"
-# ─────────────────────────────────────────
-python3 << 'PYEOF'
-import sqlite3, os
-db = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
-try:
-    conn = sqlite3.connect(db)
-    rows = conn.execute("""
-        SELECT signal_id, symbol, qty, quote_in, entry_price, opened_at
-        FROM trades WHERE closed_at IS NULL
-    """).fetchall()
-    if rows:
-        print(f"\033[0;32m[✓ OK]\033[0m   ღია trade-ები: {len(rows)}")
-        for r in rows:
-            print(f"         └─ {r[1]} qty={r[2]:.6f} entry={r[4]:.4f} opened={r[5]}")
-    else:
-        print(f"\033[0;36m[ℹ INFO]\033[0m ღია trade-ები: 0")
-    conn.close()
-except Exception as e:
-    print(f"\033[0;31m[✗ FAIL]\033[0m trades query: {e}")
-PYEOF
+def check_partial_fill_engine(rep: Report, adapter: Adapter, order_id, expected_qty):
+    fills = adapter.get_fills(order_id) or []
+    avg_px, filled_qty = avg_fill_price(fills)
+    ok = (filled_qty <= (safe_float(expected_qty) or 0))
+    rep.add("PARTIAL_FILL_ENGINE", ok, f"filled={filled_qty} avg_px={avg_px}", "WARN" if not ok else "INFO")
 
-# ─────────────────────────────────────────
-section "5. ღია OCO links"
-# ─────────────────────────────────────────
-python3 << 'PYEOF'
-import sqlite3, os
-db = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
-try:
-    conn = sqlite3.connect(db)
-    rows = conn.execute("""
-        SELECT id, symbol, status, tp_price, sl_stop_price, created_at
-        FROM oco_links WHERE status IN ('ACTIVE','OPEN','ARMED')
-    """).fetchall()
-    if rows:
-        print(f"\033[0;32m[✓ OK]\033[0m   ღია OCO links: {len(rows)}")
-        for r in rows:
-            print(f"         └─ link={r[0]} {r[1]} status={r[2]} tp={r[3]:.4f} sl={r[4]:.4f}")
-    else:
-        print(f"\033[0;36m[ℹ INFO]\033[0m ღია OCO links: 0")
-    conn.close()
-except Exception as e:
-    print(f"\033[0;31m[✗ FAIL]\033[0m oco_links query: {e}")
-PYEOF
 
-# ─────────────────────────────────────────
-section "6. Performance სტატისტიკა"
-# ─────────────────────────────────────────
-python3 << 'PYEOF'
-import sqlite3, os
-db = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
-try:
-    conn = sqlite3.connect(db)
-    r = conn.execute("""
-        SELECT
-            COUNT(*) as total,
-            SUM(CASE WHEN pnl_quote > 0 THEN 1 ELSE 0 END) as wins,
-            SUM(CASE WHEN pnl_quote <= 0 THEN 1 ELSE 0 END) as losses,
-            COALESCE(SUM(pnl_quote),0) as total_pnl,
-            COALESCE(AVG(CASE WHEN pnl_quote>0 THEN pnl_quote END),0) as avg_win,
-            COALESCE(ABS(AVG(CASE WHEN pnl_quote<0 THEN pnl_quote END)),0) as avg_loss
-        FROM trades WHERE closed_at IS NOT NULL
-    """).fetchone()
-    total,wins,losses,pnl,avg_win,avg_loss = r
-    wins = wins or 0; losses = losses or 0
-    winrate = (wins/total*100) if total else 0
-    pf = (avg_win/avg_loss) if avg_loss else 0
+def check_restart_recovery(rep: Report, adapter: Adapter):
+    open_trades = adapter.get_open_trades()
+    ok = True
+    missing = 0
+    for t in open_trades:
+        link_id = t.get("link_id")
+        oco_status = adapter.get_oco_status(link_id)
+        if not oco_status:
+            ok = False
+            missing += 1
+    rep.add("RESTART_RECOVERY", ok, f"missing_oco={missing}", "CRITICAL" if not ok else "INFO")
 
-    print(f"\033[0;36m[ℹ INFO]\033[0m დახურული trade-ები: {total}")
-    print(f"\033[0;36m[ℹ INFO]\033[0m Wins: {wins} | Losses: {losses}")
 
-    if winrate >= 40:
-        print(f"\033[0;32m[✓ OK]\033[0m   Winrate: {winrate:.1f}%")
-    elif winrate >= 30:
-        print(f"\033[1;33m[⚠ WARN]\033[0m Winrate: {winrate:.1f}% (დაბალია)")
-    else:
-        print(f"\033[0;31m[✗ FAIL]\033[0m Winrate: {winrate:.1f}% (კრიტიკულად დაბალია)")
+def check_api_resilience(rep: Report, tp, sl):
+    ok = (tp is not None and sl is not None)
+    rep.add("API_RESILIENCE", ok, "orders fetched", "CRITICAL" if not ok else "INFO")
 
-    if pnl >= 0:
-        print(f"\033[0;32m[✓ OK]\033[0m   Total PnL: +{pnl:.4f} USDT")
-    else:
-        print(f"\033[0;31m[✗ FAIL]\033[0m Total PnL: {pnl:.4f} USDT (ზარალი)")
 
-    if pf >= 1.0:
-        print(f"\033[0;32m[✓ OK]\033[0m   Profit Factor: {pf:.2f}")
-    else:
-        print(f"\033[1;33m[⚠ WARN]\033[0m Profit Factor: {pf:.2f} (< 1.0)")
+def check_race_condition(rep: Report, adapter: Adapter, signal_id):
+    closes = adapter.get_close_events_count(signal_id)
+    ok = (closes <= 1)
+    rep.add("RACE_PROTECTION", ok, f"close_events={closes}", "CRITICAL" if not ok else "INFO")
 
-    print(f"\033[0;36m[ℹ INFO]\033[0m Avg Win: +{avg_win:.4f} | Avg Loss: -{avg_loss:.4f} USDT")
-    conn.close()
-except Exception as e:
-    print(f"\033[0;31m[✗ FAIL]\033[0m stats query: {e}")
-PYEOF
 
-# ─────────────────────────────────────────
-section "7. ENV ცვლადები"
-# ─────────────────────────────────────────
-check_env() {
-    local key=$1 expected=$2
-    val="${!key}"
-    if [ -z "$val" ]; then
-        fail "$key — დაყენებული არ არის"
-    elif [ -n "$expected" ] && [ "$val" != "$expected" ]; then
-        warn "$key=$val (expected=$expected)"
-    else
-        pass "$key=$val"
-    fi
-}
-check_env "MODE" "LIVE"
-check_env "KILL_SWITCH" "false"
-check_env "LIVE_CONFIRMATION" "true"
-check_env "ALLOW_LIVE_SIGNALS" "true"
-check_env "BOT_QUOTE_PER_TRADE"
-check_env "TP_PCT"
-check_env "SL_PCT"
-check_env "BOT_SYMBOLS"
+def check_latency(rep: Report, adapter: Adapter):
+    lat = adapter.get_latency_ms()
+    ok = (lat < 2000)
+    rep.add("LATENCY", ok, f"{lat}ms", "WARN" if not ok else "INFO")
 
-# ─────────────────────────────────────────
-section "8. signal_outbox შემოწმება"
-# ─────────────────────────────────────────
-OUTBOX="${SIGNAL_OUTBOX_PATH:-/var/data/signal_outbox.json}"
-if [ -f "$OUTBOX" ]; then
-    size=$(wc -c < "$OUTBOX")
-    age=$(( $(date +%s) - $(stat -c %Y "$OUTBOX" 2>/dev/null || echo 0) ))
-    info "Outbox: $OUTBOX (${size} bytes, ${age}s ago)"
-    if [ "$size" -gt 10000 ]; then
-        warn "Outbox ძალიან დიდია (${size} bytes) — შესაძლოა signal-ები დაგროვდა"
-    else
-        pass "Outbox ზომა OK"
-    fi
-else
-    info "Outbox ფაილი ჯერ არ შექმნილა (ნორმალურია პირველ გაშვებაზე)"
-fi
 
-# ─────────────────────────────────────────
-section "9. SL Cooldown სტატუსი"
-# ─────────────────────────────────────────
-python3 << 'PYEOF'
-import sqlite3, os
-from datetime import datetime, timedelta
-db = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
-try:
-    conn = sqlite3.connect(db)
-    # ბოლო 1 საათის SL-ები
-    rows = conn.execute("""
-        SELECT outcome, closed_at FROM trades
-        WHERE closed_at IS NOT NULL
-        AND closed_at >= datetime('now', '-1 hour')
-        ORDER BY closed_at DESC
-    """).fetchall()
+def check_slippage(rep: Report, expected_price, actual_price):
+    ep = safe_float(expected_price)
+    ap = safe_float(actual_price)
+    if not ep or not ap:
+        rep.add("SLIPPAGE", False, "missing price", "WARN")
+        return
+    dev = abs(ap - ep) / ep
+    ok = dev < 0.02
+    rep.add("SLIPPAGE", ok, f"dev={dev:.4f}", "WARN" if not ok else "INFO")
 
-    sl_count = sum(1 for r in rows if r[0] == 'SL')
-    tp_count = sum(1 for r in rows if r[0] == 'TP')
 
-    print(f"\033[0;36m[ℹ INFO]\033[0m ბოლო 1 სთ: {sl_count} SL, {tp_count} TP")
+def check_fee_engine(rep: Report, adapter: Adapter, symbol, qty, actual_price, pnl_reported):
+    """
+    FIX: ძველი ვერსია ყოველთვის True-ს აბრუნებდა.
+    ახლა: estimated fee-ს ადარებს pnl-ს.
+    """
+    fee_rate = adapter.get_fee_rate(symbol)
+    q = safe_float(qty) or 0
+    ap = safe_float(actual_price) or 0
+    pnl = safe_float(pnl_reported)
 
-    if sl_count >= 2:
-        print(f"\033[1;33m[⚠ WARN]\033[0m {sl_count} SL ბოლო 1 სთ-ში — SL Cooldown შეიძლება active იყოს")
-    else:
-        print(f"\033[0;32m[✓ OK]\033[0m   SL count ნორმალურია ({sl_count}/2 limit)")
-    conn.close()
-except Exception as e:
-    print(f"\033[0;36m[ℹ INFO]\033[0m SL check: {e}")
-PYEOF
+    estimated_fee = q * ap * fee_rate * 2  # roundtrip (buy + sell)
 
-# ─────────────────────────────────────────
-section "10. ბოლო audit_log"
-# ─────────────────────────────────────────
-python3 << 'PYEOF'
-import sqlite3, os
-db = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
-try:
-    conn = sqlite3.connect(db)
-    rows = conn.execute("""
-        SELECT event_type, message, created_at FROM audit_log
-        ORDER BY id DESC LIMIT 5
-    """).fetchall()
-    print(f"\033[0;36m[ℹ INFO]\033[0m ბოლო 5 audit event:")
-    for r in rows:
-        print(f"         └─ [{r[2]}] {r[0]}: {r[1][:60]}")
-    conn.close()
-except Exception as e:
-    print(f"\033[0;31m[✗ FAIL]\033[0m audit_log: {e}")
-PYEOF
+    if pnl is None:
+        rep.add("FEE_ENGINE", True, f"est_fee={estimated_fee:.6f} pnl=None", "INFO")
+        return
 
-# ─────────────────────────────────────────
-section "საბოლოო ვერდიქტი"
-# ─────────────────────────────────────────
-echo
-TOTAL=$((PASS + FAIL_COUNT + WARN_COUNT))
-echo -e "  სულ შემოწმება: ${TOTAL}"
-echo -e "  ${GREEN}OK: ${PASS}${NC}"
-echo -e "  ${YELLOW}WARN: ${WARN_COUNT}${NC}"
-echo -e "  ${RED}FAIL: ${FAIL_COUNT}${NC}"
-echo
+    # pnl არ უნდა იყოს estimated_fee-ზე მეტად დაბალი
+    ok = pnl >= -(estimated_fee * 3)  # 3x tolerance
+    rep.add("FEE_ENGINE", ok, f"est_fee={estimated_fee:.6f} pnl={pnl:.6f}", "WARN" if not ok else "INFO")
 
-if [ "$FAIL_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
-    echo -e "${GREEN}${BOLD}  ✅ ბოტი სრულიად ჯანმრთელია!${NC}"
-elif [ "$FAIL_COUNT" -eq 0 ]; then
-    echo -e "${YELLOW}${BOLD}  ⚠️  ბოტი მუშაობს, მაგრამ ${WARN_COUNT} გაფრთხილება${NC}"
-else
-    echo -e "${RED}${BOLD}  ❌ ${FAIL_COUNT} კრიტიკული პრობლემა გამოვლინდა!${NC}"
-fi
-echo
+
+def check_logs(rep: Report, adapter: Adapter, signal_id):
+    logs = adapter.get_trade_logs(signal_id) or []
+    needed = ["ENTRY", "OCO", "EXIT", "PNL"]
+    ok = all(any(n in l for l in logs) for n in needed)
+    rep.add("LOG_COMPLETENESS", ok, f"logs={len(logs)}", "WARN" if not ok else "INFO")
+
+
+def check_edge_cases(rep: Report, trade):
+    qty = safe_float(trade.get("qty"))
+    price = safe_float(trade.get("entry_price"))
+    ok = (qty is not None and qty > 0 and price is not None and price > 0)
+    rep.add("EDGE_CASES", ok, f"qty={qty} price={price}", "CRITICAL" if not ok else "INFO")
+
+
+# =========================
+# MASTER RUN
+# =========================
+
+def run_pro_diagnostics(adapter: Adapter, signal_id: str, link_id: str):
+    rep = Report()
+
+    trade = adapter.get_trade(signal_id)
+    if not trade:
+        rep.add("TRADE_EXISTS", False, "trade missing", "CRITICAL")
+        rep.print()
+        return rep
+
+    symbol = trade.get("symbol")
+    tp_id = trade.get("tp_order_id")
+    sl_id = trade.get("sl_order_id")
+
+    tp = adapter.get_order(tp_id) if tp_id else None
+    sl = adapter.get_order(sl_id) if sl_id else None
+    pos = adapter.get_position(symbol)
+
+    check_position_sync(rep, trade, pos)
+    check_order_link(rep, tp, sl)
+    if tp_id:
+        check_partial_fill_engine(rep, adapter, tp_id, trade.get("qty"))
+    if sl_id:
+        check_partial_fill_engine(rep, adapter, sl_id, trade.get("qty"))
+    check_restart_recovery(rep, adapter)
+    check_api_resilience(rep, tp, sl)
+    check_race_condition(rep, adapter, signal_id)
+    check_latency(rep, adapter)
+
+    expected = trade.get("tp_price") or trade.get("sl_price")
+    actual = (tp or {}).get("avgPrice") or (sl or {}).get("avgPrice")
+    check_slippage(rep, expected, actual)
+    check_fee_engine(rep, adapter, symbol, trade.get("qty"), actual, trade.get("pnl_quote"))
+    check_logs(rep, adapter, signal_id)
+    check_edge_cases(rep, trade)
+
+    rep.print()
+    return rep
