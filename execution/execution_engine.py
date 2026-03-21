@@ -123,13 +123,19 @@ class ExecutionEngine:
             logger.warning(f"SPREAD_FETCH_FAIL | symbol={symbol} err={e}")
             return None
 
-    def _net_edge_ok(self) -> Tuple[bool, str]:
+    def _net_edge_ok(self, tp_pct: Optional[float] = None) -> Tuple[bool, str]:
+        """
+        FIX: adaptive tp_pct-ს ღებულობს.
+        სიგნალზე adaptive TP=0.6% → edge check-ი სწორ მნიშვნელობაზე მუშაობს.
+        """
+        effective_tp = tp_pct if tp_pct is not None else self.tp_pct
         cost = self.estimated_roundtrip_fee_pct + self.estimated_slippage_pct
-        net = self.tp_pct - cost
+        net = effective_tp - cost
         if net < self.min_net_profit_pct:
             return False, (
-                f"EDGE_TOO_SMALL tp={self.tp_pct:.2f} cost={cost:.2f} "
-                f"net={net:.2f} < min_net={self.min_net_profit_pct:.2f}"
+                f"EDGE_TOO_SMALL tp={effective_tp:.3f} cost={cost:.2f} "
+                f"net={net:.3f} < min_net={self.min_net_profit_pct:.2f} "
+                f"({'adaptive' if tp_pct is not None else 'static'})"
             )
         return True, "OK"
 
@@ -818,7 +824,7 @@ class ExecutionEngine:
         from execution.exchange_client import LiveTradingBlocked
 
         try:
-            ok_edge, edge_reason = self._net_edge_ok()
+            ok_edge, edge_reason = self._net_edge_ok(tp_pct=tp_pct)
             if not ok_edge:
                 msg = f"EXEC_REJECT | EDGE_GATE | id={signal_id} symbol={symbol} {edge_reason}"
                 logger.warning(msg)
@@ -839,12 +845,20 @@ class ExecutionEngine:
             risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
             risk_amount = balance * (risk_pct / 100.0)
 
-            quote_amount = max(min_notional, env_quote, risk_amount)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX: regime QUOTE_SIZE პატივდება
+            # adaptive["QUOTE_SIZE"] = 5.6 (UNCERTAIN) ან 7.0 (BULL)
+            # min_notional-ი კვლავ floor-ია
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            regime_quote = float(adaptive.get("QUOTE_SIZE", env_quote)) if adaptive else env_quote
+            quote_amount = max(min_notional, regime_quote)
             quote_amount = round(quote_amount, 2)
 
+            regime_name = adaptive.get("REGIME", "STATIC") if adaptive else "STATIC"
             logger.info(
                 f"[SIZE_FIX] final_quote={quote_amount} "
-                f"(min_notional={min_notional}, env={env_quote})"
+                f"regime={regime_name} regime_quote={regime_quote:.2f} "
+                f"min_notional={min_notional} tp={tp_pct:.3f}% sl={sl_pct:.3f}%"
             )
 
             try:
@@ -927,8 +941,13 @@ class ExecutionEngine:
 
             buy, buy_avg = self._place_entry_buy(symbol=str(symbol), quote_amount=quote_amount)
 
-            logger.info(f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
-            log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} order_id={buy.get('id')}")
+            logger.info(
+                f"EXEC_LIVE_BUY_OK | id={signal_id} symbol={symbol} "
+                f"quote={quote_amount} avg={buy_avg} "
+                f"regime={regime_name} tp={tp_pct:.3f}% sl={sl_pct:.3f}% "
+                f"order_id={buy.get('id')}"
+            )
+            log_event("TRADE_EXECUTED", f"{signal_id} LIVE BUY {symbol} quote={quote_amount} avg={buy_avg} regime={regime_name} tp={tp_pct:.3f}% sl={sl_pct:.3f}% order_id={buy.get('id')}")
 
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
 
