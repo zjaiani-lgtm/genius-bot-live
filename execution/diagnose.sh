@@ -327,6 +327,217 @@ except Exception as e:
     print(f'\033[0;31m[FAIL]\033[0m audit_log: {e}')
 PYEOF
 
+
+# ─────────────────────────────────────────
+section "11. ლოგიკის აუდიტი — ATR / Regime / PnL"
+# ─────────────────────────────────────────
+BASE="${BASE_PATH:-/opt/render/project/src/execution}"
+python3 - "$BASE" << 'PYEOF'
+import os, sys, importlib.util
+from datetime import datetime, timedelta
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+ok_c=0; fail_c=0; warn_c=0
+
+def ok(m):   global ok_c;   print(f'{GREEN}[OK]{NC}   {m}'); ok_c+=1
+def fail(m): global fail_c; print(f'{RED}[FAIL]{NC} {m}'); fail_c+=1
+def warn(m): global warn_c; print(f'{YELLOW}[WARN]{NC} {m}'); warn_c+=1
+def info(m): print(f'{CYAN}[INFO]{NC} {m}')
+
+BASE = sys.argv[1] if len(sys.argv) > 1 else "/opt/render/project/src/execution"
+
+# ══════════════════════════════════════════════════
+# 1. regime_engine.py — ლოგიკის ტესტი
+# ══════════════════════════════════════════════════
+re_path = os.path.join(BASE, "regime_engine.py")
+if not os.path.exists(re_path):
+    fail(f"regime_engine.py ვერ მოიძებნა: {re_path}")
+else:
+    try:
+        spec = importlib.util.spec_from_file_location("regime_engine_diag", re_path)
+        mod  = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # backward compat: ძველი stub-ი config=-ს მოითხოვს
+        try:
+            eng = mod.MarketRegimeEngine()
+        except TypeError:
+            eng = mod.MarketRegimeEngine(config={})
+
+        is_new = hasattr(eng, 'notify_outcome') and hasattr(eng, 'is_paused')
+        if is_new:
+            ok("regime_engine.py — ახალი ვერსია (notify_outcome + is_paused) ✓")
+        else:
+            warn("regime_engine.py — ძველი stub ვერსია! SL Cooldown tracking არ მუშაობს engine-ში")
+            warn("  → გამოსწორება: ჩაანაცვლე განახლებული regime_engine.py-ით")
+
+        # რეჟიმების შემოწმება — 5 შემთხვევა
+        stub_map = {"TREND_UP": "BULL", "TREND_DOWN": "BEAR"}  # ძველი stub aliases
+        tests = [
+            (0.6,  0.4,  "BULL"),
+            (0.2,  0.2,  "SIDEWAYS"),
+            (0.3,  0.5,  "UNCERTAIN"),
+            (0.1,  2.0,  "VOLATILE"),
+            (-0.2, 0.5,  "BEAR"),
+        ]
+        passed = 0
+        for trend, atr, expected in tests:
+            got = eng.detect_regime(trend, atr)
+            norm = stub_map.get(got, got)
+            if norm == expected:
+                ok(f"detect_regime({trend:+.1f}, {atr}) → '{expected}' ✓")
+                passed += 1
+            else:
+                fail(f"detect_regime({trend:+.1f}, {atr}) → '{got}' (expected '{expected}') ✗")
+
+        if passed < 5:
+            warn(f"  → {5-passed}/5 რეჟიმი არასწორია — ახალი regime_engine.py საჭიროა")
+
+        # apply() API test
+        for skip_r in ("BEAR", "VOLATILE", "SIDEWAYS"):
+            try:
+                r = eng.apply(skip_r, 0.3, "BTC/USDT")
+                skip = r.get("SKIP_TRADING", False) if isinstance(r, dict) else False
+                if skip:
+                    ok(f"apply({skip_r}) → SKIP_TRADING=True ✓")
+                else:
+                    warn(f"apply({skip_r}) → SKIP_TRADING=False ან კლავიში არ არის (ძველი API?)")
+            except TypeError:
+                warn(f"apply({skip_r}) — ძველი API signature (< 2 args) — ახალი ვერსია საჭიროა")
+
+        try:
+            r_bull = eng.apply("BULL", 0.5, "BTC/USDT")
+            if isinstance(r_bull, dict):
+                tp = r_bull.get("TP_PCT", 0)
+                sl = r_bull.get("SL_PCT", 0)
+                if tp > 0 and sl > 0:
+                    ok(f"apply(BULL, atr=0.5%) → TP={tp}%  SL={sl}% ✓")
+                else:
+                    warn(f"apply(BULL) → TP/SL კლავიშები არ არის — ახალი ვერსია საჭიროა")
+        except TypeError:
+            warn("apply(BULL, ...) — ძველი API signature")
+
+        # SL Cooldown (მხოლოდ ახალ ვერსიაში)
+        if is_new:
+            t0 = datetime(2025, 1, 1, 10, 0, 0)
+            eng.notify_outcome("BTC/USDT", "SL", t0)
+            eng.notify_outcome("BTC/USDT", "SL", t0)
+            if eng.is_paused("BTC/USDT", t0 + timedelta(minutes=5)):
+                ok("SL Cooldown — 2×SL → pause ✓")
+            else:
+                fail("SL Cooldown — 2×SL შემდეგ pause არ ავიდა!")
+            eng.notify_outcome("BTC/USDT", "TP", t0)
+            if not eng.is_paused("BTC/USDT"):
+                ok("SL Cooldown — TP reset ✓")
+            else:
+                fail("SL Cooldown — TP-ზე reset ვერ მოხდა!")
+
+    except Exception as e:
+        fail(f"regime_engine.py test error: {e}")
+
+# ══════════════════════════════════════════════════
+# 2. signal_generator.py — _atr_pct() OHLCV-based
+# ══════════════════════════════════════════════════
+sg_path = os.path.join(BASE, "signal_generator.py")
+if os.path.exists(sg_path):
+    try:
+        src = open(sg_path).read()
+        if "def _atr_pct" in src and "ohlcv" in src.lower() and ("high" in src or "ohlcv[i][2]" in src):
+            ok("signal_generator._atr_pct() — real OHLCV ATR (high/low/prev_close) ✓")
+        elif "def _atr_pct" in src:
+            warn("signal_generator._atr_pct() — ფუნქცია არსებობს, OHLCV logic გადაამოწმე")
+        else:
+            fail("signal_generator._atr_pct() — ვერ მოიძებნა!")
+    except Exception as e:
+        warn(f"signal_generator.py read: {e}")
+else:
+    warn(f"signal_generator.py ვერ მოიძებნა: {sg_path}")
+
+# ══════════════════════════════════════════════════
+# 3. PnL კალკულაცია + Breakeven Winrate
+# ══════════════════════════════════════════════════
+try:
+    fee_rt = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))
+    slip   = float(os.getenv("ESTIMATED_SLIPPAGE_PCT",      "0.05"))
+    tp_pct = float(os.getenv("TP_PCT",  "1.8"))
+    sl_pct = float(os.getenv("SL_PCT",  "0.5"))
+    quote  = float(os.getenv("BOT_QUOTE_PER_TRADE", "7.0"))
+    cost   = (fee_rt + slip) / 100.0
+
+    tp_net = quote * (tp_pct / 100.0) - quote * cost
+    sl_net = -(quote * (sl_pct / 100.0) + quote * cost)
+    rr     = abs(tp_net) / abs(sl_net) if sl_net != 0 else 0
+    be_wr  = abs(sl_net) / (tp_net + abs(sl_net)) * 100 if (tp_net + abs(sl_net)) > 0 else 100
+
+    info(f"TP({tp_pct}%) net=+{tp_net:.4f} USDT | SL({sl_pct}%) net={sl_net:.4f} USDT | R:R=1:{rr:.2f}")
+
+    if tp_net > 0:
+        ok(f"TP net profit: +{tp_net:.4f} USDT (fees={fee_rt+slip:.2f}% დაფარულია) ✓")
+    else:
+        fail(f"TP net: {tp_net:.4f} USDT — TP_PCT={tp_pct}% ძალიან დაბალია fees-ის გასაფარებლად!")
+
+    if sl_net < 0:
+        ok(f"SL net loss: {sl_net:.4f} USDT ✓")
+
+    info(f"Breakeven winrate = {be_wr:.1f}% (ამაზე მეტი საჭიროა):")
+    if be_wr <= 35:
+        ok(f"Breakeven WR {be_wr:.1f}% — მარტივად მისაღწევია ✓")
+    elif be_wr <= 45:
+        warn(f"Breakeven WR {be_wr:.1f}% — winrate {be_wr:.0f}%+ საჭიროა — TP/SL-ის გადახედვა სასარგებლო იქნება")
+    else:
+        fail(f"Breakeven WR {be_wr:.1f}% — ძალიან მაღალი! TP_PCT ან SL_PCT გადასახედია")
+
+except Exception as e:
+    fail(f"PnL კალკულაცია: {e}")
+
+# ══════════════════════════════════════════════════
+# 4. Weight ჯამი — ai_score sanity
+# ══════════════════════════════════════════════════
+try:
+    keys = ["WEIGHT_TREND","WEIGHT_STRUCTURE","WEIGHT_VOLUME","WEIGHT_RISK","WEIGHT_CONFIDENCE","WEIGHT_VOLATILITY"]
+    vals = {k: float(os.getenv(k, "0")) for k in keys}
+    total_w = sum(vals.values())
+    if abs(total_w - 1.0) < 0.01:
+        ok(f"WEIGHT ჯამი = {total_w:.3f} ≈ 1.0 — ai_score სწორ დიაპაზონშია ✓")
+    else:
+        warn(f"WEIGHT ჯამი = {total_w:.3f} (≠ 1.0) — ai_score შეიძლება >1 ან <1 გამოვიდეს")
+        info(f"  " + "  ".join(f"{k.replace('WEIGHT_','')}={v}" for k,v in vals.items()))
+except Exception as e:
+    warn(f"WEIGHT check: {e}")
+
+# ══════════════════════════════════════════════════
+# 5. ENV threshold კონსისტენტობა
+# ══════════════════════════════════════════════════
+try:
+    bull_min  = float(os.getenv("REGIME_BULL_TREND_MIN",   "0.45"))
+    th_trend  = float(os.getenv("THRESHOLD_TREND",         "0.60"))
+    th_conf   = float(os.getenv("THRESHOLD_CONF",          "0.55"))
+    conf_min  = float(os.getenv("BUY_CONFIDENCE_MIN",      "0.55"))
+    ai_thresh = 0.60  # ExcelLiveCore hardcoded
+
+    if bull_min <= th_trend:
+        ok(f"REGIME_BULL_TREND_MIN({bull_min}) ≤ THRESHOLD_TREND({th_trend}) ✓")
+    else:
+        warn(f"REGIME_BULL_TREND_MIN({bull_min}) > THRESHOLD_TREND({th_trend}) — კონფლიქტი!")
+
+    if 0.40 <= th_conf <= 0.75:
+        ok(f"THRESHOLD_CONF={th_conf} — ნორმალურ დიაპაზონშია ✓")
+    else:
+        warn(f"THRESHOLD_CONF={th_conf} — უჩვეულო მნიშვნელობა (0.40–0.75 მოსალოდნელია)")
+
+    if conf_min >= th_conf:
+        ok(f"BUY_CONFIDENCE_MIN({conf_min}) ≥ THRESHOLD_CONF({th_conf}) ✓")
+    else:
+        warn(f"BUY_CONFIDENCE_MIN({conf_min}) < THRESHOLD_CONF({th_conf}) — signal-ები conf gate-ს გვერდს ვერ აუვლის")
+
+except Exception as e:
+    warn(f"Threshold check: {e}")
+
+# ══ შედეგი ══
+print()
+print(f"{CYAN}[INFO]{NC} ლოგიკის აუდიტი: {GREEN}OK={ok_c}{NC}  {YELLOW}WARN={warn_c}{NC}  {RED}FAIL={fail_c}{NC}")
+PYEOF
+
 # ─────────────────────────────────────────
 section "საბოლოო ვერდიქტი"
 # ─────────────────────────────────────────
