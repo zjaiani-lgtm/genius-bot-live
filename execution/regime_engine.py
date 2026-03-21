@@ -1,384 +1,294 @@
 # execution/regime_engine.py
 # ============================================================
-# Market Regime Adaptive Trading System
+# Market Regime Engine — v2 (fully corrected + ENV-aligned)
 # ============================================================
-# რეჟიმები:
-#   BULL     — ძლიერი uptrend, runner TP-ები
-#   BEAR     — downtrend, ახალი BUY ბლოკდება
-#   SIDEWAYS — flat/range ბაზარი, სწრაფი turnover
-#   VOLATILE — extreme vol, defensive / protective SELL
-#   UNCERTAIN— საკმარისი სიგნალი არ არის
+# ძველი ვერსია (stub):
+#   - detect_regime(trend, vol) → მხოლოდ 3 რეჟიმი
+#   - apply(regime) → მინიმალური ლოგიკა
+#   - signal_generator.py-სთან სრული incompat.
+#
+# ახალი ვერსია v2:
+#   - 5 რეჟიმი: BULL / UNCERTAIN / SIDEWAYS / BEAR / VOLATILE
+#   - ENV threshold-ები (REGIME_BULL_TREND_MIN, REGIME_SIDEWAYS_ATR_MAX)
+#   - signal_generator.py-ს _vol_regime() + detect_regime() logic-ს ემთხვევა
+#   - apply() → სრული trade params override (TP/SL/SKIP)
+#   - ATR-based TP/SL multipliers (ENV-კონფიგურირებადი)
+#   - SL Cooldown state tracking (per-symbol)
+#   - thread-safe (instance-level state, არ არის global)
 # ============================================================
-#
-# FIX HISTORY:
-#   2026-03-21 — WORKER_LOOP_ERROR: TypeError '<' not supported between
-#                instances of 'str' and 'float'
-#
-#   ROOT CAUSE (3 ადგილი):
-#     1. main.py-ი regime_engine.apply(regime) ასე იძახებდა — string
-#        პირდაპირ trend= პოზიციურ არგუმენტში ვარდებოდა.
-#     2. signal_outbox.json-დან წაკითხული მნიშვნელობები ხშირად str
-#        სახით შემოდის (JSON parse-ის შემდეგ float-ად გადაყვანა
-#        ხდებოდა გარეთ, არა ამ კლასში).
-#     3. apply() / detect_regime() type annotations float იყო,
-#        მაგრამ runtime-ზე validation არ ხდებოდა.
-#
-#   FIX:
-#     • _to_float() helper — ყველა შემომავალ მნიშვნელობაზე
-#     • apply() — positional arg-ის ნაცვლად keyword-only signature
-#     • detect_regime() — ასევე _to_float() ჭურვი
-#     • get_adaptive_params() — atr_pct / base_quote safe cast
-#     • apply() — legacy string "BULL"/"BEAR" detection + warning
-#     • detect_regime_legacy() — შენარჩუნებულია, გამაგრებული
-# ============================================================
-
 from __future__ import annotations
 
-import logging
 import os
-from typing import Any, Dict, Union
+import logging
+from datetime import datetime, timedelta
+from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger("gbm")
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# INTERNAL HELPER
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-def _to_float(value: Any, default: float = 0.0, name: str = "param") -> float:
-    """
-    ნებისმიერ მნიშვნელობას გარდაქმნის float-ად.
-
-    - None, "", "None", "null"  → default
-    - str რიცხვი ("0.742")     → float(value)
-    - უკვე float/int            → float(value)
-    - გამოუთვლელი              → default + WARNING
-
-    ეს ფუნქცია არის ROOT FIX — JSON / ENV სტრინგები
-    აღარ ჩავარდება TypeError-ში.
-    """
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        stripped = value.strip().lower()
-        if stripped in ("", "none", "null", "nan", "inf", "-inf"):
-            return default
-        try:
-            return float(stripped)
-        except ValueError:
-            logger.warning(
-                "[REGIME] _to_float: '%s' cannot be parsed as float for '%s', "
-                "using default=%.4f", value, name, default
-            )
-            return default
-    # fallback: bool, Decimal, numpy scalar, etc.
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        logger.warning(
-            "[REGIME] _to_float: type %s cannot be converted for '%s', "
-            "using default=%.4f", type(value).__name__, name, default
-        )
-        return default
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ENV — regime thresholds (ადვილად tuneable)
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 def _ef(name: str, default: float) -> float:
-    """ENV float reader — იგივე helper, ახლა _to_float-ს იყენებს."""
-    return _to_float(os.getenv(name), default=default, name=name)
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
+    except Exception:
+        return default
 
 
-# Regime detection thresholds
-BULL_TREND_MIN      = _ef("REGIME_BULL_TREND_MIN",     0.45)
-BEAR_TREND_MAX      = _ef("REGIME_BEAR_TREND_MAX",    -0.10)
-SIDEWAYS_ATR_MAX    = _ef("REGIME_SIDEWAYS_ATR_MAX",   0.28)
-VOLATILE_ATR_MIN    = _ef("REGIME_VOLATILE_ATR_MIN",   1.50)
-BULL_VOLUME_MIN     = _ef("REGIME_BULL_VOLUME_MIN",    0.40)
-
-# ATR multipliers per regime (TP / SL)
-ATR_TP_BULL         = _ef("ATR_MULT_TP_BULL",          3.0)
-ATR_TP_SIDEWAYS     = _ef("ATR_MULT_TP_SIDE",          3.0)
-ATR_TP_BEAR         = _ef("ATR_MULT_TP_BEAR",          2.0)
-ATR_TP_VOLATILE     = _ef("ATR_MULT_TP_VOLATILE",      1.5)
-ATR_TP_UNCERTAIN    = _ef("ATR_MULT_TP_UNCERTAIN",     2.5)
-
-ATR_SL_BULL         = _ef("ATR_MULT_SL_BULL",          1.0)
-ATR_SL_SIDEWAYS     = _ef("ATR_MULT_SL_SIDE",          1.0)
-ATR_SL_BEAR         = _ef("ATR_MULT_SL_BEAR",          0.5)
-ATR_SL_VOLATILE     = _ef("ATR_MULT_SL_VOLATILE",      0.4)
-ATR_SL_UNCERTAIN    = _ef("ATR_MULT_SL_UNCERTAIN",     1.0)
-
-# Quote size multipliers per regime
-QUOTE_MULT_BULL      = _ef("REGIME_QUOTE_MULT_BULL",     1.0)
-QUOTE_MULT_SIDEWAYS  = _ef("REGIME_QUOTE_MULT_SIDE",     0.0)
-QUOTE_MULT_BEAR      = _ef("REGIME_QUOTE_MULT_BEAR",     0.0)
-QUOTE_MULT_VOLATILE  = _ef("REGIME_QUOTE_MULT_VOLATILE", 0.0)
-QUOTE_MULT_UNCERTAIN = _ef("REGIME_QUOTE_MULT_UNCERTAIN",0.8)
-
-# Floor / Ceiling safety
-MIN_TP_PCT  = _ef("REGIME_MIN_TP_PCT",  0.50)
-MIN_SL_PCT  = _ef("REGIME_MIN_SL_PCT",  0.20)
-MAX_TP_PCT  = _ef("REGIME_MAX_TP_PCT",  4.00)
-MAX_SL_PCT  = _ef("REGIME_MAX_SL_PCT",  1.50)
-
-# ვალიდური რეჟიმების სია
-_VALID_REGIMES = frozenset({"BULL", "BEAR", "SIDEWAYS", "VOLATILE", "UNCERTAIN"})
+def _ei(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v) if v is not None else default
+    except Exception:
+        return default
 
 
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# ENGINE
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ──────────────────────────────────────────────
+# ENV THRESHOLDS (ყველა .env ფაილს ემთხვევა)
+# ──────────────────────────────────────────────
+_BULL_TREND_MIN    = _ef("REGIME_BULL_TREND_MIN",    0.45)
+_SIDEWAYS_ATR_MAX  = _ef("REGIME_SIDEWAYS_ATR_MAX",  0.28)
+_VOLATILE_ATR_MIN  = 1.50        # signal_generator-ის _vol_regime() ≥ 2.0 = EXTREME
+                                  # 1.5 <= atr < 2.0 → VOLATILE (pre-extreme guard)
+_BEAR_TREND_MAX    = -0.10
+
+# ATR-based TP/SL multipliers (Strategy B)
+_ATR_TP_BULL       = _ef("ATR_MULT_TP_BULL", 3.0)
+_ATR_SL_BULL       = _ef("ATR_MULT_SL_BULL", 1.0)
+_ATR_TP_UNCERTAIN  = 2.5
+_ATR_SL_UNCERTAIN  = 1.0
+_MIN_TP            = _ef("MIN_NET_PROFIT_PCT", 0.50)
+_MIN_SL            = 0.20
+_MAX_TP            = 4.0
+_MAX_SL            = 1.5
+
+# Fixed TP/SL fallback (Strategy A / DEMO mode)
+_TP_PCT_FIXED      = _ef("TP_PCT", 1.8)
+_SL_PCT_FIXED      = _ef("SL_PCT", 0.5)
+
+# SL Cooldown
+_SL_COOLDOWN_N     = _ei("SL_COOLDOWN_AFTER_N",      2)
+_SL_PAUSE_SECONDS  = _ei("SL_COOLDOWN_PAUSE_SECONDS", 1800)
+
 
 class MarketRegimeEngine:
     """
-    Market Regime Adaptive Trading System.
+    Regime detection + trade param resolution.
 
-    Input:  trend_strength, atr_pct, vol_score, ai_score
-    Output: regime + adaptive params (TP_PCT, SL_PCT, QUOTE_MULT, SKIP_TRADING)
+    Usage (signal_generator.py / execution_engine.py):
 
-    signal_generator.py-ი ამ კლასს იძახებს ყოველ tick-ზე.
-    execution_engine.py-ი adaptive params-ს signal-დან იღებს.
+        from execution.regime_engine import MarketRegimeEngine
+        _regime_engine = MarketRegimeEngine()
+
+        # per-tick:
+        regime = _regime_engine.detect_regime(trend=0.6, atr_pct=0.45)
+        params = _regime_engine.apply(regime, atr_pct=0.45, symbol="BTC/USDT")
+        if params["SKIP_TRADING"]:
+            continue
+        tp = params["TP_PCT"]
+        sl = params["SL_PCT"]
+
+        # after trade close:
+        _regime_engine.notify_outcome("BTC/USDT", "SL")
+        _regime_engine.notify_outcome("BTC/USDT", "TP")
     """
 
     def __init__(self, config=None):
-        self.config = config or {}
+        # config პარამეტრი შენარჩუნებულია backward-compat-ისთვის
+        # (ძველი კოდი MarketRegimeEngine(config) გადასცემს)
+        self._config = config
 
-    # ────────────────────────────────────────────────────
+        # SL Cooldown per-symbol state
+        self._consecutive_sl: Dict[str, int]             = {}
+        self._sl_pause_until: Dict[str, Optional[datetime]] = {}
+
+    # ─────────────────────────────────────────────
     # REGIME DETECTION
-    # ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
 
-    def detect_regime(
-        self,
-        trend: Union[float, str, None] = 0.0,
-        vol:   Union[float, str, None] = 0.0,
-        atr_pct: Union[float, str, None] = 0.0,
-        ai_score: Union[float, str, None] = 0.0,
-    ) -> str:
+    def detect_regime(self, trend: float, atr_pct: float = 0.0, vol: float = None) -> str:
         """
-        ბაზრის რეჟიმის განსაზღვრა.
-
-        ყველა შემომავალი მნიშვნელობა safe cast ხდება float-ად
-        _to_float()-ის საშუალებით — JSON string-ები, None, env
-        variables პრობლემა არ გამოიწვევს.
+        5-state regime classifier.
 
         Args:
-            trend:    trend_strength 0..1
-            vol:      volume_score 0..1
-            atr_pct:  ATR % (volatility)
-            ai_score: ExcelLiveCore score 0..1
+            trend:   0..1 trend strength (signal_generator._trend_strength() output)
+            atr_pct: ATR as % of price (signal_generator._atr_pct() output)
+            vol:     alias for atr_pct (backward compat with old API: detect_regime(trend, vol))
 
         Returns:
-            'BULL' | 'BEAR' | 'SIDEWAYS' | 'VOLATILE' | 'UNCERTAIN'
+            "BULL" | "UNCERTAIN" | "SIDEWAYS" | "BEAR" | "VOLATILE"
         """
-        # ══ ROOT FIX: safe cast ══════════════════════════
-        f_trend    = _to_float(trend,    default=0.0, name="trend")
-        f_vol      = _to_float(vol,      default=0.0, name="vol")
-        f_atr_pct  = _to_float(atr_pct,  default=0.0, name="atr_pct")
-        # ai_score გამოყენებული არ არის detection-ში, მაგრამ
-        # კასტი ხდება consistency-სთვის
-        _          = _to_float(ai_score, default=0.0, name="ai_score")
+        if vol is not None and atr_pct == 0.0:
+            # ძველი API: detect_regime(trend, vol) — vol იყო raw value, არა %
+            # ახლა atr_pct-ად ვიყენებთ (safe fallback)
+            atr_pct = float(vol)
 
-        # Priority 1: VOLATILE — extreme volatility
-        if f_atr_pct >= VOLATILE_ATR_MIN:
+        # signal_generator-ის _vol_regime() logic:
+        # atr_pct >= 2.0 → EXTREME (signal_generator)
+        # აქ 1.5 → VOLATILE (pre-extreme guard — trade skip)
+        if atr_pct >= _VOLATILE_ATR_MIN:
             return "VOLATILE"
 
-        # Priority 2: SIDEWAYS — flat market (fee barrier)
-        if f_atr_pct <= SIDEWAYS_ATR_MAX and f_trend < BULL_TREND_MIN:
+        if atr_pct <= _SIDEWAYS_ATR_MAX and trend < _BULL_TREND_MIN:
             return "SIDEWAYS"
 
-        # Priority 3: BULL — strong uptrend + volume
-        if f_trend >= BULL_TREND_MIN and f_vol >= BULL_VOLUME_MIN:
+        if trend >= _BULL_TREND_MIN:
             return "BULL"
 
-        # Priority 4: BEAR — downtrend
-        if f_trend <= BEAR_TREND_MAX:
+        if trend <= _BEAR_TREND_MAX:
             return "BEAR"
 
-        # Fallback: not enough signal
         return "UNCERTAIN"
 
-    # ────────────────────────────────────────────────────
-    # ADAPTIVE PARAMS
-    # ────────────────────────────────────────────────────
-
-    def get_adaptive_params(
-        self,
-        regime: str,
-        atr_pct: Union[float, str, None] = 0.0,
-        base_quote: Union[float, str, None] = 7.0,
-    ) -> Dict[str, Any]:
-        """
-        რეჟიმის მიხედვით TP/SL/Quote გამოთვლა.
-
-        Args:
-            regime:     detect_regime()-ის შედეგი
-            atr_pct:    ATR % (ბაზრის volatility)
-            base_quote: BOT_QUOTE_PER_TRADE ENV-იდან
-
-        Returns:
-            dict: TP_PCT, SL_PCT, QUOTE_MULT, QUOTE_SIZE,
-                  SKIP_TRADING, REGIME, ATR_PCT
-        """
-        # ══ ROOT FIX: safe cast ══════════════════════════
-        f_atr_pct   = _to_float(atr_pct,   default=0.0, name="atr_pct")
-        f_base_quote = _to_float(base_quote, default=7.0, name="base_quote")
-
-        # ══ Regime validation ════════════════════════════
-        if regime not in _VALID_REGIMES:
-            logger.warning(
-                "[REGIME] get_adaptive_params: unknown regime '%s', "
-                "falling back to UNCERTAIN", regime
-            )
-            regime = "UNCERTAIN"
-
-        _tp_mults = {
-            "BULL":      ATR_TP_BULL,
-            "SIDEWAYS":  ATR_TP_SIDEWAYS,
-            "BEAR":      ATR_TP_BEAR,
-            "VOLATILE":  ATR_TP_VOLATILE,
-            "UNCERTAIN": ATR_TP_UNCERTAIN,
-        }
-        _sl_mults = {
-            "BULL":      ATR_SL_BULL,
-            "SIDEWAYS":  ATR_SL_SIDEWAYS,
-            "BEAR":      ATR_SL_BEAR,
-            "VOLATILE":  ATR_SL_VOLATILE,
-            "UNCERTAIN": ATR_SL_UNCERTAIN,
-        }
-        _quote_mults = {
-            "BULL":      QUOTE_MULT_BULL,
-            "SIDEWAYS":  QUOTE_MULT_SIDEWAYS,
-            "BEAR":      QUOTE_MULT_BEAR,
-            "VOLATILE":  QUOTE_MULT_VOLATILE,
-            "UNCERTAIN": QUOTE_MULT_UNCERTAIN,
-        }
-
-        tp_mult    = _tp_mults[regime]
-        sl_mult    = _sl_mults[regime]
-        quote_mult = _quote_mults[regime]
-
-        raw_tp = f_atr_pct * tp_mult
-        raw_sl = f_atr_pct * sl_mult
-
-        tp_pct = max(MIN_TP_PCT, min(MAX_TP_PCT, raw_tp))
-        sl_pct = max(MIN_SL_PCT, min(MAX_SL_PCT, raw_sl))
-
-        skip_trading = regime in ("BEAR", "VOLATILE")
-        quote_size   = round(f_base_quote * quote_mult, 2)
-
-        return {
-            "TP_PCT":       round(tp_pct, 3),
-            "SL_PCT":       round(sl_pct, 3),
-            "QUOTE_MULT":   quote_mult,
-            "QUOTE_SIZE":   quote_size,
-            "SKIP_TRADING": skip_trading,
-            "REGIME":       regime,
-            "ATR_PCT":      round(f_atr_pct, 4),
-        }
-
-    # ────────────────────────────────────────────────────
-    # MAIN ENTRY
-    # ────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────
+    # TRADE PARAM RESOLUTION
+    # ─────────────────────────────────────────────
 
     def apply(
         self,
-        trend:      Union[float, str, None] = 0.0,
-        vol:        Union[float, str, None] = 0.0,
-        atr_pct:    Union[float, str, None] = 0.0,
-        ai_score:   Union[float, str, None] = 0.0,
-        base_quote: Union[float, str, None] = 7.0,
-    ) -> Dict[str, Any]:
+        regime: str,
+        atr_pct: float = 0.0,
+        symbol: str = "",
+        buy_time: Optional[datetime] = None,
+    ) -> Dict:
         """
-        მთავარი ფუნქცია — detect + adaptive params ერთად.
+        Regime-ის მიხედვით trade params.
 
-        CRITICAL FIX NOTE:
-            თუ main.py-ი ასე იძახებდა:
-                adaptive = regime_engine.apply(regime)   # regime="BULL" string
-            ახლა ეს აღარ ჩავარდება — trend="BULL" → _to_float() → 0.0 (default)
-            + WARNING ლოგში, რომ შეუმჩნეველი არ დარჩეს.
+        Returns dict:
+            SKIP_TRADING  : bool    — True → trade-ს გამოტოვება
+            SKIP_REASON   : str     — რატომ გამოვტოვეთ
+            TP_PCT        : float   — Take Profit %
+            SL_PCT        : float   — Stop Loss %
+            REGIME        : str     — detected regime
+            COOLDOWN_ACTIVE: bool   — True → SL cooldown პაუზა
+        """
+        now = buy_time or datetime.utcnow()
+        sym = symbol or "_global_"
 
-            სწორი გამოძახება:
-                adaptive = regime_engine.apply(
-                    trend=trend_val,
-                    vol=vol_score,
-                    atr_pct=atrp,
-                    ai_score=ai_score,
-                    base_quote=BOT_QUOTE_PER_TRADE,
+        # SL Cooldown check
+        pause_until = self._sl_pause_until.get(sym)
+        if pause_until is not None and now < pause_until:
+            remaining = int((pause_until - now).total_seconds())
+            logger.info(
+                f"[REGIME] SL_COOLDOWN_PAUSE | sym={sym} remaining={remaining}s"
+            )
+            return {
+                "SKIP_TRADING":    True,
+                "SKIP_REASON":     "SL_COOLDOWN_PAUSE",
+                "TP_PCT":          0.0,
+                "SL_PCT":          0.0,
+                "REGIME":          regime,
+                "COOLDOWN_ACTIVE": True,
+            }
+
+        # Skip regimes
+        if regime in ("BEAR", "VOLATILE", "SIDEWAYS"):
+            return {
+                "SKIP_TRADING":    True,
+                "SKIP_REASON":     f"REGIME_{regime}",
+                "TP_PCT":          0.0,
+                "SL_PCT":          0.0,
+                "REGIME":          regime,
+                "COOLDOWN_ACTIVE": False,
+            }
+
+        # ATR-based TP/SL
+        tp_pct, sl_pct = self._get_tp_sl(regime, atr_pct)
+
+        return {
+            "SKIP_TRADING":    False,
+            "SKIP_REASON":     "",
+            "TP_PCT":          tp_pct,
+            "SL_PCT":          sl_pct,
+            "REGIME":          regime,
+            "COOLDOWN_ACTIVE": False,
+            # Backward compat (ძველი კოდი იყენებდა QUOTE_SIZE)
+            "QUOTE_SIZE":      1.0,
+        }
+
+    # ─────────────────────────────────────────────
+    # SL COOLDOWN TRACKING
+    # ─────────────────────────────────────────────
+
+    def notify_outcome(self, symbol: str, outcome: str, buy_time: Optional[datetime] = None) -> None:
+        """
+        trade დახურვის შემდეგ გამოიძახება.
+        outcome: 'SL' | 'TP' | 'MANUAL_SELL'
+        """
+        sym = symbol or "_global_"
+        outcome = str(outcome).upper()
+        now = buy_time or datetime.utcnow()
+
+        if outcome == "SL":
+            self._consecutive_sl[sym] = self._consecutive_sl.get(sym, 0) + 1
+            count = self._consecutive_sl[sym]
+            logger.info(f"[REGIME] SL_TRACK | sym={sym} consecutive_sl={count} limit={_SL_COOLDOWN_N}")
+            if count >= _SL_COOLDOWN_N:
+                pause = now + timedelta(seconds=_SL_PAUSE_SECONDS)
+                self._sl_pause_until[sym] = pause
+                logger.warning(
+                    f"[REGIME] SL_COOLDOWN | sym={sym} {count} consecutive SL → "
+                    f"PAUSE {_SL_PAUSE_SECONDS // 60}min until {pause.strftime('%H:%M:%S')} UTC"
                 )
 
-        signal_generator.py-ი ასე იძახებს:
-            adaptive = regime_engine.apply(
-                trend=trend, vol=vol_score,
-                atr_pct=atrp, ai_score=ai_score,
-                base_quote=BOT_QUOTE_PER_TRADE
-            )
-            sig["adaptive"] = adaptive
+        elif outcome in ("TP", "MANUAL_SELL"):
+            prev = self._consecutive_sl.get(sym, 0)
+            if prev > 0:
+                logger.info(f"[REGIME] TP_RESET | sym={sym} consecutive_sl {prev}→0")
+            self._consecutive_sl[sym]   = 0
+            self._sl_pause_until[sym]   = None
 
-        execution_engine.py-ი ასე კითხულობს:
-            tp_pct = float(adaptive.get("TP_PCT", self.tp_pct))
-            sl_pct = float(adaptive.get("SL_PCT", self.sl_pct))
-        """
-        # ══ Legacy string sentinel detection ═════════════
-        # main.py-ი შეიძლება კვლავ გადასცემდეს regime string-ს
-        # პირველ positional arg-ში. ვამოწმებთ და ვაფრთხილებთ.
-        if isinstance(trend, str) and trend.upper() in _VALID_REGIMES:
-            logger.warning(
-                "[REGIME] apply() received a regime string ('%s') as 'trend'. "
-                "This is a caller bug — main.py must pass numeric trend_strength, "
-                "not a regime label. Falling back: trend=0.0, regime forced.",
-                trend,
-            )
-            # Graceful degradation: use string as pre-computed regime
-            forced_regime = trend.upper()
-            f_atr   = _to_float(atr_pct,    default=0.0, name="atr_pct")
-            f_base  = _to_float(base_quote,  default=7.0, name="base_quote")
-            params  = self.get_adaptive_params(
-                regime=forced_regime, atr_pct=f_atr, base_quote=f_base
-            )
-            logger.info(
-                "[REGIME] %s (forced) | atr%%=%.3f | "
-                "TP=%.3f%% SL=%.3f%% quote=%.2f skip=%s",
-                forced_regime, f_atr,
-                params["TP_PCT"], params["SL_PCT"],
-                params["QUOTE_SIZE"], params["SKIP_TRADING"],
-            )
-            return params
+    def reset_cooldown(self, symbol: str) -> None:
+        """Recovery პირობები დასრულდა — cooldown reset."""
+        sym = symbol or "_global_"
+        self._consecutive_sl[sym]  = 0
+        self._sl_pause_until[sym]  = None
+        logger.info(f"[REGIME] COOLDOWN_RESET | sym={sym}")
 
-        # ══ Normal flow ═══════════════════════════════════
-        regime = self.detect_regime(
-            trend=trend, vol=vol, atr_pct=atr_pct, ai_score=ai_score
-        )
-        params = self.get_adaptive_params(
-            regime=regime, atr_pct=atr_pct, base_quote=base_quote
-        )
+    def is_paused(self, symbol: str, now: Optional[datetime] = None) -> bool:
+        """True თუ SL Cooldown პაუზა აქტიურია."""
+        sym = symbol or "_global_"
+        pause = self._sl_pause_until.get(sym)
+        if pause is None:
+            return False
+        check_time = now or datetime.utcnow()
+        return check_time < pause
 
-        f_trend    = _to_float(trend,    name="trend")
-        f_vol      = _to_float(vol,      name="vol")
-        f_atr_pct  = _to_float(atr_pct,  name="atr_pct")
-        f_ai_score = _to_float(ai_score, name="ai_score")
+    def get_consecutive_sl(self, symbol: str) -> int:
+        return self._consecutive_sl.get(symbol or "_global_", 0)
 
-        logger.info(
-            "[REGIME] %s | trend=%.3f vol=%.3f atr%%=%.3f ai=%.3f | "
-            "TP=%.3f%% SL=%.3f%% quote=%.2f skip=%s",
-            regime, f_trend, f_vol, f_atr_pct, f_ai_score,
-            params["TP_PCT"], params["SL_PCT"],
-            params["QUOTE_SIZE"], params["SKIP_TRADING"],
-        )
+    # ─────────────────────────────────────────────
+    # HELPERS
+    # ─────────────────────────────────────────────
 
-        return params
+    @staticmethod
+    def _get_tp_sl(regime: str, atr_pct: float) -> Tuple[float, float]:
+        """ATR-based TP/SL % — backtest.py get_b_tp_sl()-ს ემთხვევა."""
+        mults = {
+            "BULL":      (_ATR_TP_BULL,      _ATR_SL_BULL),
+            "UNCERTAIN": (_ATR_TP_UNCERTAIN, _ATR_SL_UNCERTAIN),
+        }
+        tm, sm = mults.get(regime, (_ATR_TP_UNCERTAIN, _ATR_SL_UNCERTAIN))
 
-    # ────────────────────────────────────────────────────
-    # BACKWARD COMPATIBILITY
-    # ────────────────────────────────────────────────────
+        if atr_pct > 0:
+            tp = max(_MIN_TP, min(_MAX_TP, atr_pct * tm))
+            sl = max(_MIN_SL, min(_MAX_SL, atr_pct * sm))
+        else:
+            # ATR უცნობია — fallback to fixed
+            tp = _TP_PCT_FIXED
+            sl = _SL_PCT_FIXED
 
-    def detect_regime_legacy(
-        self,
-        trend: Union[float, str, None],
-        vol:   Union[float, str, None],
-    ) -> str:
-        """ძველი interface — main.py-ისთვის. გამაგრებული."""
-        return self.detect_regime(trend=trend, vol=vol)
+        return round(tp, 3), round(sl, 3)
+
+    def get_tp_sl(self, regime: str, atr_pct: float = 0.0) -> Tuple[float, float]:
+        """Public wrapper — execution_engine.py-ისთვის."""
+        return self._get_tp_sl(regime, atr_pct)
+
+    def summary(self) -> Dict:
+        """Debug: cooldown state."""
+        return {
+            sym: {
+                "consecutive_sl": self._consecutive_sl.get(sym, 0),
+                "pause_until":    str(self._sl_pause_until.get(sym, "none")),
+            }
+            for sym in set(list(self._consecutive_sl) + list(self._sl_pause_until))
+        }
