@@ -103,42 +103,15 @@ def _has_open_trade(symbol: str) -> bool:
         return True
 
 
-def _resolve_excel_path(env_path: str) -> str:
-    candidates = [
-        env_path,
-        "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
-        "/opt/render/project/src/assets/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx",
-    ]
-    for p in candidates:
-        if p and os.path.exists(p):
-            return p
-
-    try:
-        assets_list = os.listdir("/opt/render/project/src/assets")
-    except Exception:
-        assets_list = []
-    try:
-        var_data_list = os.listdir("/var/data")
-    except Exception:
-        var_data_list = []
-
-    raise FileNotFoundError(
-        f"EXCEL_MODEL_NOT_FOUND | env={env_path} | assets={assets_list} | var_data={var_data_list}"
-    )
-
-
 _CORE: Optional[ExcelLiveCore] = None
 
 
 def _core() -> ExcelLiveCore:
     global _CORE
     if _CORE is None:
-        resolved = _resolve_excel_path(EXCEL_MODEL_PATH)
-        logger.info(
-            f"[GEN] EXCEL_PATH | env={EXCEL_MODEL_PATH} resolved={resolved} exists_env={os.path.exists(EXCEL_MODEL_PATH)}"
-        )
-        _CORE = ExcelLiveCore(resolved)
-        logger.info(f"[GEN] EXCEL_CORE_LOADED | path={resolved}")
+        # Excel dependency ამოღებულია — ExcelLiveCore ახლა ENV-იდან კითხულობს
+        _CORE = ExcelLiveCore()
+        logger.info(f"[GEN] CORE_LOADED | version=no-excel ENV-based")
     return _CORE
 
 
@@ -436,10 +409,84 @@ def _risk_state(vol_regime: str, ai_score: float) -> str:
 def generate_signal() -> Optional[Dict[str, Any]]:
     outbox_path = _get_outbox_path()
 
+    # core singleton — ერთხელ იქმნება, ყველგან გამოიყენება
+    core = _core()
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PROTECTIVE SELL — cooldown-ის გარეშე!
+    # ეს ᲧᲝᲕᲔᲚᲗᲕᲘᲡ შემოწმდება — crash/KILL სიტუაციაში
+    # cooldown არ ბლოკავს დაცვით SELL-ს
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    for symbol in SYMBOLS:
+        active_oco = _has_active_oco(symbol)
+        if not active_oco:
+            continue
+
+        try:
+            ohlcv_quick = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
+        except Exception:
+            continue
+
+        if not ohlcv_quick or len(ohlcv_quick) < 20:
+            continue
+
+        ohlcv_quick, _ = _drop_unclosed_candle(ohlcv_quick, TIMEFRAME)
+        if len(ohlcv_quick) < 20:
+            continue
+
+        closes_q = [float(c[4]) for c in ohlcv_quick]
+        vols_q   = [float(c[5]) for c in ohlcv_quick]
+        atrp_q   = _atr_pct(ohlcv_quick, 14)
+        vol_reg_q = _vol_regime(atrp_q)
+
+        if vol_reg_q != "EXTREME":
+            continue
+
+        trend_q  = _trend_strength(closes_q, USE_MA_FILTERS)
+        struct_q, _ = _structure_ok(closes_q, USE_MA_FILTERS, trend_q)
+        vol_sc_q, _ = _volume_score(vols_q)
+        conf_q   = _confidence_score(closes_q, ohlcv_quick, USE_MA_FILTERS)
+
+        tmp_q = CoreInputs(
+            trend_strength=trend_q, structure_ok=struct_q,
+            volume_score=vol_sc_q, risk_state="OK",
+            confidence_score=conf_q, volatility_regime=vol_reg_q,
+        )
+        ai_q = float(core.decide(tmp_q)["ai_score"])
+        risk_q = _risk_state(vol_reg_q, ai_q)
+
+        if risk_q == "KILL":
+            signal_id = str(uuid.uuid4())
+            sig = {
+                "signal_id": signal_id,
+                "ts_utc": _now_utc_iso(),
+                "certified_signal": True,
+                "final_verdict": "SELL",
+                "meta": {
+                    "source": "PROTECTIVE_SELL",
+                    "symbol": symbol,
+                    "reason": "RISK_KILL_OVERRIDE",
+                    "atr_pct": atrp_q,
+                    "vol_regime": vol_reg_q,
+                },
+                "execution": {
+                    "symbol": symbol,
+                    "direction": "LONG",
+                    "entry": {"type": "MARKET"},
+                }
+            }
+            logger.warning(
+                f"[GEN] PROTECTIVE_SELL | symbol={symbol} "
+                f"volReg={vol_reg_q} atr%={atrp_q:.2f} ai={ai_q:.3f} — COOLDOWN BYPASSED"
+            )
+            append_signal(sig, outbox_path)
+            return sig
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # COOLDOWN — ჩვეულებრივი signal-ებისთვის
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if not _cooldown_ok():
         return None
-
-    core = _core()
 
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
@@ -555,36 +602,17 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
                 )
 
-        # Protective SELL if active OCO and risk is KILL
-        if active_oco and risk == "KILL":
-            signal_id = str(uuid.uuid4())
-            sig = {
-                "signal_id": signal_id,
-                "ts_utc": _now_utc_iso(),
-                "certified_signal": True,
-                "final_verdict": "SELL",
-                "meta": {
-                    "source": "DYZEN_EXCEL_LIVE_CORE",
-                    "symbol": symbol,
-                    "reason": "RISK_KILL_OVERRIDE",
-                    "decision": decision,
-                },
-                "execution": {
-                    "symbol": symbol,
-                    "direction": "LONG",
-                    "entry": {"type": "MARKET"},
-                }
-            }
-            _emit(sig, outbox_path)
-            return sig
-
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TREND REVERSAL SELL — open trade-ზე
+        # protective SELL (KILL) უკვე ზემოთ დამუშავდა
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         mom1 = _momentum(closes, 1) if len(closes) > 1 else 0.0
 
         if open_trade:
-            # 🚫 BLOCK SELL თუ OCO უკვე აქტიურია
-            
-            # SELL LOGIC
-            if trend < -0.2 and mom1 < -0.02:
+            # SELL LOGIC — შერბილებული პირობები:
+            # trend < -0.15 (ნაცვლად -0.2) AND mom1 < -0.01 (ნაცვლად -0.02)
+            # ეს ნიშნავს: ნელ კლებაზეც გამოვა, არა მხოლოდ crash-ზე
+            if trend < -0.15 and mom1 < -0.01:
                 signal_id = str(uuid.uuid4())
                 sig = {
                     "signal_id": signal_id,
@@ -595,6 +623,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                         "source": "GEN_SIGNAL_SELL",
                         "symbol": symbol,
                         "reason": "TREND_REVERSAL",
+                        "trend": trend,
+                        "mom1": mom1,
                         "decision": decision,
                     },
                     "execution": {
@@ -602,6 +632,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                         "direction": "LONG",
                     }
                 }
+                logger.info(
+                    f"[GEN] TREND_REVERSAL_SELL | symbol={symbol} "
+                    f"trend={trend:.3f} mom1={mom1:.4f}"
+                )
                 _emit(sig, outbox_path)
                 return sig
 
