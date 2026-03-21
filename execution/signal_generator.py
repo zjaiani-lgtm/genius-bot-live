@@ -9,7 +9,14 @@ from typing import Optional, Dict, Any, Tuple, List
 import ccxt
 
 from execution.signal_client import append_signal
-from execution.db.repository import has_active_oco_for_symbol, has_open_trade_for_symbol
+from execution.db.repository import (
+    has_active_oco_for_symbol,
+    has_open_trade_for_symbol,
+    get_sl_cooldown_state,
+    increment_consecutive_sl,
+    reset_consecutive_sl,
+    is_sl_pause_active,
+)
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 from execution.regime_engine import MarketRegimeEngine
 
@@ -69,8 +76,11 @@ SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
 RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
 RECOVERY_CANDLE_PCT = float(os.getenv("RECOVERY_CANDLE_PCT", "0.25"))
 
-_consecutive_sl: int = 0
-_sl_pause_until: float = 0.0
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SL Cooldown state — DB-based (restart-safe)
+# consecutive_sl და sl_pause_until ახლა DB-შია
+# memory globals ამოღებულია — deploy/restart bypass შეუძლებელია
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
 # -----------------------------
@@ -218,29 +228,27 @@ def _get_outbox_path() -> str:
 
 
 def _notify_sl_event() -> None:
-    """SL დაფიქსირდა — counter გაზარდე, საჭიროების შემთხვევაში პაუზა."""
-    global _consecutive_sl, _sl_pause_until
-    _consecutive_sl += 1
-    logger.info(f"[SL_TRACK] consecutive_sl={_consecutive_sl} limit={SL_COOLDOWN_COUNT}")
-    if _consecutive_sl >= SL_COOLDOWN_COUNT:
-        _sl_pause_until = time.time() + SL_COOLDOWN_PAUSE
+    """SL hit — DB-ში counter გაიზარდე (restart-safe)."""
+    new_count = increment_consecutive_sl(pause_seconds=SL_COOLDOWN_PAUSE)
+    logger.info(f"[SL_TRACK] consecutive_sl={new_count} limit={SL_COOLDOWN_COUNT} (DB-saved)")
+    if new_count >= SL_COOLDOWN_COUNT:
         logger.warning(
-            f"[SL_COOLDOWN] {_consecutive_sl} consecutive SL → PAUSE {SL_COOLDOWN_PAUSE//60} min "
-            f"until {datetime.utcfromtimestamp(_sl_pause_until).strftime('%H:%M:%S')} UTC"
+            f"[SL_COOLDOWN] {new_count} consecutive SL → PAUSE {SL_COOLDOWN_PAUSE//60} min "
+            f"(saved to DB — restart-safe)"
         )
 
 
 def _notify_tp_event() -> None:
-    """TP — consecutive SL counter-ი reset."""
-    global _consecutive_sl
-    if _consecutive_sl > 0:
-        logger.info(f"[SL_TRACK] TP hit → reset consecutive_sl {_consecutive_sl}→0")
-    _consecutive_sl = 0
+    """TP hit — DB-ში counter reset (restart-safe)."""
+    state = get_sl_cooldown_state()
+    if state["consecutive_sl"] > 0:
+        logger.info(f"[SL_TRACK] TP hit → reset consecutive_sl {state['consecutive_sl']}→0 (DB)")
+    reset_consecutive_sl()
 
 
 def _sl_pause_active() -> bool:
-    """True თუ SL პაუზა ჯერ კიდევ აქტიურია."""
-    return time.time() < _sl_pause_until
+    """DB-დან წაიკითხავს — restart-ზეც სწორია."""
+    return is_sl_pause_active()
 
 
 def _recovery_ok(ohlcv: List[List[float]]) -> Tuple[bool, str]:
@@ -495,7 +503,6 @@ def _risk_state(vol_regime: str, ai_score: float) -> str:
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
-    global _consecutive_sl, _sl_pause_until
     outbox_path = _get_outbox_path()
 
     # core singleton — ერთხელ იქმნება, ყველგან გამოიყენება
@@ -585,15 +592,22 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # SL PAUSE — 2 consecutive SL-ის შემდეგ 30 წუთი პაუზა
-    # + recovery: 3 მწვანე სანთელი + ბოლო >= 0.25%
+    # SL PAUSE — DB-based, restart-safe
+    # consecutive_sl და sl_pause_until DB-შია → deploy bypass შეუძლებელია
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if _sl_pause_active():
-        remaining = int(_sl_pause_until - time.time())
-        logger.info(f"[SL_COOLDOWN] PAUSED | remaining={remaining}s ({remaining//60}m{remaining%60}s)")
+        sl_state = get_sl_cooldown_state()
+        pause_ts = sl_state.get("sl_pause_until") or 0.0
+        remaining = max(0, int(pause_ts - time.time()))
+        logger.info(
+            f"[SL_COOLDOWN] PAUSED (DB) | remaining={remaining}s "
+            f"({remaining//60}m{remaining%60}s) | "
+            f"consecutive_sl={sl_state['consecutive_sl']}"
+        )
         return None
 
-    if _consecutive_sl >= SL_COOLDOWN_COUNT:
+    sl_state = get_sl_cooldown_state()
+    if sl_state["consecutive_sl"] >= SL_COOLDOWN_COUNT:
         # პაუზა დასრულდა — recovery check
         recovery_passed = False
         for sym in SYMBOLS:
@@ -607,7 +621,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             rec_ok, rec_reason = _recovery_ok(ohlcv_r)
             logger.info(
                 f"[SL_RECOVERY] symbol={sym} ok={rec_ok} reason={rec_reason} "
-                f"consecutive_sl={_consecutive_sl}"
+                f"consecutive_sl={sl_state['consecutive_sl']} (DB)"
             )
             if rec_ok:
                 recovery_passed = True
@@ -615,15 +629,16 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if not recovery_passed:
             logger.info(
-                f"[SL_RECOVERY] WAITING | consecutive_sl={_consecutive_sl} "
+                f"[SL_RECOVERY] WAITING (DB) | consecutive_sl={sl_state['consecutive_sl']} "
                 f"need={RECOVERY_CANDLES} green candles >= {RECOVERY_CANDLE_PCT}%"
             )
             return None
         else:
             logger.warning(
-                f"[SL_RECOVERY] PASSED ✅ | reset consecutive_sl={_consecutive_sl}→0 | trading resumed"
+                f"[SL_RECOVERY] PASSED ✅ (DB) | "
+                f"consecutive_sl={sl_state['consecutive_sl']}→0 | trading resumed"
             )
-            _consecutive_sl = 0
+            reset_consecutive_sl()
 
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
