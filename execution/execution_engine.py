@@ -29,6 +29,7 @@ from execution.telegram_notifier import (
     notify_signal_created,
     notify_trade_closed,
 )
+from execution.signal_generator import notify_outcome as _notify_sl_tp_outcome
 
 logger = logging.getLogger("gbm")
 
@@ -475,6 +476,12 @@ class ExecutionEngine:
                             stats=stats,
                         )
 
+                        # SL/TP tracker — consecutive SL counter reset
+                        try:
+                            _notify_sl_tp_outcome("TP")
+                        except Exception:
+                            pass
+
                         self._run_post_close_diagnostics(
                             signal_id=str(signal_id),
                             link_id=link_id,
@@ -535,6 +542,12 @@ class ExecutionEngine:
                             outcome="SL",
                             stats=stats,
                         )
+
+                        # SL/TP tracker — consecutive SL counter გაზარდე
+                        try:
+                            _notify_sl_tp_outcome("SL")
+                        except Exception:
+                            pass
 
                         self._run_post_close_diagnostics(
                             signal_id=str(signal_id),
