@@ -11,6 +11,7 @@ import ccxt
 from execution.signal_client import append_signal
 from execution.db.repository import has_active_oco_for_symbol, has_open_trade_for_symbol
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
+from execution.regime_engine import MarketRegimeEngine
 
 logger = logging.getLogger("gbm")
 
@@ -124,6 +125,18 @@ def _core() -> ExcelLiveCore:
         _CORE = ExcelLiveCore()
         logger.info(f"[GEN] CORE_LOADED | version=no-excel ENV-based")
     return _CORE
+
+
+# ─── Regime Engine singleton ───────────────────────────────
+_REGIME_ENGINE: Optional[MarketRegimeEngine] = None
+
+
+def _regime() -> MarketRegimeEngine:
+    global _REGIME_ENGINE
+    if _REGIME_ENGINE is None:
+        _REGIME_ENGINE = MarketRegimeEngine()
+        logger.info("[GEN] REGIME_ENGINE_LOADED")
+    return _REGIME_ENGINE
 
 
 def _pct(a: float, b: float) -> float:
@@ -533,6 +546,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if risk_q == "KILL":
             signal_id = str(uuid.uuid4())
+            # VOLATILE regime params
+            adaptive_sell = _regime().apply(
+                trend=trend_q, vol=vol_sc_q,
+                atr_pct=atrp_q, ai_score=ai_q,
+                base_quote=BOT_QUOTE_PER_TRADE,
+            )
             sig = {
                 "signal_id": signal_id,
                 "ts_utc": _now_utc_iso(),
@@ -544,6 +563,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     "reason": "RISK_KILL_OVERRIDE",
                     "atr_pct": atrp_q,
                     "vol_regime": vol_reg_q,
+                    "regime": adaptive_sell.get("REGIME", "VOLATILE"),
                 },
                 "execution": {
                     "symbol": symbol,
@@ -793,6 +813,33 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             continue
 
         signal_id = str(uuid.uuid4())
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # MARKET REGIME — ATR-based dynamic TP/SL
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        adaptive = _regime().apply(
+            trend=trend,
+            vol=vol_score,
+            atr_pct=atrp,
+            ai_score=float(decision["ai_score"]),
+            base_quote=BOT_QUOTE_PER_TRADE,
+        )
+
+        # BEAR/VOLATILE/SIDEWAYS → trade ბლოკდება
+        if adaptive.get("SKIP_TRADING"):
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] BLOCKED_BY_REGIME | symbol={symbol} "
+                    f"regime={adaptive.get('REGIME')} "
+                    f"atr%={atrp:.3f} trend={trend:.3f}"
+                )
+            continue
+
+        # QUOTE_SIZE regime-ისგან (BULL=7.0, UNCERTAIN=5.6 და ა.შ.)
+        quote_size = adaptive.get("QUOTE_SIZE", BOT_QUOTE_PER_TRADE)
+        if quote_size <= 0:
+            continue
+
         sig = {
             "signal_id": signal_id,
             "ts_utc": _now_utc_iso(),
@@ -802,13 +849,25 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 "source": "DYZEN_EXCEL_LIVE_CORE",
                 "symbol": symbol,
                 "decision": decision,
+                "regime": adaptive.get("REGIME"),
+                "atr_pct": round(atrp, 4),
             },
             "execution": {
                 "symbol": symbol,
                 "direction": "LONG",
                 "entry": {"type": "MARKET"},
-                "quote_amount": BOT_QUOTE_PER_TRADE,
-            }
+                "quote_amount": quote_size,
+            },
+            # execution_engine.py-ი ამ dict-ს კითხულობს:
+            # tp_pct = float(adaptive.get("TP_PCT", self.tp_pct))
+            # sl_pct = float(adaptive.get("SL_PCT", self.sl_pct))
+            "adaptive": {
+                "TP_PCT":       adaptive["TP_PCT"],
+                "SL_PCT":       adaptive["SL_PCT"],
+                "REGIME":       adaptive["REGIME"],
+                "ATR_PCT":      adaptive["ATR_PCT"],
+                "QUOTE_SIZE":   quote_size,
+            },
         }
 
         _emit(sig, outbox_path)
