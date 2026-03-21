@@ -60,6 +60,17 @@ if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
 
 _last_emit_ts: float = 0.0
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SL COOLDOWN — 2 SL-ის შემდეგ 30 წუთი პაუზა
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
+SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
+RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
+RECOVERY_CANDLE_PCT = float(os.getenv("RECOVERY_CANDLE_PCT", "0.25"))
+
+_consecutive_sl: int = 0
+_sl_pause_until: float = 0.0
+
 
 # -----------------------------
 # HELPERS
@@ -191,6 +202,70 @@ def _emit(signal: Dict[str, Any], outbox_path: str) -> None:
 
 def _get_outbox_path() -> str:
     return os.getenv("OUTBOX_PATH") or os.getenv("SIGNAL_OUTBOX_PATH") or "/var/data/signal_outbox.json"
+
+
+def _notify_sl_event() -> None:
+    """SL დაფიქსირდა — counter გაზარდე, საჭიროების შემთხვევაში პაუზა."""
+    global _consecutive_sl, _sl_pause_until
+    _consecutive_sl += 1
+    logger.info(f"[SL_TRACK] consecutive_sl={_consecutive_sl} limit={SL_COOLDOWN_COUNT}")
+    if _consecutive_sl >= SL_COOLDOWN_COUNT:
+        _sl_pause_until = time.time() + SL_COOLDOWN_PAUSE
+        logger.warning(
+            f"[SL_COOLDOWN] {_consecutive_sl} consecutive SL → PAUSE {SL_COOLDOWN_PAUSE//60} min "
+            f"until {datetime.utcfromtimestamp(_sl_pause_until).strftime('%H:%M:%S')} UTC"
+        )
+
+
+def _notify_tp_event() -> None:
+    """TP — consecutive SL counter-ი reset."""
+    global _consecutive_sl
+    if _consecutive_sl > 0:
+        logger.info(f"[SL_TRACK] TP hit → reset consecutive_sl {_consecutive_sl}→0")
+    _consecutive_sl = 0
+
+
+def _sl_pause_active() -> bool:
+    """True თუ SL პაუზა ჯერ კიდევ აქტიურია."""
+    return time.time() < _sl_pause_until
+
+
+def _recovery_ok(ohlcv: List[List[float]]) -> Tuple[bool, str]:
+    """
+    Recovery პირობები პაუზის შემდეგ:
+      1. ბოლო RECOVERY_CANDLES (3) სანთელი მწვანეა (close > open)
+      2. ბოლო სანთელი >= RECOVERY_CANDLE_PCT (0.25%) ზომისაა
+    """
+    if len(ohlcv) < RECOVERY_CANDLES + 1:
+        return False, f"not_enough_candles need={RECOVERY_CANDLES+1}"
+
+    candles = ohlcv[-(RECOVERY_CANDLES):]
+
+    # 3 მწვანე სანთელი
+    green_count = 0
+    for c in candles:
+        o = float(c[1])  # open
+        cl = float(c[4]) # close
+        if cl > o:
+            green_count += 1
+
+    green_ok = green_count >= RECOVERY_CANDLES
+
+    # ბოლო სანთლის ზომა
+    last_c = ohlcv[-1]
+    last_open  = float(last_c[1])
+    last_close = float(last_c[4])
+    if last_open <= 0:
+        return False, "last_candle_open_zero"
+    last_candle_pct = abs((last_close - last_open) / last_open) * 100.0
+    size_ok = last_candle_pct >= RECOVERY_CANDLE_PCT
+
+    ok = green_ok and size_ok
+    reason = (
+        f"green={green_count}/{RECOVERY_CANDLES} "
+        f"last_candle_pct={last_candle_pct:.3f}% >= {RECOVERY_CANDLE_PCT}%={int(size_ok)}"
+    )
+    return ok, reason
 
 
 def _tf_seconds(tf: str) -> int:
@@ -488,6 +563,48 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     if not _cooldown_ok():
         return None
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SL PAUSE — 2 consecutive SL-ის შემდეგ 30 წუთი პაუზა
+    # + recovery: 3 მწვანე სანთელი + ბოლო >= 0.25%
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if _sl_pause_active():
+        remaining = int(_sl_pause_until - time.time())
+        logger.info(f"[SL_COOLDOWN] PAUSED | remaining={remaining}s ({remaining//60}m{remaining%60}s)")
+        return None
+
+    if _consecutive_sl >= SL_COOLDOWN_COUNT:
+        # პაუზა დასრულდა — recovery check
+        recovery_passed = False
+        for sym in SYMBOLS:
+            try:
+                ohlcv_r = EXCHANGE.fetch_ohlcv(sym, timeframe=TIMEFRAME, limit=RECOVERY_CANDLES + 5)
+            except Exception:
+                continue
+            if not ohlcv_r or len(ohlcv_r) < RECOVERY_CANDLES + 1:
+                continue
+            ohlcv_r, _ = _drop_unclosed_candle(ohlcv_r, TIMEFRAME)
+            rec_ok, rec_reason = _recovery_ok(ohlcv_r)
+            logger.info(
+                f"[SL_RECOVERY] symbol={sym} ok={rec_ok} reason={rec_reason} "
+                f"consecutive_sl={_consecutive_sl}"
+            )
+            if rec_ok:
+                recovery_passed = True
+                break
+
+        if not recovery_passed:
+            logger.info(
+                f"[SL_RECOVERY] WAITING | consecutive_sl={_consecutive_sl} "
+                f"need={RECOVERY_CANDLES} green candles >= {RECOVERY_CANDLE_PCT}%"
+            )
+            return None
+        else:
+            global _consecutive_sl
+            logger.warning(
+                f"[SL_RECOVERY] PASSED ✅ | reset consecutive_sl={_consecutive_sl}→0 | trading resumed"
+            )
+            _consecutive_sl = 0
+
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
         open_trade = _has_open_trade(symbol)
@@ -702,3 +819,17 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
 def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
+
+
+def notify_outcome(outcome: str) -> None:
+    """
+    main.py-იდან გამოიძახება trade-ის დახურვის შემდეგ.
+    outcome: 'SL' ან 'TP' ან 'MANUAL_SELL'
+    ამ ფუნქციის გამოძახება execution_engine.py-ში:
+      after close_trade(...) → from execution.signal_generator import notify_outcome
+                                notify_outcome(outcome)
+    """
+    if str(outcome).upper() == "SL":
+        _notify_sl_event()
+    elif str(outcome).upper() in ("TP", "MANUAL_SELL"):
+        _notify_tp_event()
