@@ -1,4 +1,5 @@
 import sqlite3
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution.db.db import get_connection
@@ -71,6 +72,109 @@ def update_system_state(
     fields.append("updated_at = datetime('now')")
     q = "UPDATE system_state SET " + ", ".join(fields) + " WHERE id = 1"
     _execute(q, tuple(params))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SL COOLDOWN — DB-based (restart-safe)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def get_sl_cooldown_state() -> Dict[str, Any]:
+    """
+    DB-დან წაიკითხავს consecutive_sl და sl_pause_until.
+    restart-ზეც შენარჩუნდება!
+
+    Returns:
+        {
+            "consecutive_sl": int,
+            "sl_pause_until": float | None  (unix timestamp)
+        }
+    """
+    row = _fetchone(
+        "SELECT consecutive_sl, sl_pause_until FROM system_state WHERE id = 1"
+    )
+    if not row:
+        return {"consecutive_sl": 0, "sl_pause_until": None}
+
+    consecutive_sl = int(row[0] or 0)
+    sl_pause_raw = row[1]
+
+    # sl_pause_until — UTC ISO string ან None
+    sl_pause_until: Optional[float] = None
+    if sl_pause_raw:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(str(sl_pause_raw).replace("Z", "+00:00"))
+            sl_pause_until = dt.timestamp()
+        except Exception:
+            sl_pause_until = None
+
+    return {
+        "consecutive_sl": consecutive_sl,
+        "sl_pause_until": sl_pause_until,
+    }
+
+
+def increment_consecutive_sl(pause_seconds: int = 1800) -> int:
+    """
+    SL hit-ზე გამოიძახება.
+    consecutive_sl += 1
+    თუ limit-ს მიაღწია → sl_pause_until = now + pause_seconds
+
+    Returns: ახალი consecutive_sl მნიშვნელობა
+    """
+    state = get_sl_cooldown_state()
+    new_count = state["consecutive_sl"] + 1
+
+    from datetime import datetime, timezone, timedelta
+    pause_until_iso: Optional[str] = None
+
+    # SL limit-ი signal_generator.py-ის ENV-დან (default=2)
+    import os
+    limit = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
+
+    if new_count >= limit:
+        pause_dt = datetime.now(timezone.utc) + timedelta(seconds=pause_seconds)
+        pause_until_iso = pause_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    _execute(
+        """
+        UPDATE system_state
+        SET consecutive_sl   = ?,
+            sl_pause_until   = ?,
+            updated_at       = datetime('now')
+        WHERE id = 1
+        """,
+        (new_count, pause_until_iso),
+    )
+    return new_count
+
+
+def reset_consecutive_sl() -> None:
+    """
+    TP hit ან recovery pass-ზე გამოიძახება.
+    consecutive_sl = 0, sl_pause_until = NULL
+    """
+    _execute(
+        """
+        UPDATE system_state
+        SET consecutive_sl = 0,
+            sl_pause_until = NULL,
+            updated_at     = datetime('now')
+        WHERE id = 1
+        """
+    )
+
+
+def is_sl_pause_active() -> bool:
+    """
+    True თუ SL პაუზა ჯერ კიდევ აქტიურია.
+    signal_generator.py-ი ამ ფუნქციას იყენებს cooldown-ის ნაცვლად.
+    """
+    state = get_sl_cooldown_state()
+    pause_until = state.get("sl_pause_until")
+    if pause_until is None:
+        return False
+    return time.time() < pause_until
 
 
 # -----------------------
@@ -275,17 +379,17 @@ def get_closed_trades() -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     for row in rows:
         result.append({
-            "signal_id": row[0],
-            "symbol": row[1],
-            "qty": row[2],
-            "quote_in": row[3],
+            "signal_id":   row[0],
+            "symbol":      row[1],
+            "qty":         row[2],
+            "quote_in":    row[3],
             "entry_price": row[4],
-            "opened_at": row[5],
-            "exit_price": row[6],
-            "closed_at": row[7],
-            "outcome": row[8],
-            "pnl_quote": row[9],
-            "pnl_pct": row[10],
+            "opened_at":   row[5],
+            "exit_price":  row[6],
+            "closed_at":   row[7],
+            "outcome":     row[8],
+            "pnl_quote":   row[9],
+            "pnl_pct":     row[10],
         })
     return result
 
@@ -309,20 +413,20 @@ def get_trade_stats() -> Dict[str, Any]:
         """
     ) or (0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-    closed_trades = int(row[0] or 0)
-    wins = int(row[1] or 0)
-    losses = int(row[2] or 0)
-    pnl_quote_sum = float(row[3] or 0.0)
-    quote_in_sum = float(row[4] or 0.0)
-    gross_profit = float(row[5] or 0.0)
-    gross_loss = float(row[6] or 0.0)
-    avg_win = float(row[7] or 0.0)
-    avg_loss = float(row[8] or 0.0)
-    expectancy_quote = float(row[9] or 0.0)
+    closed_trades     = int(row[0] or 0)
+    wins              = int(row[1] or 0)
+    losses            = int(row[2] or 0)
+    pnl_quote_sum     = float(row[3] or 0.0)
+    quote_in_sum      = float(row[4] or 0.0)
+    gross_profit      = float(row[5] or 0.0)
+    gross_loss        = float(row[6] or 0.0)
+    avg_win           = float(row[7] or 0.0)
+    avg_loss          = float(row[8] or 0.0)
+    expectancy_quote  = float(row[9] or 0.0)
 
-    winrate_pct = (wins / closed_trades * 100.0) if closed_trades else 0.0
-    roi_pct = (pnl_quote_sum / quote_in_sum * 100.0) if quote_in_sum else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
+    winrate_pct    = (wins / closed_trades * 100.0) if closed_trades else 0.0
+    roi_pct        = (pnl_quote_sum / quote_in_sum * 100.0) if quote_in_sum else 0.0
+    profit_factor  = (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0)
 
     row2 = _fetchone(
         """
@@ -334,23 +438,23 @@ def get_trade_stats() -> Dict[str, Any]:
         """
     ) or (0, 0.0)
 
-    open_trades = int(row2[0] or 0)
-    open_quote_in_sum = float(row2[1] or 0.0)
+    open_trades        = int(row2[0] or 0)
+    open_quote_in_sum  = float(row2[1] or 0.0)
 
     return {
-        "closed_trades": closed_trades,
-        "wins": wins,
-        "losses": losses,
-        "winrate_pct": winrate_pct,
-        "roi_pct": roi_pct,
-        "pnl_quote_sum": pnl_quote_sum,
-        "quote_in_sum": quote_in_sum,
-        "profit_factor": profit_factor,
-        "gross_profit": gross_profit,
-        "gross_loss": gross_loss,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
+        "closed_trades":    closed_trades,
+        "wins":             wins,
+        "losses":           losses,
+        "winrate_pct":      winrate_pct,
+        "roi_pct":          roi_pct,
+        "pnl_quote_sum":    pnl_quote_sum,
+        "quote_in_sum":     quote_in_sum,
+        "profit_factor":    profit_factor,
+        "gross_profit":     gross_profit,
+        "gross_loss":       gross_loss,
+        "avg_win":          avg_win,
+        "avg_loss":         avg_loss,
         "expectancy_quote": expectancy_quote,
-        "open_trades": open_trades,
-        "open_quote_in_sum": open_quote_in_sum,
+        "open_trades":      open_trades,
+        "open_quote_in_sum":open_quote_in_sum,
     }
