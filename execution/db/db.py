@@ -101,5 +101,33 @@ def init_db():
     )
     """)
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # MIGRATION: SL Cooldown columns
+    # system_state-ში ვამატებთ consecutive_sl და sl_pause_until
+    # CREATE TABLE IF NOT EXISTS ვერ ამატებს columns არსებულ ცხრილში
+    # ამიტომ ALTER TABLE-ს ვიყენებთ — IF NOT EXISTS pattern
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _migrate_sl_cooldown_columns(cur)
+
     conn.commit()
     conn.close()
+
+
+def _migrate_sl_cooldown_columns(cur) -> None:
+    """
+    system_state ცხრილში ამატებს SL Cooldown columns-ებს.
+    იდემპოტენტურია — მეორეჯერ გაშვებაზე error არ გამოსვლება.
+    """
+    # არსებული columns-ების სია
+    cur.execute("PRAGMA table_info(system_state)")
+    existing = {row[1] for row in cur.fetchall()}
+
+    if "consecutive_sl" not in existing:
+        cur.execute(
+            "ALTER TABLE system_state ADD COLUMN consecutive_sl INTEGER NOT NULL DEFAULT 0"
+        )
+
+    if "sl_pause_until" not in existing:
+        cur.execute(
+            "ALTER TABLE system_state ADD COLUMN sl_pause_until TEXT DEFAULT NULL"
+        )
