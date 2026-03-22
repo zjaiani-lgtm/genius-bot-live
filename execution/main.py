@@ -143,6 +143,12 @@ def main():
 
     generate_once = _try_import_generator()
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIX #3: MarketRegimeEngine — loop-გარეთ, ᲔᲠᲗᲘ instance სამუდამოდ
+    # ძველი კოდი ყოველ ტიკზე ახალ instance-ს ქმნიდა → state იკარგებოდა
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    regime_engine = MarketRegimeEngine()
+
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
@@ -177,35 +183,76 @@ def main():
                     except Exception:
                         pass
 
-
                 sig = _safe_pop_next_signal(outbox_path)
 
                 if sig:
-                    logger.info(f"Signal received | id={sig.get('signal_id')} | verdict={sig.get('final_verdict')}")
+                    signal_id = sig.get("signal_id", "UNKNOWN")
+                    verdict = str(sig.get("final_verdict", "")).upper()
 
-                    # 🔥 1. detect regime
-                    regime_engine = MarketRegimeEngine(os.environ)
+                    logger.info(f"Signal received | id={signal_id} | verdict={verdict}")
 
-                    trend = float(sig.get("trend", 0) or 0)
-                    vol = float(sig.get("vol_score", 0) or 0)
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # FIX #2: SELL signal — regime check bypass
+                    # SELL (TREND_REVERSAL / PROTECTIVE_SELL) ყოველთვის
+                    # სრულდება, SKIP_TRADING-ი მას ვერ ბლოკავს.
+                    # ძველი კოდი SELL-საც ჩერდებოდა SIDEWAYS-ზე!
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    if verdict == "SELL":
+                        logger.info(
+                            f"[AUTO] SELL signal → bypass regime check | "
+                            f"id={signal_id} source={sig.get('meta', {}).get('source', 'UNKNOWN')}"
+                        )
+                        engine.execute_signal(sig)
 
-                    regime = regime_engine.detect_regime(trend, vol)
-                    adaptive = regime_engine.apply(regime)
+                    elif verdict == "TRADE":
+                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        # FIX #1: atr_pct top-level-დან წაიკითხება.
+                        # signal_generator.py sig["atr_pct"]-ს წერს top-level-ზე.
+                        # ძველი კოდი vol-ს გადასცემდა atr_pct-ის ნაცვლად →
+                        # detect_regime(trend, vol=raw_score) — ATR %-ი კი 0 იყო.
+                        # apply(regime) — atr_pct=0 → fallback static TP/SL ყოველთვის.
+                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        trend   = float(sig.get("trend",     0) or 0)
+                        atr_pct = float(sig.get("atr_pct",   0) or 0)
+                        symbol  = str((sig.get("execution") or {}).get("symbol", ""))
 
-                    logger.info(f"[AUTO] Regime={regime} trend={trend:.3f} vol={vol:.3f}")
+                        # FIX #1a: detect_regime — atr_pct სწორი keyword-ით
+                        regime  = regime_engine.detect_regime(trend=trend, atr_pct=atr_pct)
 
-                    # ❌ 2. skip bad market
-                    if adaptive.get("SKIP_TRADING"):
-                        logger.warning("[AUTO] ❌ Skip trade (SIDEWAYS)")
-                        continue
+                        # FIX #1b: apply — atr_pct + symbol გადაეცემა
+                        adaptive = regime_engine.apply(regime, atr_pct=atr_pct, symbol=symbol)
 
-                    # 🔥 3. APPLY (safe version)
-                    sig["adaptive"] = adaptive   # 👈 ეს უკეთესია ვიდრე runtime_config
+                        logger.info(
+                            f"[AUTO] Regime={regime} trend={trend:.3f} "
+                            f"atr_pct={atr_pct:.3f} symbol={symbol}"
+                        )
 
-                    logger.info(f"[AUTO] Applied params: {adaptive}")
+                        # FIX #2 (TRADE): skip ცუდ ბაზარზე — SELL-ს არ ეხება
+                        if adaptive.get("SKIP_TRADING"):
+                            logger.warning(
+                                f"[AUTO] Skip trade | regime={regime} "
+                                f"reason={adaptive.get('SKIP_REASON', '')} | "
+                                f"id={signal_id}"
+                            )
+                            continue
 
-                    # 🚀 4. EXECUTE
-                    engine.execute_signal(sig)
+                        # adaptive-ი სიგნალში ჩაიწერება — execution_engine კითხულობს
+                        # adaptive-ში: TP_PCT, SL_PCT, REGIME, QUOTE_SIZE
+                        # signal_generator-ის adaptive override-ს ვინარჩუნებთ
+                        # (signal_generator-ი უკვე წერს sig["adaptive"])
+                        # main.py-ის regime მხოლოდ SKIP check-ისთვის — TP/SL sig-ში უკვეა
+                        logger.info(
+                            f"[AUTO] Applied regime params: TP={adaptive.get('TP_PCT', 'n/a')}% "
+                            f"SL={adaptive.get('SL_PCT', 'n/a')}% "
+                            f"regime={regime} | id={signal_id}"
+                        )
+
+                        engine.execute_signal(sig)
+
+                    else:
+                        # HOLD ან სხვა — უბრალოდ log
+                        logger.info(f"[AUTO] Unsupported verdict={verdict} | id={signal_id} → skip")
+
                 else:
                     logger.info("Worker alive, waiting for SIGNAL_OUTBOX...")
 
