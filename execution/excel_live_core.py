@@ -94,7 +94,8 @@ class ExcelLiveCore:
         self.th_volume  = _env_float("THRESHOLD_VOLUME", 0.50)
         self.th_conf    = _env_float("THRESHOLD_CONF",   0.64)
 
-        # --- Soft Volume Override ---
+        # --- AI execute threshold (ENV-ით კონტროლირებადი) ---
+        self.ai_execute_min = _env_float("AI_EXECUTE_MIN_SCORE", 0.55)
         self.enable_soft_volume_override  = _env_bool("ENABLE_SOFT_VOLUME_OVERRIDE", True)
         self.soft_volume_ai_min           = _env_float("SOFT_VOLUME_AI_MIN",  0.60)
         self.soft_volume_relax            = _env_float("SOFT_VOLUME_RELAX",   0.20)
@@ -153,10 +154,9 @@ class ExcelLiveCore:
         vol_ok = vol_ok_strict or vol_ok_soft
 
         active_strategy    = "YES" if (trend_ok and struct_ok and vol_ok and conf_ok and risk_ok and volband_ok) else "NO"
-        # FIX: > 0.60 → >= 0.55
-        # ძველი: ai=0.600 → False (strict >) → STAND_BY — boundary bug
-        # ETH ლოგი: ai=0.600, final=STAND_BY — ზუსტად ამ მიზეზით იბლოკებოდა
-        final_trade_decision = "EXECUTE" if (macro_gate == "ALLOW" and active_strategy == "YES" and ai_score >= 0.55) else "STAND_BY"
+        # AI_EXECUTE_MIN_SCORE — ENV-ით კონტროლირებადი (default=0.55)
+        # .env-ში: AI_EXECUTE_MIN_SCORE=0.55
+        final_trade_decision = "EXECUTE" if (macro_gate == "ALLOW" and active_strategy == "YES" and ai_score >= self.ai_execute_min) else "STAND_BY"
 
         return {
             "ai_score":              ai_score,
