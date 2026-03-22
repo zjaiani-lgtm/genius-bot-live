@@ -95,28 +95,6 @@ class ExecutionEngine:
         # AI_SIGNAL_THRESHOLD — secondary ai_score threshold (adaptive signal-ზე) (0=off)
         self.ai_signal_threshold = float(os.getenv("AI_SIGNAL_THRESHOLD", "0"))
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # #3 Trailing Stop — signal adaptive dict-ზე override-ი
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.trailing_stop_enabled  = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
-        self.trailing_stop_distance = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # #5 Partial Take Profit
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.use_partial_tp   = os.getenv("USE_PARTIAL_TP", "false").lower() == "true"
-        self.partial_tp1_pct  = float(os.getenv("PARTIAL_TP1_PCT",  "1.5"))
-        self.partial_tp1_size = float(os.getenv("PARTIAL_TP1_SIZE", "0.5"))
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # #7 Breakeven Stop
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.use_breakeven_stop    = os.getenv("USE_BREAKEVEN_STOP", "true").lower() == "true"
-        self.breakeven_trigger_pct = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.5"))
-
-        # trailing peak tracker: {signal_id: peak_price}
-        self._trailing_peaks: dict = {}
-
     def _load_system_state(self) -> Dict[str, Any]:
         raw = get_system_state()
         if self.state_debug:
@@ -454,40 +432,6 @@ class ExecutionEngine:
                     logger.error(f"TRADE_PARSE_FAIL | {signal_id} | {e}")
                     continue
 
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # #7 BREAKEVEN STOP check (ყოველ reconcile ტიკზე)
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                if tp_status not in filled and sl_status not in filled:
-                    try:
-                        self._check_breakeven(
-                            signal_id=str(signal_id),
-                            link_id=int(link_id),
-                            symbol=str(symbol),
-                            entry_price=float(entry_price),
-                            sl_order_id=str(sl_order_id),
-                            sl_stop_price=float(sl_stop_price or 0),
-                            sl_limit_price=float(sl_limit_price or 0),
-                            amount=float(amount),
-                        )
-                    except Exception as e:
-                        logger.warning(f"BREAKEVEN_CHECK_ERR | id={signal_id} err={e}")
-
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # #3 TRAILING STOP check (ყოველ reconcile ტიკზე)
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                if tp_status not in filled and sl_status not in filled:
-                    try:
-                        self._check_trailing_stop(
-                            signal_id=str(signal_id),
-                            link_id=int(link_id),
-                            symbol=str(symbol),
-                            entry_price=float(entry_price),
-                            sl_order_id=str(sl_order_id),
-                            amount=float(amount),
-                        )
-                    except Exception as e:
-                        logger.warning(f"TRAILING_CHECK_ERR | id={signal_id} err={e}")
-
                 if tp_status in filled and sl_status in filled:
                     logger.critical(f"OCO_DESYNC | BOTH_FILLED | {signal_id}")
                     set_oco_status(link_id, "DESYNC")
@@ -623,6 +567,64 @@ class ExecutionEngine:
                             _notify_sl_tp_outcome("SL")
                         except Exception:
                             pass
+
+                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        # FIX: SL Cooldown limit-ს მიაღწია → ყველა ღია OCO
+                        # გაუქმდეს. წინააღმდეგ შემთხვევაში ღია OCO-ები
+                        # autonomous-ად ასრულებენ SL-ებს პაუზის დროს →
+                        # consecutive_sl იზრდება შემდგომ, cooldown იმუშავებს
+                        # მაგრამ ზარალი კვლავ ხდება.
+                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        try:
+                            from execution.db.repository import get_sl_cooldown_state, list_active_oco_links
+                            sl_state = get_sl_cooldown_state()
+                            sl_limit = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
+                            if sl_state["consecutive_sl"] >= sl_limit:
+                                logger.warning(
+                                    f"[SL_COOLDOWN] limit reached ({sl_state['consecutive_sl']}) "
+                                    f"→ cancelling ALL open OCOs to prevent further autonomous SL hits"
+                                )
+                                open_links = list_active_oco_links(limit=20)
+                                for olink in open_links:
+                                    try:
+                                        (ol_id, ol_sig, ol_sym, ol_base,
+                                         ol_tp_oid, ol_sl_oid, *_rest) = olink
+                                        # skip current (already closed)
+                                        if str(ol_sig) == str(signal_id):
+                                            continue
+                                        # cancel TP order
+                                        if ol_tp_oid:
+                                            try:
+                                                self.exchange.cancel_order(str(ol_tp_oid), str(ol_sym))
+                                                logger.info(f"[SL_COOLDOWN] cancelled TP order | sym={ol_sym} oid={ol_tp_oid}")
+                                            except Exception:
+                                                pass
+                                        # cancel SL order
+                                        if ol_sl_oid:
+                                            try:
+                                                self.exchange.cancel_order(str(ol_sl_oid), str(ol_sym))
+                                                logger.info(f"[SL_COOLDOWN] cancelled SL order | sym={ol_sym} oid={ol_sl_oid}")
+                                            except Exception:
+                                                pass
+                                        # market sell remaining position
+                                        try:
+                                            free_base = float(self.exchange.fetch_balance_free(str(ol_base)))
+                                            if free_base > 0:
+                                                sell_amt = self.exchange.floor_amount(str(ol_sym), free_base * self.sell_buffer)
+                                                if sell_amt > 0:
+                                                    self.exchange.place_market_sell(str(ol_sym), sell_amt)
+                                                    logger.warning(
+                                                        f"[SL_COOLDOWN] market sold remaining | "
+                                                        f"sym={ol_sym} amount={sell_amt}"
+                                                    )
+                                        except Exception as e2:
+                                            logger.warning(f"[SL_COOLDOWN] market sell fail | sym={ol_sym} err={e2}")
+                                        set_oco_status(int(ol_id), "CLOSED_SL_COOLDOWN")
+                                        log_event("SL_COOLDOWN_FORCE_CLOSE", f"sig={ol_sig} sym={ol_sym}")
+                                    except Exception as e3:
+                                        logger.warning(f"[SL_COOLDOWN] cancel_loop err | {e3}")
+                        except Exception as e:
+                            logger.warning(f"[SL_COOLDOWN] cancel_all_oco_fail | err={e}")
 
                         self._run_post_close_diagnostics(
                             signal_id=str(signal_id),
@@ -802,209 +804,6 @@ class ExecutionEngine:
         buy = self.exchange.place_market_buy_by_quote(symbol=symbol, quote_amount=quote_amount)
         buy_avg = float(buy.get("average") or buy.get("price") or 0.0) or self.exchange.fetch_last_price(symbol)
         return buy, buy_avg
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # #5 PARTIAL TAKE PROFIT
-    # entry-ის შემდეგ TP1 (1.5%) → 50%-ს ყიდის, OCO-ს ბალანსი რჩება
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def _place_partial_tp_order(
-        self,
-        signal_id: str,
-        symbol: str,
-        sell_amount: float,
-        buy_avg: float,
-        adaptive: dict,
-    ) -> Optional[str]:
-        """
-        TP1 limit sell ორდერი — sell_amount * partial_tp1_size რაოდენობაზე.
-        Returns tp1_order_id ან None.
-        """
-        use_partial = adaptive.get("USE_PARTIAL_TP", self.use_partial_tp)
-        if not use_partial:
-            return None
-        if self.exchange is None:
-            return None
-        try:
-            tp1_pct    = float(adaptive.get("PARTIAL_TP1_PCT",  self.partial_tp1_pct))
-            tp1_size   = float(adaptive.get("PARTIAL_TP1_SIZE", self.partial_tp1_size))
-            tp1_price  = self.exchange.floor_price(symbol, buy_avg * (1.0 + tp1_pct / 100.0))
-            tp1_amount = self.exchange.floor_amount(symbol, sell_amount * tp1_size)
-            if tp1_amount <= 0:
-                return None
-            order = self.exchange.place_limit_sell_amount(
-                symbol=symbol, base_amount=tp1_amount, price=tp1_price
-            )
-            oid = str(order.get("id") or "")
-            logger.info(
-                f"PARTIAL_TP1_PLACED | id={signal_id} symbol={symbol} "
-                f"tp1_price={tp1_price} amount={tp1_amount} order_id={oid}"
-            )
-            log_event("PARTIAL_TP1_PLACED", f"{signal_id} {symbol} price={tp1_price} amount={tp1_amount}")
-            return oid
-        except Exception as e:
-            logger.warning(f"PARTIAL_TP1_FAIL | id={signal_id} symbol={symbol} err={e}")
-            return None
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # #7 BREAKEVEN STOP
-    # ყოველ reconcile ტიკზე: current_price > entry*(1+trigger%) → SL → entry
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def _check_breakeven(
-        self,
-        signal_id: str,
-        link_id: int,
-        symbol: str,
-        entry_price: float,
-        sl_order_id: str,
-        sl_stop_price: float,
-        sl_limit_price: float,
-        amount: float,
-        adaptive_meta: Optional[dict] = None,
-    ) -> bool:
-        """
-        True თუ breakeven move მოხდა და SL შეიცვალა.
-        """
-        use_be = (adaptive_meta or {}).get("USE_BREAKEVEN_STOP", self.use_breakeven_stop)
-        if not use_be:
-            return False
-        trigger_pct = float((adaptive_meta or {}).get("BREAKEVEN_TRIGGER_PCT", self.breakeven_trigger_pct))
-        breakeven_price = entry_price * (1.0 + trigger_pct / 100.0)
-
-        try:
-            current_price = self.exchange.fetch_last_price(symbol)
-        except Exception:
-            return False
-
-        # უკვე breakeven-ზეა? sl_stop_price >= entry → skip
-        if float(sl_stop_price or 0) >= entry_price * 0.999:
-            return False
-
-        if current_price < breakeven_price:
-            return False
-
-        # breakeven triggered — cancel old SL, place new at entry
-        new_sl_stop  = self.exchange.floor_price(symbol, entry_price)
-        new_sl_limit = self.exchange.floor_price(symbol, entry_price * (1.0 - self.sl_limit_gap_pct / 100.0))
-
-        try:
-            self.exchange.cancel_order(str(sl_order_id), symbol)
-        except Exception as e:
-            logger.warning(f"BREAKEVEN_CANCEL_SL_FAIL | id={signal_id} err={e}")
-            return False
-
-        try:
-            new_sl = self.exchange.place_stop_loss_limit_sell(
-                symbol=symbol,
-                base_amount=float(amount),
-                stop_price=float(new_sl_stop),
-                limit_price=float(new_sl_limit),
-            )
-            new_sl_id = str(new_sl.get("id") or "")
-
-            # DB-ში ახალი SL id შევინახოთ oco_links-ში
-            from execution.db.repository import _execute as _db_exec
-            _db_exec(
-                "UPDATE oco_links SET sl_order_id=?, sl_stop_price=?, sl_limit_price=?, "
-                "updated_at=datetime('now') WHERE id=?",
-                (new_sl_id, float(new_sl_stop), float(new_sl_limit), int(link_id)),
-            )
-
-            logger.info(
-                f"BREAKEVEN_TRIGGERED | id={signal_id} symbol={symbol} "
-                f"entry={entry_price:.6f} trigger={breakeven_price:.6f} "
-                f"new_sl={new_sl_stop:.6f} order_id={new_sl_id}"
-            )
-            log_event("BREAKEVEN_TRIGGERED", f"{signal_id} {symbol} new_sl={new_sl_stop:.6f}")
-            return True
-        except Exception as e:
-            logger.warning(f"BREAKEVEN_NEW_SL_FAIL | id={signal_id} symbol={symbol} err={e}")
-            return False
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # #3 TRAILING STOP
-    # ყოველ reconcile ტიკზე: price > peak → peak update → SL გადაიწია
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    def _check_trailing_stop(
-        self,
-        signal_id: str,
-        link_id: int,
-        symbol: str,
-        entry_price: float,
-        sl_order_id: str,
-        amount: float,
-        adaptive_meta: Optional[dict] = None,
-    ) -> bool:
-        """
-        True თუ trailing stop SL-ი განახლდა.
-        """
-        use_trail = (adaptive_meta or {}).get("TRAILING_STOP_ENABLED", self.trailing_stop_enabled)
-        if not use_trail:
-            return False
-        distance_pct = float((adaptive_meta or {}).get("TRAILING_STOP_DISTANCE", self.trailing_stop_distance))
-
-        try:
-            current_price = self.exchange.fetch_last_price(symbol)
-        except Exception:
-            return False
-
-        # peak tracker — in-memory (restart-ზე entry-ზე დაბრუნდება)
-        peak = self._trailing_peaks.get(signal_id, entry_price)
-        if current_price > peak:
-            self._trailing_peaks[signal_id] = current_price
-            peak = current_price
-
-        new_sl_stop  = peak * (1.0 - distance_pct / 100.0)
-        new_sl_limit = new_sl_stop * (1.0 - self.sl_limit_gap_pct / 100.0)
-        new_sl_stop  = self.exchange.floor_price(symbol, new_sl_stop)
-        new_sl_limit = self.exchange.floor_price(symbol, new_sl_limit)
-
-        # DB-ში ახლანდელი sl_stop_price
-        try:
-            from execution.db.repository import _fetchone
-            row = _fetchone(
-                "SELECT sl_stop_price FROM oco_links WHERE id=?", (int(link_id),)
-            )
-            current_sl = float(row[0]) if row else 0.0
-        except Exception:
-            current_sl = 0.0
-
-        # SL-ი ამოვიდა თუ არ ვინახავთ — skip
-        min_move_pct = 0.05  # სულ მცირე 0.05% გადაადგილება trailing-ზე
-        if new_sl_stop <= current_sl * (1.0 + min_move_pct / 100.0):
-            return False
-
-        try:
-            self.exchange.cancel_order(str(sl_order_id), symbol)
-        except Exception as e:
-            logger.warning(f"TRAILING_CANCEL_SL_FAIL | id={signal_id} err={e}")
-            return False
-
-        try:
-            new_sl = self.exchange.place_stop_loss_limit_sell(
-                symbol=symbol,
-                base_amount=float(amount),
-                stop_price=float(new_sl_stop),
-                limit_price=float(new_sl_limit),
-            )
-            new_sl_id = str(new_sl.get("id") or "")
-
-            from execution.db.repository import _execute as _db_exec
-            _db_exec(
-                "UPDATE oco_links SET sl_order_id=?, sl_stop_price=?, sl_limit_price=?, "
-                "updated_at=datetime('now') WHERE id=?",
-                (new_sl_id, float(new_sl_stop), float(new_sl_limit), int(link_id)),
-            )
-
-            logger.info(
-                f"TRAILING_SL_UPDATED | id={signal_id} symbol={symbol} "
-                f"peak={peak:.6f} new_sl={new_sl_stop:.6f} "
-                f"distance={distance_pct}% order_id={new_sl_id}"
-            )
-            log_event("TRAILING_SL_UPDATED", f"{signal_id} {symbol} peak={peak:.6f} new_sl={new_sl_stop:.6f}")
-            return True
-        except Exception as e:
-            logger.warning(f"TRAILING_NEW_SL_FAIL | id={signal_id} symbol={symbol} err={e}")
-            return False
 
     def execute_signal(self, signal: Dict[str, Any]) -> None:
         signal_id = str(signal.get("signal_id", "UNKNOWN"))
@@ -1372,20 +1171,6 @@ class ExecutionEngine:
             )
 
             log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
-
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # #5 PARTIAL TP — TP1 limit order (50% at 1.5%)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            try:
-                self._place_partial_tp_order(
-                    signal_id=str(signal_id),
-                    symbol=str(symbol),
-                    sell_amount=float(sell_amount),
-                    buy_avg=float(buy_avg),
-                    adaptive=adaptive if adaptive else {},
-                )
-            except Exception as e:
-                logger.warning(f"PARTIAL_TP_FAIL | id={signal_id} err={e}")
 
             try:
                 notify_signal_created(
