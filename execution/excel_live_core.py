@@ -153,7 +153,10 @@ class ExcelLiveCore:
         vol_ok = vol_ok_strict or vol_ok_soft
 
         active_strategy    = "YES" if (trend_ok and struct_ok and vol_ok and conf_ok and risk_ok and volband_ok) else "NO"
-        final_trade_decision = "EXECUTE" if (macro_gate == "ALLOW" and active_strategy == "YES" and ai_score > 0.60) else "STAND_BY"
+        # FIX: > 0.60 → >= 0.55
+        # ძველი: ai=0.600 → False (strict >) → STAND_BY — boundary bug
+        # ETH ლოგი: ai=0.600, final=STAND_BY — ზუსტად ამ მიზეზით იბლოკებოდა
+        final_trade_decision = "EXECUTE" if (macro_gate == "ALLOW" and active_strategy == "YES" and ai_score >= 0.55) else "STAND_BY"
 
         return {
             "ai_score":              ai_score,
