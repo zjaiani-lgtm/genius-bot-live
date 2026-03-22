@@ -553,17 +553,22 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if risk_q == "KILL":
             signal_id = str(uuid.uuid4())
-            # VOLATILE regime params
-            adaptive_sell = _regime().apply(
-                trend=trend_q, vol=vol_sc_q,
-                atr_pct=atrp_q, ai_score=ai_q,
-                base_quote=BOT_QUOTE_PER_TRADE,
-            )
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX #4a: apply() სწორი kwargs-ებით.
+            # ძველი კოდი: _regime().apply(trend=, vol=, atr_pct=, ai_score=, base_quote=)
+            # regime_engine.apply() signature: apply(regime, atr_pct, symbol, buy_time)
+            # trend=/vol=/ai_score=/base_quote= სრულად იგნორდებოდა → atr_pct=0 ყოველთვის
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            regime_sell = _regime().detect_regime(trend=trend_q, atr_pct=atrp_q)
+            adaptive_sell = _regime().apply(regime_sell, atr_pct=atrp_q, symbol=symbol)
             sig = {
                 "signal_id": signal_id,
                 "ts_utc": _now_utc_iso(),
                 "certified_signal": True,
                 "final_verdict": "SELL",
+                # FIX #4b: top-level trend + atr_pct → main.py კითხულობს
+                "trend":   round(trend_q, 4),
+                "atr_pct": round(atrp_q, 4),
                 "meta": {
                     "source": "PROTECTIVE_SELL",
                     "symbol": symbol,
@@ -771,6 +776,9 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     "ts_utc": _now_utc_iso(),
                     "certified_signal": True,
                     "final_verdict": "SELL",
+                    # FIX #4b: top-level trend + atr_pct → main.py-ი კითხულობს
+                    "trend":   round(trend, 4),
+                    "atr_pct": round(atrp, 4),
                     "meta": {
                         "source": "GEN_SIGNAL_SELL",
                         "symbol": symbol,
@@ -831,14 +839,14 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # MARKET REGIME — ATR-based dynamic TP/SL
+        # FIX #4c: apply() სწორი kwargs-ებით.
+        # ძველი კოდი: _regime().apply(trend=, vol=, atr_pct=, ai_score=, base_quote=)
+        # regime_engine.apply() signature: apply(regime, atr_pct, symbol, buy_time)
+        # trend=/vol=/ai_score=/base_quote= კვები იგნორდებოდა → atr_pct=0 ყოველთვის
+        # → _get_tp_sl() fallback static TP/SL → dynamic TP/SL NEVER worked in production
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        adaptive = _regime().apply(
-            trend=trend,
-            vol=vol_score,
-            atr_pct=atrp,
-            ai_score=float(decision["ai_score"]),
-            base_quote=BOT_QUOTE_PER_TRADE,
-        )
+        regime_name = _regime().detect_regime(trend=trend, atr_pct=atrp)
+        adaptive = _regime().apply(regime_name, atr_pct=atrp, symbol=symbol)
 
         # BEAR/VOLATILE/SIDEWAYS → trade ბლოკდება
         if adaptive.get("SKIP_TRADING"):
@@ -850,8 +858,11 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 )
             continue
 
-        # QUOTE_SIZE regime-ისგან (BULL=7.0, UNCERTAIN=5.6 და ა.შ.)
-        quote_size = adaptive.get("QUOTE_SIZE", BOT_QUOTE_PER_TRADE)
+        # QUOTE_SIZE: regime_engine-ი 1.0-ს აბრუნებს backward-compat-ისთვის
+        # BOT_QUOTE_PER_TRADE ENV-ს ვიყენებთ როგორც base — 1.0 fallback-ზე
+        quote_size = adaptive.get("QUOTE_SIZE", 1.0)
+        if quote_size <= 0 or quote_size == 1.0:
+            quote_size = BOT_QUOTE_PER_TRADE
         if quote_size <= 0:
             continue
 
@@ -860,6 +871,9 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             "ts_utc": _now_utc_iso(),
             "certified_signal": True,
             "final_verdict": "TRADE",
+            # FIX #4d: top-level trend + atr_pct → main.py კითხულობს regime check-ისთვის
+            "trend":   round(trend, 4),
+            "atr_pct": round(atrp, 4),
             "meta": {
                 "source": "DYZEN_EXCEL_LIVE_CORE",
                 "symbol": symbol,
@@ -876,12 +890,14 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             # execution_engine.py-ი ამ dict-ს კითხულობს:
             # tp_pct = float(adaptive.get("TP_PCT", self.tp_pct))
             # sl_pct = float(adaptive.get("SL_PCT", self.sl_pct))
+            # FIX #4e: adaptive["ATR_PCT"] → KeyError იყო!
+            # regime_engine.apply() არ აბრუნებს ATR_PCT key-ს → atrp პირდაპირ
             "adaptive": {
-                "TP_PCT":       adaptive["TP_PCT"],
-                "SL_PCT":       adaptive["SL_PCT"],
-                "REGIME":       adaptive["REGIME"],
-                "ATR_PCT":      adaptive["ATR_PCT"],
-                "QUOTE_SIZE":   quote_size,
+                "TP_PCT":     adaptive["TP_PCT"],
+                "SL_PCT":     adaptive["SL_PCT"],
+                "REGIME":     adaptive["REGIME"],
+                "ATR_PCT":    round(atrp, 4),      # FIX: adaptive["ATR_PCT"] → atrp
+                "QUOTE_SIZE": quote_size,
             },
         }
 
