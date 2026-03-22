@@ -82,6 +82,19 @@ class ExecutionEngine:
         self.limit_entry_offset_pct = float(os.getenv("LIMIT_ENTRY_OFFSET_PCT", "0.02"))
         self.limit_entry_timeout_sec = int(os.getenv("LIMIT_ENTRY_TIMEOUT_SEC", "6"))
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # DEAD PARAMS ACTIVATED — ადრე ENV-ში იყო, კოდი არ კითხულობდა
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # MAX_CONSECUTIVE_LOSSES — N consecutive loss-ის შემდეგ EXEC block (0=off)
+        self.max_consecutive_losses = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0"))
+
+        # MAX_DAILY_LOSS — daily P&L % loss limit, e.g. 3 = -3% → block (0=off)
+        self.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS", "0"))
+
+        # AI_SIGNAL_THRESHOLD — secondary ai_score threshold (adaptive signal-ზე) (0=off)
+        self.ai_signal_threshold = float(os.getenv("AI_SIGNAL_THRESHOLD", "0"))
+
     def _load_system_state(self) -> Dict[str, Any]:
         raw = get_system_state()
         if self.state_debug:
@@ -803,6 +816,80 @@ class ExecutionEngine:
             logger.warning(f"EXEC_REJECT | bad payload | id={signal_id}")
             log_event("REJECT_BAD_PAYLOAD", f"{signal_id}")
             return
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # DEAD PARAMS GUARDS — BUY-ის წინ, ყველა mode-ში
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # 1. MAX_CONSECUTIVE_LOSSES — N consecutive SL-ის შემდეგ EXEC block
+        if self.max_consecutive_losses > 0:
+            try:
+                stats = get_trade_stats()
+                losses = int(stats.get("losses", 0))
+                wins   = int(stats.get("wins",   0))
+                # consecutive losses: ბოლო N trade-ი ვინახავ ბრუნვის გარეშე
+                # მარტივი proxy: ბოლო (losses-wins) streak თუ > limit
+                from execution.db.repository import get_closed_trades
+                closed = get_closed_trades()
+                if closed:
+                    streak = 0
+                    for t in reversed(closed):
+                        if float(t.get("pnl_quote", 0) or 0) < 0:
+                            streak += 1
+                        else:
+                            break
+                    if streak >= self.max_consecutive_losses:
+                        msg = (
+                            f"EXEC_REJECT | MAX_CONSECUTIVE_LOSSES | "
+                            f"streak={streak} >= limit={self.max_consecutive_losses} | id={signal_id}"
+                        )
+                        logger.warning(msg)
+                        log_event("EXEC_REJECT_CONSECUTIVE_LOSSES", msg)
+                        return
+            except Exception as e:
+                logger.warning(f"CONSECUTIVE_LOSS_CHECK_FAIL | err={e} → skipped")
+
+        # 2. MAX_DAILY_LOSS — დღის P&L% ზარალი limit-ს გადასცდა?
+        if self.max_daily_loss_pct > 0:
+            try:
+                from execution.db.repository import get_closed_trades
+                from datetime import datetime, timezone
+                closed = get_closed_trades()
+                today = datetime.now(timezone.utc).date().isoformat()
+                daily_pnl = sum(
+                    float(t.get("pnl_quote", 0) or 0)
+                    for t in closed
+                    if str(t.get("closed_at", "") or "")[:10] == today
+                )
+                daily_quote_in = sum(
+                    float(t.get("quote_in", 0) or 0)
+                    for t in closed
+                    if str(t.get("closed_at", "") or "")[:10] == today
+                )
+                if daily_quote_in > 0:
+                    daily_loss_pct = abs(min(0, daily_pnl)) / daily_quote_in * 100.0
+                    if daily_loss_pct >= self.max_daily_loss_pct:
+                        msg = (
+                            f"EXEC_REJECT | MAX_DAILY_LOSS | "
+                            f"daily_loss={daily_loss_pct:.2f}% >= limit={self.max_daily_loss_pct}% | id={signal_id}"
+                        )
+                        logger.warning(msg)
+                        log_event("EXEC_REJECT_DAILY_LOSS", msg)
+                        return
+            except Exception as e:
+                logger.warning(f"DAILY_LOSS_CHECK_FAIL | err={e} → skipped")
+
+        # 3. AI_SIGNAL_THRESHOLD — adaptive signal-ის ai_score secondary check
+        if self.ai_signal_threshold > 0 and adaptive:
+            sig_ai = float(signal.get("meta", {}).get("decision", {}).get("ai_score", 1.0) or 1.0)
+            if sig_ai < self.ai_signal_threshold:
+                msg = (
+                    f"EXEC_REJECT | AI_SIGNAL_THRESHOLD | "
+                    f"ai={sig_ai:.3f} < threshold={self.ai_signal_threshold} | id={signal_id}"
+                )
+                logger.warning(msg)
+                log_event("EXEC_REJECT_AI_THRESHOLD", msg)
+                return
 
         if self.mode == "DEMO":
             last_price = float(self.price_feed.fetch_ticker(symbol)["last"])
