@@ -202,6 +202,12 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
+    # FIX: ATR_TO_TP_SANITY_FACTOR — dynamic TP-სთან ადაპტირებული შემოწმება
+    # ძველი: TP=3.0 × factor=0.10 = min_atr=0.30 → BNB atr=0.23 → BLOCKED_BY_EDGE
+    # ლოგი: "ATR_BELOW_TP atr%=0.23 < TP_PCT*ATR_TO_TP_SANITY_FACTOR=0.30 (TP_PCT=3.00 factor=0.10)"
+    # პრობლემა: TP=3.0% (regime-based) მაღალია → sanity check ბლოკავს ნორმალურ ბაზარს
+    # გამოსწორება: factor=0.10 → 0.06 — 15m flat ბაზარზე atr=0.20-0.35% რეალისტურია
+    # min_atr = 3.0 × 0.06 = 0.18% — BNB atr=0.23 გაივლის
     min_atr_for_tp = assumed_gross_edge * ATR_TO_TP_SANITY_FACTOR
     if atr_pct < min_atr_for_tp:
         return False, (
@@ -497,7 +503,10 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]], use_ma: boo
 def _risk_state(vol_regime: str, ai_score: float) -> str:
     if vol_regime == "EXTREME":
         return "KILL"
-    if ai_score < 0.45:
+    # FIX: 0.45 → 0.35
+    # ძველი: ai=0.342 → REDUCE → risk_num=0.5 → ai კიდევ ეცემა → feedback loop
+    # ახლა: REDUCE მხოლოდ ძალიან დაბალ ai-ზე — ნორმალური ბაზარი OK-ად გადის
+    if ai_score < 0.35:
         return "REDUCE"
     return "OK"
 
