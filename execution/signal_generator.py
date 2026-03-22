@@ -69,8 +69,57 @@ SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "0"))
 AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.0"))
 
 # 4. Trade frequency limits
-MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "0"))   # 0 = unlimited
-MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "0"))   # 0 = unlimited
+MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "0"))
+MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "0"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #1 RSI + MACD filter
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_RSI_FILTER        = os.getenv("USE_RSI_FILTER", "true").strip().lower() == "true"
+RSI_PERIOD            = int(os.getenv("RSI_PERIOD", "14"))
+RSI_MIN               = float(os.getenv("RSI_MIN", "35"))
+RSI_MAX               = float(os.getenv("RSI_MAX", "70"))
+RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "60"))
+
+USE_MACD_FILTER       = os.getenv("USE_MACD_FILTER", "true").strip().lower() == "true"
+MACD_FAST             = int(os.getenv("MACD_FAST", "12"))
+MACD_SLOW             = int(os.getenv("MACD_SLOW", "26"))
+MACD_SIGNAL_PERIOD    = int(os.getenv("MACD_SIGNAL_PERIOD", "9"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #2 Multi-timeframe confirmation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_MTF_FILTER        = os.getenv("USE_MTF_FILTER", "true").strip().lower() == "true"
+MTF_TIMEFRAME         = os.getenv("MTF_TIMEFRAME", "1h").strip()
+MTF_CANDLE_LIMIT      = int(os.getenv("MTF_CANDLE_LIMIT", "50"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #3 Trailing Stop
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "false").strip().lower() == "true"
+TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #4 Dynamic position sizing
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_DYNAMIC_SIZING    = os.getenv("USE_DYNAMIC_SIZING", "true").strip().lower() == "true"
+DYNAMIC_SIZE_MIN      = float(os.getenv("DYNAMIC_SIZE_MIN", "5.0"))
+DYNAMIC_SIZE_MAX      = float(os.getenv("DYNAMIC_SIZE_MAX", "15.0"))
+DYNAMIC_SIZE_AI_LOW   = float(os.getenv("DYNAMIC_SIZE_AI_LOW",  "0.55"))
+DYNAMIC_SIZE_AI_HIGH  = float(os.getenv("DYNAMIC_SIZE_AI_HIGH", "0.80"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #5 Partial Take Profit
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_PARTIAL_TP        = os.getenv("USE_PARTIAL_TP", "false").strip().lower() == "true"
+PARTIAL_TP1_PCT       = float(os.getenv("PARTIAL_TP1_PCT", "1.5"))
+PARTIAL_TP1_SIZE      = float(os.getenv("PARTIAL_TP1_SIZE", "0.5"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #7 Breakeven Stop
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_BREAKEVEN_STOP    = os.getenv("USE_BREAKEVEN_STOP", "true").strip().lower() == "true"
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.5"))
 
 # Soft structure override (USED ONLY WHEN USE_MA_FILTERS=false)
 STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
@@ -570,12 +619,119 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]], use_ma: boo
 def _risk_state(vol_regime: str, ai_score: float) -> str:
     if vol_regime == "EXTREME":
         return "KILL"
-    # FIX: 0.45 → 0.35
-    # ძველი: ai=0.342 → REDUCE → risk_num=0.5 → ai კიდევ ეცემა → feedback loop
-    # ახლა: REDUCE მხოლოდ ძალიან დაბალ ai-ზე — ნორმალური ბაზარი OK-ად გადის
     if ai_score < 0.35:
         return "REDUCE"
     return "OK"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #1 RSI
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _rsi(closes: List[float], n: int = 14) -> float:
+    """Wilder RSI — სტანდარტული implementation."""
+    if len(closes) < n + 1:
+        return 50.0  # neutral — საკმარისი data არ არის
+    gains, losses = [], []
+    for i in range(-n, 0):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0.0))
+        losses.append(max(-d, 0.0))
+    avg_gain = sum(gains) / n
+    avg_loss = sum(losses) / n
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #1 MACD
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _ema(closes: List[float], n: int) -> List[float]:
+    """Exponential Moving Average — სრული სერია."""
+    if len(closes) < n:
+        return [sum(closes) / len(closes)] * len(closes)
+    k = 2.0 / (n + 1.0)
+    result = [sum(closes[:n]) / n]
+    for price in closes[n:]:
+        result.append(price * k + result[-1] * (1.0 - k))
+    # pad front with first value to match closes length
+    pad = len(closes) - len(result)
+    return [result[0]] * pad + result
+
+
+def _macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9
+          ) -> Tuple[float, float, float]:
+    """
+    Returns (macd_line, signal_line, histogram) for the LAST candle.
+    macd > signal_line AND histogram > 0 → bullish crossover
+    """
+    if len(closes) < slow + signal:
+        return 0.0, 0.0, 0.0
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    # align lengths
+    min_len = min(len(ema_fast), len(ema_slow))
+    macd_series = [ema_fast[i] - ema_slow[i] for i in range(-min_len, 0)]
+    if len(macd_series) < signal:
+        return 0.0, 0.0, 0.0
+    sig_ema = _ema(macd_series, signal)
+    macd_val   = macd_series[-1]
+    signal_val = sig_ema[-1]
+    hist       = macd_val - signal_val
+    return round(macd_val, 8), round(signal_val, 8), round(hist, 8)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #2 Multi-Timeframe — higher timeframe trend check
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _mtf_trend_ok(symbol: str) -> Tuple[bool, str]:
+    """
+    1h (MTF_TIMEFRAME) trend-ი BULL-ია?
+    სწრაფი check: EMA20 > EMA50 AND last > EMA20
+    Returns (ok, reason)
+    """
+    try:
+        ohlcv_h = EXCHANGE.fetch_ohlcv(symbol, timeframe=MTF_TIMEFRAME, limit=MTF_CANDLE_LIMIT)
+        if not ohlcv_h or len(ohlcv_h) < 52:
+            return True, "not_enough_data→skip"  # data-ს ნაკლებობა → არ ვბლოკავთ
+        ohlcv_h, _ = _drop_unclosed_candle(ohlcv_h, MTF_TIMEFRAME)
+        if len(ohlcv_h) < 52:
+            return True, "not_enough_data→skip"
+        closes_h = [float(c[4]) for c in ohlcv_h]
+        ema20_h = _ema(closes_h, 20)
+        ema50_h = _ema(closes_h, 50)
+        last_h  = closes_h[-1]
+        ok = (last_h > ema20_h[-1]) and (ema20_h[-1] > ema50_h[-1])
+        reason = (
+            f"mtf={MTF_TIMEFRAME} last={last_h:.4f} "
+            f"ema20={ema20_h[-1]:.4f} ema50={ema50_h[-1]:.4f} ok={ok}"
+        )
+        return ok, reason
+    except Exception as e:
+        return True, f"mtf_fetch_err→skip: {e}"  # fetch error → არ ვბლოკავთ
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #4 Dynamic position sizing
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _dynamic_quote_size(ai_score: float, base: float) -> float:
+    """
+    ai_score → quote size:
+      ai < AI_LOW  → DYNAMIC_SIZE_MIN
+      ai > AI_HIGH → DYNAMIC_SIZE_MAX
+      between      → linear interpolation
+    """
+    if not USE_DYNAMIC_SIZING:
+        return base
+    lo, hi = DYNAMIC_SIZE_AI_LOW, DYNAMIC_SIZE_AI_HIGH
+    if ai_score <= lo:
+        return DYNAMIC_SIZE_MIN
+    if ai_score >= hi:
+        return DYNAMIC_SIZE_MAX
+    t = (ai_score - lo) / (hi - lo)
+    size = DYNAMIC_SIZE_MIN + t * (DYNAMIC_SIZE_MAX - DYNAMIC_SIZE_MIN)
+    return round(size, 2)
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
@@ -826,8 +982,15 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         if open_trade:
             # SELL პირობები: trend < -0.15 AND mom1 < -0.01
-            # ნელ კლებაზეც რეაგირებს, არა მხოლოდ crash-ზე
-            if trend < -0.15 and mom1 < -0.01:
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # #1 RSI SELL: RSI > RSI_SELL_MIN(60) + trend reversal → ადრე გასვლა
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            rsi_sell = _rsi(closes, RSI_PERIOD) if USE_RSI_FILTER else 50.0
+            rsi_sell_trigger = USE_RSI_FILTER and rsi_sell >= RSI_SELL_MIN
+
+            sell_triggered = (trend < -0.15 and mom1 < -0.01) or rsi_sell_trigger
+
+            if sell_triggered:
                 signal_id = str(uuid.uuid4())
                 sig = {
                     "signal_id": signal_id,
@@ -839,9 +1002,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     "meta": {
                         "source": "GEN_SIGNAL_SELL",
                         "symbol": symbol,
-                        "reason": "TREND_REVERSAL",
+                        "reason": "RSI_OVERBOUGHT" if rsi_sell_trigger else "TREND_REVERSAL",
                         "trend": trend,
                         "mom1": mom1,
+                        "rsi":  round(rsi_sell, 2) if USE_RSI_FILTER else None,
                         "ai_score": float(decision["ai_score"]),
                         "decision_was": decision["final_trade_decision"],
                     },
@@ -853,6 +1017,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 logger.info(
                     f"[GEN] TREND_REVERSAL_SELL | symbol={symbol} "
                     f"trend={trend:.3f} mom1={mom1:.4f} "
+                    f"rsi={rsi_sell:.1f} rsi_trigger={rsi_sell_trigger} "
                     f"decision_was={decision['final_trade_decision']} — COOLDOWN BYPASSED"
                 )
                 # append_signal პირდაპირ — cooldown bypass (SELL არ ყოვნდება 60s)
@@ -953,6 +1118,48 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 logger.info(f"[GEN] BLOCKED_BY_ENV | symbol={symbol} reason=ALLOW_LIVE_SIGNALS=false")
             continue
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # #1 RSI FILTER
+        # RSI_MIN(35) <= rsi <= RSI_MAX(70) → BUY zone
+        # 35-70: oversold recovery, არა overbought ზონა
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_RSI_FILTER:
+            rsi_val = _rsi(closes, RSI_PERIOD)
+            if not (RSI_MIN <= rsi_val <= RSI_MAX):
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_RSI | symbol={symbol} rsi={rsi_val:.1f} "
+                        f"zone=[{RSI_MIN},{RSI_MAX}]"
+                    )
+                continue
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # #1 MACD FILTER
+        # macd_line > signal_line AND histogram > 0 → bullish momentum
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_MACD_FILTER:
+            macd_line, macd_sig, macd_hist = _macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL_PERIOD)
+            if macd_hist <= 0 or macd_line <= macd_sig:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_MACD | symbol={symbol} "
+                        f"macd={macd_line:.6f} signal={macd_sig:.6f} hist={macd_hist:.6f}"
+                    )
+                continue
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # #2 MULTI-TIMEFRAME FILTER
+        # 1h EMA20 > EMA50 AND last > EMA20 → higher TF BULL
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_MTF_FILTER:
+            mtf_ok, mtf_reason = _mtf_trend_ok(symbol)
+            if not mtf_ok:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_MTF | symbol={symbol} reason={mtf_reason}"
+                    )
+                continue
+
         signal_id = str(uuid.uuid4())
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -976,46 +1183,77 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 )
             continue
 
-        # QUOTE_SIZE: regime_engine-ი 1.0-ს აბრუნებს backward-compat-ისთვის
-        # BOT_QUOTE_PER_TRADE ENV-ს ვიყენებთ როგორც base — 1.0 fallback-ზე
+        # QUOTE_SIZE: dynamic sizing (ai_score-based) ან static BOT_QUOTE_PER_TRADE
         quote_size = adaptive.get("QUOTE_SIZE", 1.0)
         if quote_size <= 0 or quote_size == 1.0:
             quote_size = BOT_QUOTE_PER_TRADE
         if quote_size <= 0:
             continue
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # #4 DYNAMIC POSITION SIZING — ai_score → quote size
+        # ai_score=0.55 → DYNAMIC_SIZE_MIN=5 USDT
+        # ai_score=0.80 → DYNAMIC_SIZE_MAX=15 USDT
+        # between → linear interpolation
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        ai_for_sizing = float(decision["ai_score"])
+        quote_size = _dynamic_quote_size(ai_for_sizing, quote_size)
+        if quote_size <= 0:
+            continue
+
+        # RSI/MACD values for meta (if computed)
+        rsi_meta  = round(_rsi(closes, RSI_PERIOD), 2) if USE_RSI_FILTER else None
+        macd_meta = None
+        if USE_MACD_FILTER:
+            ml, ms, mh = _macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL_PERIOD)
+            macd_meta = {"macd": round(ml, 6), "signal": round(ms, 6), "hist": round(mh, 6)}
+
         sig = {
             "signal_id": signal_id,
             "ts_utc": _now_utc_iso(),
             "certified_signal": True,
             "final_verdict": "TRADE",
-            # FIX #4d: top-level trend + atr_pct → main.py კითხულობს regime check-ისთვის
             "trend":   round(trend, 4),
             "atr_pct": round(atrp, 4),
             "meta": {
-                "source": "DYZEN_EXCEL_LIVE_CORE",
-                "symbol": symbol,
+                "source":  "DYZEN_EXCEL_LIVE_CORE",
+                "symbol":  symbol,
                 "decision": decision,
-                "regime": adaptive.get("REGIME"),
+                "regime":  adaptive.get("REGIME"),
                 "atr_pct": round(atrp, 4),
+                "rsi":     rsi_meta,
+                "macd":    macd_meta,
+                "ai_score": ai_for_sizing,
+                "mtf_tf":  MTF_TIMEFRAME if USE_MTF_FILTER else None,
             },
             "execution": {
-                "symbol": symbol,
-                "direction": "LONG",
-                "entry": {"type": "MARKET"},
+                "symbol":       symbol,
+                "direction":    "LONG",
+                "entry":        {"type": "MARKET"},
                 "quote_amount": quote_size,
             },
-            # execution_engine.py-ი ამ dict-ს კითხულობს:
-            # tp_pct = float(adaptive.get("TP_PCT", self.tp_pct))
-            # sl_pct = float(adaptive.get("SL_PCT", self.sl_pct))
-            # FIX #4e: adaptive["ATR_PCT"] → KeyError იყო!
-            # regime_engine.apply() არ აბრუნებს ATR_PCT key-ს → atrp პირდაპირ
             "adaptive": {
                 "TP_PCT":     adaptive["TP_PCT"],
                 "SL_PCT":     adaptive["SL_PCT"],
                 "REGIME":     adaptive["REGIME"],
-                "ATR_PCT":    round(atrp, 4),      # FIX: adaptive["ATR_PCT"] → atrp
+                "ATR_PCT":    round(atrp, 4),
                 "QUOTE_SIZE": quote_size,
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # #3 Trailing Stop — execution_engine კითხულობს
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                "TRAILING_STOP_ENABLED":   TRAILING_STOP_ENABLED,
+                "TRAILING_STOP_DISTANCE":  TRAILING_STOP_DISTANCE,
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # #5 Partial TP — execution_engine კითხულობს
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                "USE_PARTIAL_TP":    USE_PARTIAL_TP,
+                "PARTIAL_TP1_PCT":   PARTIAL_TP1_PCT,
+                "PARTIAL_TP1_SIZE":  PARTIAL_TP1_SIZE,
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # #7 Breakeven Stop — execution_engine კითხულობს
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                "USE_BREAKEVEN_STOP":    USE_BREAKEVEN_STOP,
+                "BREAKEVEN_TRIGGER_PCT": BREAKEVEN_TRIGGER_PCT,
             },
         }
 
