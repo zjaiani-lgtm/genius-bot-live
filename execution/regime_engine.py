@@ -47,8 +47,8 @@ def _ei(name: str, default: int) -> int:
 # ──────────────────────────────────────────────
 _BULL_TREND_MIN    = _ef("REGIME_BULL_TREND_MIN",    0.45)
 _SIDEWAYS_ATR_MAX  = _ef("REGIME_SIDEWAYS_ATR_MAX",  0.28)
-_VOLATILE_ATR_MIN  = 1.50        # signal_generator-ის _vol_regime() ≥ 2.0 = EXTREME
-                                  # 1.5 <= atr < 2.0 → VOLATILE (pre-extreme guard)
+# FIX: ENV-კონფიგურირებადი (ადრე hardcoded 1.50 იყო)
+_VOLATILE_ATR_MIN  = _ef("REGIME_VOLATILE_ATR_MIN",  1.50)
 _BEAR_TREND_MAX    = -0.10
 
 # ATR-based TP/SL multipliers (Strategy B)
@@ -194,6 +194,15 @@ class MarketRegimeEngine:
         # ATR-based TP/SL
         tp_pct, sl_pct = self._get_tp_sl(regime, atr_pct)
 
+        # QUOTE_SIZE: regime-based default sizing
+        # BULL → full size, UNCERTAIN → reduced
+        # signal_generator.py _dynamic_quote_size() override-ავს ai_score-ზე
+        quote_size_defaults = {
+            "BULL":      _ef("QUOTE_SIZE_BULL",      15.0),
+            "UNCERTAIN": _ef("QUOTE_SIZE_UNCERTAIN",  7.0),
+        }
+        quote_size = quote_size_defaults.get(regime, _ef("BOT_QUOTE_PER_TRADE", 15.0))
+
         return {
             "SKIP_TRADING":    False,
             "SKIP_REASON":     "",
@@ -201,8 +210,8 @@ class MarketRegimeEngine:
             "SL_PCT":          sl_pct,
             "REGIME":          regime,
             "COOLDOWN_ACTIVE": False,
-            # Backward compat (ძველი კოდი იყენებდა QUOTE_SIZE)
-            "QUOTE_SIZE":      1.0,
+            # FIX: regime-based QUOTE_SIZE (ადრე ყოველთვის 1.0 — dead value)
+            "QUOTE_SIZE":      quote_size,
         }
 
     # ─────────────────────────────────────────────
