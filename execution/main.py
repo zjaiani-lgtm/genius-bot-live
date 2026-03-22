@@ -25,6 +25,9 @@ from execution.telegram_notifier import (
 
 logger = logging.getLogger("gbm")
 
+# SIGNAL_EXPIRATION_SECONDS — outbox-დან წამოღებული ძველი signal-ი → skip
+_SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "0"))
+
 
 def _bootstrap_state_if_needed() -> None:
     raw = get_system_state()
@@ -190,6 +193,39 @@ def main():
                     verdict = str(sig.get("final_verdict", "")).upper()
 
                     logger.info(f"Signal received | id={signal_id} | verdict={verdict}")
+
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # SIGNAL_EXPIRATION_SECONDS — ძველი signal-ი → skip
+                    # signal_generator-ი წერს sig["ts_utc"] (UTC ISO)
+                    # თუ signal-ი outbox-ში SIGNAL_EXPIRATION_SECONDS-ზე
+                    # მეტია → გამოტოვება (stale signal)
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    if _SIGNAL_EXPIRATION_SECONDS > 0:
+                        try:
+                            from datetime import datetime, timezone
+                            ts_raw = sig.get("ts_utc", "")
+                            if ts_raw:
+                                sig_dt = datetime.fromisoformat(
+                                    str(ts_raw).replace("Z", "+00:00")
+                                )
+                                if sig_dt.tzinfo is None:
+                                    sig_dt = sig_dt.replace(tzinfo=timezone.utc)
+                                age_s = (datetime.now(timezone.utc) - sig_dt).total_seconds()
+                                if age_s > _SIGNAL_EXPIRATION_SECONDS:
+                                    logger.warning(
+                                        f"[EXPIRED] signal skipped | id={signal_id} "
+                                        f"age={age_s:.0f}s > limit={_SIGNAL_EXPIRATION_SECONDS}s"
+                                    )
+                                    try:
+                                        log_event(
+                                            "SIGNAL_EXPIRED",
+                                            f"id={signal_id} age={age_s:.0f}s verdict={verdict}"
+                                        )
+                                    except Exception:
+                                        pass
+                                    continue
+                        except Exception as e:
+                            logger.warning(f"EXPIRY_CHECK_FAIL | id={signal_id} err={e} → skip check")
 
                     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                     # FIX #2: SELL signal — regime check bypass
