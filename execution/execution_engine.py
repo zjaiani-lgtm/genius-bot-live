@@ -682,7 +682,7 @@ class ExecutionEngine:
                         # limit-ზე: პაუზა + სრული დახურვა.
                         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                         try:
-                            from execution.db.repository import get_sl_cooldown_state, list_active_oco_links
+                            from execution.db.repository import get_sl_cooldown_state
                             sl_state = get_sl_cooldown_state()
                             sl_limit = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
                             cur_sl   = sl_state["consecutive_sl"]
