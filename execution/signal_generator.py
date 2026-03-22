@@ -143,7 +143,10 @@ _last_emit_ts: float = 0.0
 SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
 SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
 RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
-RECOVERY_CANDLE_PCT = float(os.getenv("RECOVERY_CANDLE_PCT", "0.25"))
+# FIX: 0.25% → 0.10% default. 15m flat ბაზარზე სანთლები 0.15-0.35%-ია.
+# 0.25% ძალიან მაღალია → recovery 30+ წუთი არ გადის.
+# ENV-ში: RECOVERY_CANDLE_PCT=0.15 (ან 0.10 flat ბაზრისთვის)
+RECOVERY_CANDLE_PCT = float(os.getenv("RECOVERY_CANDLE_PCT", "0.10"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL Cooldown state — DB-based (restart-safe)
@@ -370,15 +373,16 @@ def _trades_last_hour_count() -> int:
 def _recovery_ok(ohlcv: List[List[float]]) -> Tuple[bool, str]:
     """
     Recovery პირობები პაუზის შემდეგ:
-      1. ბოლო RECOVERY_CANDLES (3) სანთელი მწვანეა (close > open)
-      2. ბოლო სანთელი >= RECOVERY_CANDLE_PCT (0.25%) ზომისაა
+      1. ბოლო RECOVERY_CANDLES (3) სანთლიდან მინ. 2 მწვანეა (close > open)
+         FIX: ძველი ლოგიკა ALL 3 green — ძალიან მკაცრი 15m flat ბაზრისთვის
+         ახალი: >= ceil(RECOVERY_CANDLES * 2/3) — უმრავლესობა green
+      2. ბოლო სანთელი >= RECOVERY_CANDLE_PCT ზომისაა
     """
     if len(ohlcv) < RECOVERY_CANDLES + 1:
         return False, f"not_enough_candles need={RECOVERY_CANDLES+1}"
 
     candles = ohlcv[-(RECOVERY_CANDLES):]
 
-    # 3 მწვანე სანთელი
     green_count = 0
     for c in candles:
         o = float(c[1])  # open
@@ -386,7 +390,10 @@ def _recovery_ok(ohlcv: List[List[float]]) -> Tuple[bool, str]:
         if cl > o:
             green_count += 1
 
-    green_ok = green_count >= RECOVERY_CANDLES
+    # FIX: majority green (2 out of 3) instead of all 3
+    import math
+    min_green = math.ceil(RECOVERY_CANDLES * 2 / 3)
+    green_ok = green_count >= min_green
 
     # ბოლო სანთლის ზომა
     last_c = ohlcv[-1]
@@ -399,7 +406,7 @@ def _recovery_ok(ohlcv: List[List[float]]) -> Tuple[bool, str]:
 
     ok = green_ok and size_ok
     reason = (
-        f"green={green_count}/{RECOVERY_CANDLES} "
+        f"green={green_count}/{RECOVERY_CANDLES} (need>={min_green}) "
         f"last_candle_pct={last_candle_pct:.3f}% >= {RECOVERY_CANDLE_PCT}%={int(size_ok)}"
     )
     return ok, reason
@@ -866,6 +873,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         return None
 
     sl_state = get_sl_cooldown_state()
+    # FIX: თუ პაუზა დროით გაიარა (is_sl_pause_active()=False) მაგრამ
+    # consecutive_sl ჯერ კიდევ >= limit-ია DB-ში → recovery check საჭიროა.
+    # თუ recovery_candles=3 და ბაზარი flat-ია (0.15-0.20% სანთლები) →
+    # recovery NEVER passes და ბოტი დაბლოკილია indefinitely.
+    # FIX: RECOVERY_CANDLE_PCT-ს ENV-ით გასამართავად default 0.10%-ზე
+    # (0.25% ძალიან მაღალია 15m flat ბაზრისთვის).
+    # ასევე: consecutive_sl DB-ში reset-ი recovery pass-ის შემდეგ სწორდება.
     if sl_state["consecutive_sl"] >= SL_COOLDOWN_COUNT:
         # პაუზა დასრულდა — recovery check
         recovery_passed = False
