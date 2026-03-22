@@ -32,6 +32,9 @@ COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
 
 BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
+# MAX_QUOTE_PER_TRADE — exchange_client._guard()-ის hard ceiling
+# dynamic sizing-ი ამ მნიშვნელობას ვერ გადააჭარბებს
+MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "15"))
 
 # Fee-aware edge gate
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
@@ -1198,6 +1201,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         ai_for_sizing = float(decision["ai_score"])
         quote_size = _dynamic_quote_size(ai_for_sizing, quote_size)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # exchange_client._guard() — MAX_QUOTE_PER_TRADE hard ceiling
+        # dynamic sizing-მა შეიძლება მეტი დაანგარიშოს (13.35 > 7)
+        # → LIVE_BLOCKED. ამ cap-ი ბლოკს ასცდება.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        quote_size = min(quote_size, MAX_QUOTE_PER_TRADE)
         if quote_size <= 0:
             continue
 
