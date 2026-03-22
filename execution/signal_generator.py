@@ -55,6 +55,23 @@ BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true
 GEN_DEBUG = os.getenv("GEN_DEBUG", "true").strip().lower() == "true"
 GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == "true"
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# DEAD PARAMS ACTIVATED — ადრე ENV-ში იყო, კოდი არ კითხულობდა
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# 1. Volume filter — 24h volume < MIN_VOLUME_24H → BUY skip
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "0"))
+
+# 2. Signal expiration — signal ts_utc-დან SIGNAL_EXPIRATION_SECONDS გასული → skip
+SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "0"))
+
+# 3. AI confidence boost — ai_score * AI_CONFIDENCE_BOOST (>1.0 ამაღლებს score-ს)
+AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.0"))
+
+# 4. Trade frequency limits
+MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "0"))   # 0 = unlimited
+MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "0"))   # 0 = unlimited
+
 # Soft structure override (USED ONLY WHEN USE_MA_FILTERS=false)
 STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
 STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.58"))
@@ -255,6 +272,47 @@ def _notify_tp_event() -> None:
 def _sl_pause_active() -> bool:
     """DB-დან წაიკითხავს — restart-ზეც სწორია."""
     return is_sl_pause_active()
+
+
+def _trades_today_count() -> int:
+    """დღეს (UTC) დახურული + ღია trade-ების რაოდენობა DB-დან."""
+    try:
+        from execution.db.repository import get_closed_trades
+        trades = get_closed_trades()
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).date().isoformat()
+        count = sum(
+            1 for t in trades
+            if str(t.get("closed_at", "") or t.get("opened_at", ""))[:10] == today
+        )
+        return count
+    except Exception:
+        return 0
+
+
+def _trades_last_hour_count() -> int:
+    """ბოლო 60 წუთში დახურული trade-ების რაოდენობა DB-დან."""
+    try:
+        from execution.db.repository import get_closed_trades
+        trades = get_closed_trades()
+        from datetime import datetime, timezone, timedelta
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        count = 0
+        for t in trades:
+            closed_at = t.get("closed_at")
+            if not closed_at:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(closed_at).replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if dt >= cutoff:
+                    count += 1
+            except Exception:
+                pass
+        return count
+    except Exception:
+        return 0
 
 
 def _recovery_ok(ohlcv: List[List[float]]) -> Tuple[bool, str]:
@@ -495,9 +553,18 @@ def _confidence_score(closes: List[float], ohlcv: List[List[float]], use_ma: boo
     if use_ma:
         ma20 = _sma(closes, 20)
         cond_ma = 1.0 if last > ma20 else 0.0
-        return (0.35 * cond_ma) + (0.35 * cond_last_prev) + (0.20 * cond_slope) + (0.10 * cond_atr)
+        raw = (0.35 * cond_ma) + (0.35 * cond_last_prev) + (0.20 * cond_slope) + (0.10 * cond_atr)
+    else:
+        raw = (0.45 * cond_last_prev) + (0.35 * cond_slope) + (0.20 * cond_atr)
 
-    return (0.45 * cond_last_prev) + (0.35 * cond_slope) + (0.20 * cond_atr)
+    # AI_CONFIDENCE_BOOST — ENV-ით კონფიგურირებადი score multiplier (default=1.0, ENV=1.15)
+    # _clamp 1.0-ზე: boost ამაღლებს score-ს, მაგრამ 1.0-ს ვერ გადააჭარბებს
+    boosted = min(1.0, raw * AI_CONFIDENCE_BOOST)
+    if GEN_DEBUG and AI_CONFIDENCE_BOOST != 1.0:
+        logger.debug(
+            f"[CONF_BOOST] raw={raw:.3f} × {AI_CONFIDENCE_BOOST} = {boosted:.3f}"
+        )
+    return boosted
 
 
 def _risk_state(vol_regime: str, ai_score: float) -> str:
@@ -606,6 +673,25 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # TRADE FREQUENCY LIMITS — MAX_TRADES_PER_DAY / HOUR
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if MAX_TRADES_PER_DAY > 0:
+        today_count = _trades_today_count()
+        if today_count >= MAX_TRADES_PER_DAY:
+            logger.info(
+                f"[GEN] BLOCKED_DAILY_LIMIT | today={today_count} >= MAX_TRADES_PER_DAY={MAX_TRADES_PER_DAY}"
+            )
+            return None
+
+    if MAX_TRADES_PER_HOUR > 0:
+        hour_count = _trades_last_hour_count()
+        if hour_count >= MAX_TRADES_PER_HOUR:
+            logger.info(
+                f"[GEN] BLOCKED_HOURLY_LIMIT | last_hour={hour_count} >= MAX_TRADES_PER_HOUR={MAX_TRADES_PER_HOUR}"
+            )
+            return None
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # SL PAUSE — DB-based, restart-safe
     # consecutive_sl და sl_pause_until DB-შია → deploy bypass შეუძლებელია
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -681,6 +767,23 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         last = closes[-1]
         prev = closes[-2]
         atrp = _atr_pct(ohlcv, 14)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # MIN_VOLUME_24H filter — 24h volume-ი საკმარისია?
+        # vols[-1] = ბოლო კანდელის volume. 24h≈96 candles(15m).
+        # v24 = ბოლო 96 კანდელის ჯამი (proximate 24h volume)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if MIN_VOLUME_24H > 0:
+            candles_per_day = 96  # 15m × 96 = 24h
+            v24 = sum(vols[-candles_per_day:]) * last  # USDT-ში
+            if v24 < MIN_VOLUME_24H:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_LOW_VOLUME | symbol={symbol} "
+                        f"v24_usdt={v24:.0f} < MIN_VOLUME_24H={MIN_VOLUME_24H:.0f}"
+                    )
+                continue
+
         vol_reg = _vol_regime(atrp)
 
         trend = _trend_strength(closes, USE_MA_FILTERS)
