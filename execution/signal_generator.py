@@ -712,7 +712,58 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         logger.info(f"[GEN] FINAL_DECISION={decision['final_trade_decision']}")
 
-        # 🚫 თუ BLOCKED
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # CRITICAL FIX: TREND REVERSAL SELL — decision check-ის წინ!
+        # ძველი კოდი: SELL open_trade-ზე decision==EXECUTE-ის შემდეგ იყო
+        # → flat ბაზარზე decision=STAND_BY → SELL UNREACHABLE (dead code)
+        # ახლა: SELL ყველაზე პირველი შემოწმება — decision-ს არ ელოდება
+        # cooldown-საც bypass-ავს (append_signal, არა _emit) — SELL არ ყოვნდება
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        mom1 = _momentum(closes, 1) if len(closes) > 1 else 0.0
+
+        if open_trade:
+            # SELL პირობები: trend < -0.15 AND mom1 < -0.01
+            # ნელ კლებაზეც რეაგირებს, არა მხოლოდ crash-ზე
+            if trend < -0.15 and mom1 < -0.01:
+                signal_id = str(uuid.uuid4())
+                sig = {
+                    "signal_id": signal_id,
+                    "ts_utc": _now_utc_iso(),
+                    "certified_signal": True,
+                    "final_verdict": "SELL",
+                    "trend":   round(trend, 4),
+                    "atr_pct": round(atrp, 4),
+                    "meta": {
+                        "source": "GEN_SIGNAL_SELL",
+                        "symbol": symbol,
+                        "reason": "TREND_REVERSAL",
+                        "trend": trend,
+                        "mom1": mom1,
+                        "ai_score": float(decision["ai_score"]),
+                        "decision_was": decision["final_trade_decision"],
+                    },
+                    "execution": {
+                        "symbol": symbol,
+                        "direction": "LONG",
+                    }
+                }
+                logger.info(
+                    f"[GEN] TREND_REVERSAL_SELL | symbol={symbol} "
+                    f"trend={trend:.3f} mom1={mom1:.4f} "
+                    f"decision_was={decision['final_trade_decision']} — COOLDOWN BYPASSED"
+                )
+                # append_signal პირდაპირ — cooldown bypass (SELL არ ყოვნდება 60s)
+                append_signal(sig, outbox_path)
+                return sig
+
+            # open trade-ია, მაგრამ SELL პირობა არ დასრულდა — BUY-ს ნუ ვცდილობთ
+            continue
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # BUY PATH — მხოლოდ open_trade=False შემთხვევაში
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # 🚫 BUY BLOCKED — decision check
         if decision["final_trade_decision"] != "EXECUTE":
             logger.info(
                 f"[GEN] BLOCKED_BY_CORE | symbol={symbol} "
@@ -767,51 +818,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"sma5={s5:.6f} sma10={s10:.6f} sma_gap%={sma_gap_pct:.3f} "
                     f"v5={v5:.3f} v20={v20:.3f} vRatio={v_ratio:.3f} use_ma={USE_MA_FILTERS}"
                 )
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # TREND REVERSAL SELL — open trade-ზე
-        # protective SELL (KILL) უკვე ზემოთ დამუშავდა
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        mom1 = _momentum(closes, 1) if len(closes) > 1 else 0.0
-
-        if open_trade:
-            # SELL LOGIC — შერბილებული პირობები:
-            # trend < -0.15 (ნაცვლად -0.2) AND mom1 < -0.01 (ნაცვლად -0.02)
-            # ეს ნიშნავს: ნელ კლებაზეც გამოვა, არა მხოლოდ crash-ზე
-            if trend < -0.15 and mom1 < -0.01:
-                signal_id = str(uuid.uuid4())
-                sig = {
-                    "signal_id": signal_id,
-                    "ts_utc": _now_utc_iso(),
-                    "certified_signal": True,
-                    "final_verdict": "SELL",
-                    # FIX #4b: top-level trend + atr_pct → main.py-ი კითხულობს
-                    "trend":   round(trend, 4),
-                    "atr_pct": round(atrp, 4),
-                    "meta": {
-                        "source": "GEN_SIGNAL_SELL",
-                        "symbol": symbol,
-                        "reason": "TREND_REVERSAL",
-                        "trend": trend,
-                        "mom1": mom1,
-                        "decision": decision,
-                    },
-                    "execution": {
-                        "symbol": symbol,
-                        "direction": "LONG",
-                    }
-                }
-                logger.info(
-                    f"[GEN] TREND_REVERSAL_SELL | symbol={symbol} "
-                    f"trend={trend:.3f} mom1={mom1:.4f}"
-                )
-                _emit(sig, outbox_path)
-                return sig
-
-            continue
-
-        if decision["final_trade_decision"] != "EXECUTE":
-            continue
 
         # -----------------------------
         # EXTRA LIVE GUARDS
