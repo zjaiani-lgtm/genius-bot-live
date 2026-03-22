@@ -96,6 +96,57 @@ class ExecutionEngine:
         self.ai_signal_threshold = float(os.getenv("AI_SIGNAL_THRESHOLD", "0"))
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # CAPITAL PROTECTION — drawdown + exposure limits
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # MAX_ACCOUNT_DRAWDOWN — % balance drop from session start → KILL (0=off)
+        # e.g. 7 = if balance drops 7% from start → stop all trading
+        self.max_account_drawdown_pct = float(os.getenv("MAX_ACCOUNT_DRAWDOWN", "0"))
+        self._session_start_balance: Optional[float] = None  # set on first live BUY
+
+        # MAX_RISK_PER_TRADE_PCT — max % of balance per single trade (0=off)
+        # e.g. 1.0 = max 1% of balance per trade → overrides BOT_QUOTE_PER_TRADE if lower
+        self.max_risk_per_trade_pct = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0"))
+
+        # CAPITAL_USAGE_MIN/MAX — % of balance that should be deployed (informational + guard)
+        # MAX: if open exposure > MAX % of balance → skip new BUY
+        self.capital_usage_min = float(os.getenv("CAPITAL_USAGE_MIN", "0"))
+        self.capital_usage_max = float(os.getenv("CAPITAL_USAGE_MAX", "1.0"))
+
+        # MAX_PORTFOLIO_EXPOSURE — max % of total balance in open trades (0=off)
+        # e.g. 0.75 = max 75% of balance can be in open positions at once
+        self.max_portfolio_exposure = float(os.getenv("MAX_PORTFOLIO_EXPOSURE", "0"))
+
+        # MAX_SYMBOL_EXPOSURE — max % of balance in any single symbol (0=off)
+        # e.g. 0.40 = max 40% of balance in BTC/USDT at once
+        self.max_symbol_exposure = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0"))
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # STRATEGY / MARKET MODE flags — logging + future branching
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        self.adaptive_mode    = os.getenv("ADAPTIVE_MODE",    "true").lower()  == "true"
+        self.execution_style  = os.getenv("EXECUTION_STYLE",  "FAST").upper()
+        self.strategy_mode    = os.getenv("STRATEGY_MODE",    "HYBRID").upper()
+        self.market_mode      = os.getenv("MARKET_MODE",      "ADAPTIVE").upper()
+        self.trade_activity   = os.getenv("TRADE_ACTIVITY",   "HIGH").upper()
+
+        # BOT_POSITION_SIZE — fixed base-asset size override (0 = use quote_amount instead)
+        self.bot_position_size = float(os.getenv("BOT_POSITION_SIZE", "0"))
+
+        # DEDUPE_ONLY_WHEN_ACTIVE_OCO — if true: skip dedup check when no active OCO
+        # (allows re-entry after full close without waiting full cooldown)
+        self.dedupe_only_when_active_oco = os.getenv("DEDUPE_ONLY_WHEN_ACTIVE_OCO", "false").lower() == "true"
+
+        logger.info(
+            f"[ENGINE_INIT] mode={self.mode} adaptive={self.adaptive_mode} "
+            f"strategy={self.strategy_mode} market_mode={self.market_mode} "
+            f"execution_style={self.execution_style} trade_activity={self.trade_activity} "
+            f"max_drawdown={self.max_account_drawdown_pct}% "
+            f"max_portfolio_exp={self.max_portfolio_exposure} "
+            f"max_risk_per_trade={self.max_risk_per_trade_pct}%"
+        )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #3 Trailing Stop
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         self.trailing_stop_enabled  = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
@@ -1205,6 +1256,52 @@ class ExecutionEngine:
                 log_event("EXEC_REJECT_AI_THRESHOLD", msg)
                 return
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 4. MAX_ACCOUNT_DRAWDOWN — session balance drop limit
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if self.max_account_drawdown_pct > 0 and self.exchange is not None:
+            try:
+                current_balance = float(self.exchange.fetch_balance_free("USDT"))
+                if self._session_start_balance is None:
+                    self._session_start_balance = current_balance
+                    logger.info(f"[DRAWDOWN] session_start_balance={current_balance:.2f} USDT")
+                elif self._session_start_balance > 0:
+                    drawdown_pct = (self._session_start_balance - current_balance) / self._session_start_balance * 100.0
+                    if drawdown_pct >= self.max_account_drawdown_pct:
+                        msg = (
+                            f"EXEC_REJECT | MAX_ACCOUNT_DRAWDOWN | "
+                            f"drawdown={drawdown_pct:.2f}% >= limit={self.max_account_drawdown_pct}% | "
+                            f"start={self._session_start_balance:.2f} current={current_balance:.2f} | id={signal_id}"
+                        )
+                        logger.error(msg)
+                        log_event("EXEC_REJECT_DRAWDOWN", msg)
+                        return
+            except Exception as e:
+                logger.warning(f"DRAWDOWN_CHECK_FAIL | err={e} → skipped")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 5. MAX_PORTFOLIO_EXPOSURE — max % of balance in open trades
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if self.max_portfolio_exposure > 0 and self.exchange is not None:
+            try:
+                from execution.db.repository import get_trade_stats
+                stats = get_trade_stats()
+                open_exposure = float(stats.get("open_quote_in_sum", 0) or 0)
+                total_balance = float(self.exchange.fetch_balance_free("USDT")) + open_exposure
+                if total_balance > 0:
+                    exposure_ratio = open_exposure / total_balance
+                    if exposure_ratio >= self.max_portfolio_exposure:
+                        msg = (
+                            f"EXEC_REJECT | MAX_PORTFOLIO_EXPOSURE | "
+                            f"exposure={exposure_ratio:.2%} >= limit={self.max_portfolio_exposure:.2%} | "
+                            f"open_usdt={open_exposure:.2f} total={total_balance:.2f} | id={signal_id}"
+                        )
+                        logger.warning(msg)
+                        log_event("EXEC_REJECT_PORTFOLIO_EXPOSURE", msg)
+                        return
+            except Exception as e:
+                logger.warning(f"PORTFOLIO_EXPOSURE_CHECK_FAIL | err={e} → skipped")
+
         if self.mode == "DEMO":
             last_price = float(self.price_feed.fetch_ticker(symbol)["last"])
             base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
@@ -1254,6 +1351,38 @@ class ExecutionEngine:
             regime_quote = float(adaptive.get("QUOTE_SIZE", env_quote)) if adaptive else env_quote
             quote_amount = max(min_notional, regime_quote)
             quote_amount = round(quote_amount, 2)
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # MAX_RISK_PER_TRADE_PCT — hard ceiling on quote by % of balance
+            # e.g. 1.0% of 200 USDT balance = max 2 USDT per trade
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if self.max_risk_per_trade_pct > 0 and balance > 0:
+                max_by_risk = round(balance * (self.max_risk_per_trade_pct / 100.0), 2)
+                if quote_amount > max_by_risk:
+                    logger.info(
+                        f"[RISK_CAP] quote {quote_amount:.2f} → {max_by_risk:.2f} "
+                        f"(MAX_RISK_PER_TRADE_PCT={self.max_risk_per_trade_pct}% of {balance:.2f})"
+                    )
+                    quote_amount = max_by_risk
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # MAX_SYMBOL_EXPOSURE — max % of balance in this symbol
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if self.max_symbol_exposure > 0 and balance > 0:
+                from execution.db.repository import count_open_trades_for_symbol
+                sym_open_count = count_open_trades_for_symbol(str(symbol))
+                total_balance_est = balance + float(
+                    __import__("execution.db.repository", fromlist=["get_trade_stats"])
+                    .get_trade_stats().get("open_quote_in_sum", 0) or 0
+                )
+                max_sym_quote = round(total_balance_est * self.max_symbol_exposure, 2)
+                if sym_open_count > 0 and quote_amount > max_sym_quote:
+                    logger.info(
+                        f"[SYM_EXP_CAP] quote {quote_amount:.2f} → {max_sym_quote:.2f} "
+                        f"(MAX_SYMBOL_EXPOSURE={self.max_symbol_exposure:.0%} sym_open={sym_open_count})"
+                    )
+                    quote_amount = max(min_notional, max_sym_quote)
+                    quote_amount = round(quote_amount, 2)
 
             regime_name = adaptive.get("REGIME", "STATIC") if adaptive else "STATIC"
             logger.info(
