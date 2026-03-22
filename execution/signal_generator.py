@@ -75,6 +75,18 @@ AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.0"))
 MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "0"))
 MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "0"))
 
+# 5. AI_FILTER_LOW_CONFIDENCE — ai_score < threshold → hard reject before any other check
+# true = strict mode: ყველა low-confidence signal drop-ი ყველა filter-ის წინ
+AI_FILTER_LOW_CONFIDENCE = os.getenv("AI_FILTER_LOW_CONFIDENCE", "false").strip().lower() == "true"
+AI_FILTER_MIN_SCORE      = float(os.getenv("BUY_CONFIDENCE_MIN", "0.38"))  # reuses BUY_CONFIDENCE_MIN
+
+# 6. GEN_TEST_SIGNAL — force-emit one test signal for integration testing (true = one shot)
+GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true"
+
+# 7. BUY_LIQUIDITY_MIN_SCORE — volume_score minimum for BUY (0=off)
+# volume_score < this → skip (stricter than soft-volume-override)
+BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0"))
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #1 RSI + MACD filter
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -751,6 +763,28 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     core = _core()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # GEN_TEST_SIGNAL — integration test one-shot signal
+    # GEN_TEST_SIGNAL=true → emit one dummy HOLD signal და return
+    # production-ზე false უნდა იყოს
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if GEN_TEST_SIGNAL:
+        test_sym = SYMBOLS[0] if SYMBOLS else "BTC/USDT"
+        test_sig = {
+            "signal_id":       str(uuid.uuid4()),
+            "ts_utc":          _now_utc_iso(),
+            "certified_signal": True,
+            "final_verdict":   "HOLD",
+            "trend":           0.0,
+            "atr_pct":         0.0,
+            "meta":            {"source": "GEN_TEST_SIGNAL", "symbol": test_sym},
+            "execution":       {"symbol": test_sym, "direction": "LONG",
+                                "entry": {"type": "MARKET"}, "quote_amount": 0},
+        }
+        logger.info(f"[GEN_TEST] test signal emitted | symbol={test_sym}")
+        append_signal(test_sig, outbox_path)
+        return test_sig
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # PROTECTIVE SELL — cooldown-ის გარეშე!
     # ეს ᲧᲝᲕᲔᲚᲗᲕᲘᲡ შემოწმდება — crash/KILL სიტუაციაში
     # cooldown არ ბლოკავს დაცვით SELL-ს
@@ -1047,6 +1081,26 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # BUY PATH — მხოლოდ open_trade=False შემთხვევაში
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+        # AI_FILTER_LOW_CONFIDENCE — strict pre-filter (ყველა სხვა check-ის წინ)
+        if AI_FILTER_LOW_CONFIDENCE:
+            raw_ai = float(decision.get("ai_score", 0) or 0)
+            if raw_ai < AI_FILTER_MIN_SCORE:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_AI_FILTER | symbol={symbol} "
+                        f"ai={raw_ai:.3f} < min={AI_FILTER_MIN_SCORE:.3f}"
+                    )
+                continue
+
+        # BUY_LIQUIDITY_MIN_SCORE — volume_score hard floor (0=off)
+        if BUY_LIQUIDITY_MIN_SCORE > 0 and vol_score < BUY_LIQUIDITY_MIN_SCORE:
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] BLOCKED_LIQUIDITY | symbol={symbol} "
+                    f"vol_score={vol_score:.3f} < BUY_LIQUIDITY_MIN_SCORE={BUY_LIQUIDITY_MIN_SCORE:.3f}"
+                )
+            continue
 
         # 🚫 BUY BLOCKED — decision check
         if decision["final_trade_decision"] != "EXECUTE":
