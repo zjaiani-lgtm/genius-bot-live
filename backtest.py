@@ -136,9 +136,9 @@ SL_PAUSE_SECONDS = _ei("SL_COOLDOWN_PAUSE_SECONDS", 1800)
 # Breakeven
 BREAKEVEN_TRIGGER = _ef("BREAKEVEN_TRIGGER_PCT", 0.5)
 
-# OHLCV
+# OHLCV — 1000 candle = ~10 days of 15m data (მეტი history = უფრო reliable)
 TIMEFRAME    = os.getenv("BOT_TIMEFRAME", "15m")
-CANDLE_LIMIT = _ei("BOT_CANDLE_LIMIT", 500)
+CANDLE_LIMIT = _ei("BOT_CANDLE_LIMIT", 1000)  # FIX: default 500→1000
 ATR_PERIOD   = 14
 
 # Walk-Forward
@@ -149,10 +149,10 @@ WF_FOLDS     = 5
 MC_RUNS    = 1000
 MC_CAPITAL = 1000.0   # starting capital USDT
 
-# Parameter Optimization grid
+# Parameter Optimization grid — შენი ENV-ის TP_PCT=1.20 ირგვლივ
 PARAM_GRID = {
-    "tp_pct":  [1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-    "sl_pct":  [0.5, 0.75, 1.0, 1.25, 1.5],
+    "tp_pct":  [0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0],  # FIX: 1.20 ჩართულია
+    "sl_pct":  [0.4, 0.5, 0.7, 1.0, 1.25, 1.5],        # FIX: 0.70 ჩართულია
     "rsi_min": [30, 35, 40, 45],
     "rsi_max": [65, 70, 75, 80],
 }
