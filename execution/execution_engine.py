@@ -30,7 +30,6 @@ from execution.telegram_notifier import (
     notify_trade_closed,
 )
 from execution.signal_generator import notify_outcome as _notify_sl_tp_outcome
-import execution.config as _cfg  # FIX: single source of truth for all ENV params
 
 logger = logging.getLogger("gbm")
 
@@ -55,8 +54,8 @@ def _norm(s: Any) -> str:
 class ExecutionEngine:
     def __init__(self):
         self.mode = os.getenv("MODE", "DEMO").upper()
-        self.env_kill_switch = _cfg.KILL_SWITCH
-        self.live_confirmation = _cfg.LIVE_CONFIRMATION
+        self.env_kill_switch = os.getenv("KILL_SWITCH", "false").lower() == "true"
+        self.live_confirmation = os.getenv("LIVE_CONFIRMATION", "false").lower() == "true"
 
         self.price_feed = ccxt.binance({"enableRateLimit": True})
 
@@ -67,17 +66,17 @@ class ExecutionEngine:
 
         self.state_debug = os.getenv("STATE_DEBUG", "false").lower() == "true"
 
-        self.tp_pct = _cfg.TP_PCT
-        self.sl_pct = _cfg.SL_PCT
-        self.sl_limit_gap_pct = _cfg.SL_LIMIT_GAP_PCT
+        self.tp_pct = float(os.getenv("TP_PCT", "1.30"))
+        self.sl_pct = float(os.getenv("SL_PCT", "0.70"))
+        self.sl_limit_gap_pct = float(os.getenv("SL_LIMIT_GAP_PCT", "0.15"))
 
-        self.sell_buffer = _cfg.SELL_BUFFER
-        self.sell_retry_buffer = _cfg.SELL_RETRY_BUFFER
+        self.sell_buffer = float(os.getenv("SELL_BUFFER", "0.999"))
+        self.sell_retry_buffer = float(os.getenv("SELL_RETRY_BUFFER", "0.998"))
 
-        self.max_spread_pct = _cfg.MAX_SPREAD_PCT
-        self.estimated_roundtrip_fee_pct = _cfg.ESTIMATED_ROUNDTRIP_FEE_PCT
-        self.estimated_slippage_pct = _cfg.ESTIMATED_SLIPPAGE_PCT
-        self.min_net_profit_pct = _cfg.MIN_NET_PROFIT_PCT
+        self.max_spread_pct = float(os.getenv("MAX_SPREAD_PCT", "0.12"))
+        self.estimated_roundtrip_fee_pct = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
+        self.estimated_slippage_pct = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
+        self.min_net_profit_pct = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
 
         self.entry_mode = os.getenv("ENTRY_MODE", "MARKET").strip().upper()
         self.limit_entry_offset_pct = float(os.getenv("LIMIT_ENTRY_OFFSET_PCT", "0.02"))
@@ -88,10 +87,10 @@ class ExecutionEngine:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
         # MAX_CONSECUTIVE_LOSSES — N consecutive loss-ის შემდეგ EXEC block (0=off)
-        self.max_consecutive_losses = _cfg.MAX_CONSECUTIVE_LOSSES
+        self.max_consecutive_losses = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "0"))
 
         # MAX_DAILY_LOSS — daily P&L % loss limit, e.g. 3 = -3% → block (0=off)
-        self.max_daily_loss_pct = float(_cfg.MAX_DAILY_LOSS)
+        self.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS", "0"))
 
         # AI_SIGNAL_THRESHOLD — secondary ai_score threshold (adaptive signal-ზე) (0=off)
         self.ai_signal_threshold = float(os.getenv("AI_SIGNAL_THRESHOLD", "0"))
@@ -102,25 +101,25 @@ class ExecutionEngine:
 
         # MAX_ACCOUNT_DRAWDOWN — % balance drop from session start → KILL (0=off)
         # e.g. 7 = if balance drops 7% from start → stop all trading
-        self.max_account_drawdown_pct = _cfg.MAX_ACCOUNT_DRAWDOWN
+        self.max_account_drawdown_pct = float(os.getenv("MAX_ACCOUNT_DRAWDOWN", "0"))
         self._session_start_balance: Optional[float] = None  # set on first live BUY
 
         # MAX_RISK_PER_TRADE_PCT — max % of balance per single trade (0=off)
         # e.g. 1.0 = max 1% of balance per trade → overrides BOT_QUOTE_PER_TRADE if lower
-        self.max_risk_per_trade_pct = _cfg.MAX_RISK_PER_TRADE_PCT
+        self.max_risk_per_trade_pct = float(os.getenv("MAX_RISK_PER_TRADE_PCT", "0"))
 
         # CAPITAL_USAGE_MIN/MAX — % of balance that should be deployed (informational + guard)
         # MAX: if open exposure > MAX % of balance → skip new BUY
-        self.capital_usage_min = _cfg.CAPITAL_USAGE_MIN
-        self.capital_usage_max = _cfg.CAPITAL_USAGE_MAX
+        self.capital_usage_min = float(os.getenv("CAPITAL_USAGE_MIN", "0"))
+        self.capital_usage_max = float(os.getenv("CAPITAL_USAGE_MAX", "1.0"))
 
         # MAX_PORTFOLIO_EXPOSURE — max % of total balance in open trades (0=off)
         # e.g. 0.75 = max 75% of balance can be in open positions at once
-        self.max_portfolio_exposure = _cfg.MAX_PORTFOLIO_EXPOSURE
+        self.max_portfolio_exposure = float(os.getenv("MAX_PORTFOLIO_EXPOSURE", "0"))
 
         # MAX_SYMBOL_EXPOSURE — max % of balance in any single symbol (0=off)
         # e.g. 0.40 = max 40% of balance in BTC/USDT at once
-        self.max_symbol_exposure = _cfg.MAX_SYMBOL_EXPOSURE
+        self.max_symbol_exposure = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0"))
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # STRATEGY / MARKET MODE flags — logging + future branching
@@ -150,40 +149,25 @@ class ExecutionEngine:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #3 Trailing Stop
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.trailing_stop_enabled  = _cfg.TRAILING_STOP_ENABLED
-        self.trailing_stop_distance = _cfg.TRAILING_STOP_DISTANCE
+        self.trailing_stop_enabled  = os.getenv("TRAILING_STOP_ENABLED", "false").lower() == "true"
+        self.trailing_stop_distance = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #5 Partial Take Profit
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.use_partial_tp   = _cfg.USE_PARTIAL_TP
-        self.partial_tp1_pct  = _cfg.PARTIAL_TP1_PCT
-        self.partial_tp1_size = _cfg.PARTIAL_TP1_SIZE
+        self.use_partial_tp   = os.getenv("USE_PARTIAL_TP", "false").lower() == "true"
+        self.partial_tp1_pct  = float(os.getenv("PARTIAL_TP1_PCT",  "1.5"))
+        self.partial_tp1_size = float(os.getenv("PARTIAL_TP1_SIZE", "0.5"))
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #7 Breakeven Stop
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self.use_breakeven_stop    = _cfg.USE_BREAKEVEN_STOP
-        self.breakeven_trigger_pct = _cfg.BREAKEVEN_TRIGGER_PCT
+        self.use_breakeven_stop    = os.getenv("USE_BREAKEVEN_STOP", "true").lower() == "true"
+        self.breakeven_trigger_pct = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.5"))
 
         # trailing peak tracker: {signal_id: peak_price}
         self._trailing_peaks: dict = {}
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # FIX: regime_engine reference — injected by main.py.
-        # None → regime notify silently skipped (safe fallback).
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        self._regime_engine = None  # set via engine.inject_regime_engine(re)
-
-
-    def inject_regime_engine(self, regime_engine) -> None:
-        """main.py-დან გამოიძახება MarketRegimeEngine instance-ის inject-ისთვის.
-
-        engine = ExecutionEngine()
-        engine.inject_regime_engine(regime_engine)  # main.py-ში, loop-ის წინ
-        """
-        self._regime_engine = regime_engine
-        logger.info("[ENGINE] regime_engine injected — SL Cooldown tracking active")
     def _load_system_state(self) -> Dict[str, Any]:
         raw = get_system_state()
         if self.state_debug:
@@ -668,18 +652,6 @@ class ExecutionEngine:
                         except Exception:
                             pass
 
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # FIX: regime_engine SL Cooldown — TP resets counter
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        try:
-                            from execution.regime_engine import MarketRegimeEngine as _RE
-                            _re_instance = getattr(self, "_regime_engine", None)
-                            if _re_instance is not None:
-                                _re_instance.notify_outcome(str(symbol), "TP")
-                                logger.info(f"[REGIME_OUTCOME] TP reset | sym={symbol}")
-                        except Exception as _re_err:
-                            logger.warning(f"[REGIME_OUTCOME] TP notify fail | {_re_err}")
-
                         self._run_post_close_diagnostics(
                             signal_id=str(signal_id),
                             link_id=link_id,
@@ -746,24 +718,6 @@ class ExecutionEngine:
                             _notify_sl_tp_outcome("SL")
                         except Exception:
                             pass
-
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # FIX: regime_engine SL Cooldown — SL increments counter
-                        # ეს არის ის კრიტიკული call რომელიც არ არსებობდა.
-                        # regime_engine.apply() SL Cooldown-ს ამოწმებს მხოლოდ
-                        # მაშინ თუ notify_outcome("SL") გამოიძახება.
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        try:
-                            _re_instance = getattr(self, "_regime_engine", None)
-                            if _re_instance is not None:
-                                _re_instance.notify_outcome(str(symbol), "SL")
-                                cons_sl = _re_instance.get_consecutive_sl(str(symbol))
-                                logger.warning(
-                                    f"[REGIME_OUTCOME] SL tracked | sym={symbol} "
-                                    f"consecutive_sl={cons_sl}"
-                                )
-                        except Exception as _re_err:
-                            logger.warning(f"[REGIME_OUTCOME] SL notify fail | {_re_err}")
 
                         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                         # FIX v2: SL hit-ის შემდეგ ყველა სხვა ღია OCO
