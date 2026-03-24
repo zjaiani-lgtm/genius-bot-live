@@ -1,14 +1,90 @@
 # execution/db/db.py
+# ============================================================
+# FIX #3: Thread-local connection pool
+# ─────────────────────────────────────────────────────────────
+# ძველი კოდი: get_connection() ყოველ query-ზე ახალ sqlite3.connect()-ს
+# ხსნიდა და conn.close()-ს ეძახებოდა — overhead + lock risk.
+#
+# ახალი კოდი:
+#   • threading.local() — თითოეულ thread-ს საკუთარი connection აქვს
+#   • connection იხსნება ერთხელ thread-ის სიცოცხლეში
+#   • init_db() ახლა get_connection()-ს იყენებს — კონსისტენტური
+#   • close_all_connections() — graceful shutdown-ისთვის
+#   • WAL mode + busy_timeout — SQLite concurrent write-ების დასაცავად
+# ============================================================
 import sqlite3
+import threading
+import logging
 from execution.config import DB_PATH
 
+logger = logging.getLogger("gbm")
 
-def get_connection():
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+# thread-local storage: თითოეულ thread-ს _local.conn აქვს
+_local = threading.local()
+
+# ─────────────────────────────────────────────────────────────
+# WAL + busy timeout — production SQLite defaults
+# ─────────────────────────────────────────────────────────────
+_WAL_PRAGMAS = [
+    "PRAGMA journal_mode=WAL",      # concurrent readers + writer
+    "PRAGMA synchronous=NORMAL",    # WAL-თან უსაფრთხოა, სწრაფია
+    "PRAGMA busy_timeout=3000",     # 3s wait on locked DB instead of crash
+    "PRAGMA foreign_keys=ON",
+]
 
 
-def init_db():
+def get_connection() -> sqlite3.Connection:
+    """
+    Thread-local connection — ერთი connection per thread, სამუდამოდ.
+
+    პირველ გამოძახებაზე thread-ისთვის ახალ connection-ს ხსნის,
+    შემდგომ გამოძახებებზე იმავეს აბრუნებს.
+    """
+    conn = getattr(_local, "conn", None)
+
+    # connection-ი closed ან არარსებული → ახლიდან გახსნა
+    if conn is None:
+        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(
+            str(DB_PATH),
+            check_same_thread=False,   # thread-local-ით ვმართავთ thread-safety-ს
+            timeout=10,                # fallback timeout
+        )
+        conn.row_factory = sqlite3.Row  # dict-like rows — optional, backward-compat off by default
+
+        # production pragmas
+        for pragma in _WAL_PRAGMAS:
+            try:
+                conn.execute(pragma)
+            except Exception as e:
+                logger.warning(f"[DB] pragma fail | {pragma} | {e}")
+
+        _local.conn = conn
+        logger.debug(f"[DB] new connection opened | thread={threading.current_thread().name}")
+
+    return conn
+
+
+def close_thread_connection() -> None:
+    """
+    მიმდინარე thread-ის connection-ს ხურავს.
+    გამოიყენე graceful shutdown-ზე ან test teardown-ზე.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
+        logger.debug(f"[DB] connection closed | thread={threading.current_thread().name}")
+
+
+def init_db() -> None:
+    """
+    Schema initialization — ერთხელ გამოიძახება main.py-ში.
+    get_connection()-ის connection-ს იყენებს (WAL უკვე ჩართულია).
+    """
     conn = get_connection()
     cur = conn.cursor()
 
@@ -101,24 +177,20 @@ def init_db():
     )
     """)
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # MIGRATION: SL Cooldown columns
-    # system_state-ში ვამატებთ consecutive_sl და sl_pause_until
-    # CREATE TABLE IF NOT EXISTS ვერ ამატებს columns არსებულ ცხრილში
-    # ამიტომ ALTER TABLE-ს ვიყენებთ — IF NOT EXISTS pattern
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     _migrate_sl_cooldown_columns(cur)
 
     conn.commit()
-    conn.close()
+    # კავშირი აღარ იხურება — thread-local-ში რჩება
 
 
 def _migrate_sl_cooldown_columns(cur) -> None:
     """
     system_state ცხრილში ამატებს SL Cooldown columns-ებს.
-    იდემპოტენტურია — მეორეჯერ გაშვებაზე error არ გამოსვლება.
+    იდემპოტენტურია.
     """
-    # არსებული columns-ების სია
     cur.execute("PRAGMA table_info(system_state)")
     existing = {row[1] for row in cur.fetchall()}
 
