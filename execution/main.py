@@ -152,14 +152,6 @@ def main():
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     regime_engine = MarketRegimeEngine()
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX: inject regime_engine into execution_engine
-    # SL Cooldown feature ამ inject-ის გარეშე არარეალიზებული იყო.
-    # notify_outcome("SL"/"TP") ახლა execution_engine-ში მუშაობს.
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    engine.inject_regime_engine(regime_engine)
-    logger.info("[MAIN] regime_engine injected into execution_engine")
-
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
