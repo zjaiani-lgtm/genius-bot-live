@@ -532,6 +532,21 @@ def get_open_trade_for_symbol(symbol: str):
     )
 
 
+def get_all_open_trades():
+    """
+    FIX DRAWDOWN: ყველა ღია trade-ის დაბრუნება drawdown calculation-სთვის.
+    Returns: list of (signal_id, symbol, qty, entry_price)
+    """
+    return _fetchall(
+        """
+        SELECT signal_id, symbol, qty, entry_price
+        FROM trades
+        WHERE closed_at IS NULL
+        ORDER BY opened_at ASC
+        """
+    )
+
+
 def open_trade(
     signal_id: str,
     symbol: str,
