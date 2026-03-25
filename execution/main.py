@@ -31,7 +31,7 @@ _SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "0"))
 
 def _bootstrap_state_if_needed() -> None:
     raw = get_system_state()
-    if not isinstance(raw, (list, tuple)) or len(raw) < 5:
+    if raw is None or len(raw) < 5:
         logger.warning("BOOTSTRAP_STATE | system_state row missing or invalid -> skip")
         return
 
