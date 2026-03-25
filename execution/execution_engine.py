@@ -1042,15 +1042,28 @@ class ExecutionEngine:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     def _place_partial_tp_order(self, signal_id: str, symbol: str,
                                  sell_amount: float, buy_avg: float,
-                                 adaptive: dict) -> Optional[str]:
+                                 adaptive: dict,
+                                 _override_amount: bool = False) -> Optional[str]:
+        """
+        FIX PARTIAL_TP1_FAIL: _override_amount=True ნიშნავს sell_amount უკვე
+        სწორად გამოყოფილია OCO-სგან (caller-ის მიერ pre-split).
+        _override_amount=False (ძველი ქცევა): tp1_size გამოიყენება შიგნით.
+        """
         use_partial = adaptive.get("USE_PARTIAL_TP", self.use_partial_tp)
         if not use_partial:
             return None
         try:
-            tp1_pct    = float(adaptive.get("PARTIAL_TP1_PCT",  self.partial_tp1_pct))
-            tp1_size   = float(adaptive.get("PARTIAL_TP1_SIZE", self.partial_tp1_size))
-            tp1_price  = self.exchange.floor_price(symbol, buy_avg * (1.0 + tp1_pct / 100.0))
-            tp1_amount = self.exchange.floor_amount(symbol, sell_amount * tp1_size)
+            tp1_pct   = float(adaptive.get("PARTIAL_TP1_PCT", self.partial_tp1_pct))
+            tp1_price = self.exchange.floor_price(symbol, buy_avg * (1.0 + tp1_pct / 100.0))
+
+            if _override_amount:
+                # sell_amount უკვე არის partial portion — პირდაპირ ვიყენებთ
+                tp1_amount = self.exchange.floor_amount(symbol, sell_amount)
+            else:
+                # ძველი გზა (fallback): შიგნით ვყოფთ
+                tp1_size   = float(adaptive.get("PARTIAL_TP1_SIZE", self.partial_tp1_size))
+                tp1_amount = self.exchange.floor_amount(symbol, sell_amount * tp1_size)
+
             if tp1_amount <= 0:
                 return None
             order = self.exchange.place_limit_sell_amount(
@@ -1327,14 +1340,34 @@ class ExecutionEngine:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 4. MAX_ACCOUNT_DRAWDOWN — session balance drop limit
         # FIX I-5: _session_start_balance DB-ში ინახება — restart-safe.
-        # ადრე: in-memory → restart-ზე ნულდებოდა → drawdown protection
-        # bypass-ი შესაძლებელი იყო (6% drawdown + restart = სრული limit).
-        # ახლა: audit_log-ში "SESSION_START_BALANCE" event-ი ინახება.
-        # restart-ზე DB-დან წამოვიღებთ — protection გრძელდება.
+        # FIX DRAWDOWN: total balance = free_USDT + open_trades_value
+        # ძველი: fetch_balance_free("USDT") → locked trade-ები არ ითვლებოდა
+        #         → 2 ღია trade = -30$ false drawdown alarm.
+        # ახალი: free_USDT + Σ(qty × entry_price) → რეალური portfolio value.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if self.max_account_drawdown_pct > 0 and self.exchange is not None:
             try:
-                current_balance = float(self.exchange.fetch_balance_free("USDT"))
+                free_usdt = float(self.exchange.fetch_balance_free("USDT"))
+
+                # FIX: open trade-ების ღირებულება დავამატოთ
+                try:
+                    from execution.db.repository import get_all_open_trades
+                    open_rows = get_all_open_trades() or []
+                    locked_value = 0.0
+                    for row in open_rows:
+                        # row = (signal_id, symbol, qty, entry_price)
+                        _qty   = float(row[2] or 0)
+                        _eprice = float(row[3] or 0)
+                        # current price სჯობია, fallback: entry_price
+                        try:
+                            _cprice = float(self.exchange.fetch_last_price(str(row[1])))
+                        except Exception:
+                            _cprice = _eprice
+                        locked_value += _qty * _cprice
+                except Exception:
+                    locked_value = 0.0
+
+                current_balance = free_usdt + locked_value
 
                 # I-5: in-memory None → DB-დან ვცდილობთ წამოღებას
                 if self._session_start_balance is None:
@@ -1357,7 +1390,7 @@ class ExecutionEngine:
                 if self._session_start_balance is None:
                     # პირველი ჯერ — DB-ში ვინახავთ
                     self._session_start_balance = current_balance
-                    logger.info(f"[DRAWDOWN] session_start_balance={current_balance:.2f} USDT (saved to DB)")
+                    logger.info(f"[DRAWDOWN] session_start_balance={current_balance:.2f} USDT (free={free_usdt:.2f} locked={locked_value:.2f})")
                     try:
                         log_event("SESSION_START_BALANCE", f"{current_balance:.4f}")
                     except Exception:
@@ -1365,11 +1398,13 @@ class ExecutionEngine:
 
                 elif self._session_start_balance > 0:
                     drawdown_pct = (self._session_start_balance - current_balance) / self._session_start_balance * 100.0
+                    logger.debug(f"[DRAWDOWN] free={free_usdt:.2f} locked={locked_value:.2f} total={current_balance:.2f} dd={drawdown_pct:.2f}%")
                     if drawdown_pct >= self.max_account_drawdown_pct:
                         msg = (
                             f"EXEC_REJECT | MAX_ACCOUNT_DRAWDOWN | "
                             f"drawdown={drawdown_pct:.2f}% >= limit={self.max_account_drawdown_pct}% | "
-                            f"start={self._session_start_balance:.2f} current={current_balance:.2f} | id={signal_id}"
+                            f"start={self._session_start_balance:.2f} total={current_balance:.2f} "
+                            f"(free={free_usdt:.2f}+locked={locked_value:.2f}) | id={signal_id}"
                         )
                         logger.error(msg)
                         log_event("EXEC_REJECT_DRAWDOWN", msg)
@@ -1592,10 +1627,34 @@ class ExecutionEngine:
                 log_event("OCO_SKIP_NO_FREE_BASE", msg)
                 return
 
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX PARTIAL_TP1_FAIL: amount წინასწარ ვყოფთ
+            # ძველი ქცევა: OCO=100% + PartialTP=50% → insufficient balance
+            # ახალი ქცევა: OCO=50%, PartialTP=50% → total=100% ✓
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            _adp = adaptive if adaptive else {}
+            _use_partial = _adp.get("USE_PARTIAL_TP", self.use_partial_tp)
+            _tp1_size    = float(_adp.get("PARTIAL_TP1_SIZE", self.partial_tp1_size))
+
+            if _use_partial and 0 < _tp1_size < 1.0:
+                _oco_fraction  = 1.0 - _tp1_size                                          # e.g. 0.50
+                oco_amount     = self.exchange.floor_amount(symbol, sell_amount * _oco_fraction)
+                partial_amount = self.exchange.floor_amount(symbol, sell_amount * _tp1_size)
+                if oco_amount <= 0 or partial_amount <= 0:
+                    # precision rounding-მა 0-ზე ჩამოიყვანა → გათიშე partial
+                    oco_amount     = sell_amount
+                    partial_amount = 0.0
+                    _use_partial   = False
+                    logger.warning(f"PARTIAL_TP_SPLIT_ZERO | fallback full OCO | id={signal_id}")
+            else:
+                oco_amount     = sell_amount
+                partial_amount = 0.0
+                _use_partial   = False
+
             open_trade(
                 signal_id=signal_id,
                 symbol=str(symbol),
-                qty=float(sell_amount),
+                qty=float(sell_amount),        # DB-ში სრული qty (tracking-სთვის)
                 quote_in=float(quote_amount),
                 entry_price=float(buy_avg),
             )
@@ -1610,7 +1669,7 @@ class ExecutionEngine:
 
             oco = self.exchange.place_oco_sell(
                 symbol=str(symbol),
-                base_amount=float(sell_amount),
+                base_amount=float(oco_amount),   # FIX: partial portion reserved
                 tp_price=float(tp_price),
                 sl_stop_price=float(sl_stop),
                 sl_limit_price=float(sl_limit),
@@ -1650,24 +1709,27 @@ class ExecutionEngine:
                 tp_price=float(tp_price),
                 sl_stop_price=float(sl_stop),
                 sl_limit_price=float(sl_limit),
-                amount=float(sell_amount),
+                amount=float(oco_amount),     # FIX: OCO portion only
             )
 
-            log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id}")
+            log_event("TRADE_LIVE_ARMED", f"{signal_id} {symbol} OCO_ARMED listOrderId={list_order_id} oco_amt={oco_amount} partial_amt={partial_amount}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # #5 PARTIAL TP — TP1 limit order (50% at 1.5%)
+            # #5 PARTIAL TP — TP1 limit order
+            # FIX: partial_amount წინასწარ გამოყოფილია OCO-სგან
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            try:
-                self._place_partial_tp_order(
-                    signal_id=str(signal_id),
-                    symbol=str(symbol),
-                    sell_amount=float(sell_amount),
-                    buy_avg=float(buy_avg),
-                    adaptive=adaptive if adaptive else {},
-                )
-            except Exception as e:
-                logger.warning(f"PARTIAL_TP_FAIL | id={signal_id} err={e}")
+            if _use_partial and partial_amount > 0:
+                try:
+                    self._place_partial_tp_order(
+                        signal_id=str(signal_id),
+                        symbol=str(symbol),
+                        sell_amount=float(partial_amount),   # FIX: pre-split
+                        buy_avg=float(buy_avg),
+                        adaptive=_adp,
+                        _override_amount=True,               # skip internal size calc
+                    )
+                except Exception as e:
+                    logger.warning(f"PARTIAL_TP_FAIL | id={signal_id} err={e}")
 
             try:
                 notify_signal_created(
