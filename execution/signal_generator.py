@@ -149,6 +149,14 @@ if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
 
 _last_emit_ts: float = 0.0
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX I-1: per-symbol RSI SELL one-shot flag
+# RSI >= RSI_SELL_MIN → SELL emit ხდება ერთხელ per open_trade.
+# flag ნულდება RSI-ის დაცემისას (< RSI_SELL_MIN - 3) ან trade close-ზე.
+# გარეშე: RSI 75+ ზოლზე ყოველ tick-ზე SELL emit → outbox spam.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_rsi_sell_fired: dict = {}  # {symbol: bool}
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL COOLDOWN — 2 SL-ის შემდეგ 30 წუთი პაუზა
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1047,7 +1055,24 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             # #1 RSI SELL: RSI > RSI_SELL_MIN(60) + trend reversal → ადრე გასვლა
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             rsi_sell = _rsi(closes, RSI_PERIOD) if USE_RSI_FILTER else 50.0
-            rsi_sell_trigger = USE_RSI_FILTER and rsi_sell >= RSI_SELL_MIN
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX I-1: RSI SELL one-shot per open_trade per symbol.
+            # _rsi_sell_fired[symbol]=True → ამ trade-ზე RSI SELL გაისვრა.
+            # flag reset: RSI < RSI_SELL_MIN - 3 (cool-down zone).
+            # შედეგი: outbox spam აღარ იქნება, ერთი SELL per RSI spike.
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            global _rsi_sell_fired
+            rsi_cool_zone = RSI_SELL_MIN - 3  # e.g. 75 - 3 = 72
+            if rsi_sell < rsi_cool_zone:
+                _rsi_sell_fired[symbol] = False  # RSI დაეცა → reset flag
+
+            already_fired = _rsi_sell_fired.get(symbol, False)
+            rsi_sell_trigger = (
+                USE_RSI_FILTER
+                and rsi_sell >= RSI_SELL_MIN
+                and not already_fired
+            )
 
             sell_triggered = (trend < -0.15 and mom1 < -0.01) or rsi_sell_trigger
 
@@ -1082,6 +1107,9 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"decision_was={decision['final_trade_decision']} — COOLDOWN BYPASSED"
                 )
                 # append_signal პირდაპირ — cooldown bypass (SELL არ ყოვნდება 60s)
+                # FIX I-1: flag → True, ამ trade-ზე RSI SELL აღარ გაიმეორდება
+                if rsi_sell_trigger:
+                    _rsi_sell_fired[symbol] = True
                 append_signal(sig, outbox_path)
                 return sig
 
@@ -1350,15 +1378,32 @@ def run_once(*args, **kwargs) -> Optional[Dict[str, Any]]:
     return generate_signal()
 
 
-def notify_outcome(outcome: str) -> None:
+def notify_outcome(outcome: str, symbol: str = "") -> None:
     """
-    main.py-იდან გამოიძახება trade-ის დახურვის შემდეგ.
+    execution_engine.py-იდან გამოიძახება trade-ის დახურვის შემდეგ.
     outcome: 'SL' ან 'TP' ან 'MANUAL_SELL'
-    ამ ფუნქციის გამოძახება execution_engine.py-ში:
-      after close_trade(...) → from execution.signal_generator import notify_outcome
-                                notify_outcome(outcome)
+    symbol:  რომელი სიმბოლოს trade დაიხურა (e.g. 'BTC/USDT')
+
+    FIX I-8: symbol parameter დამატებულია.
+    DB cooldown ჯერ კიდევ global-ია (system_state) — ეს ნიშნავს
+    BTC SL → ETH-საც ბლოკავს. symbol-ი log-ში ჩანს debugging-ისთვის.
+    სრული per-symbol DB isolation → repository.py migration (შემდეგი ეტაპი).
     """
-    if str(outcome).upper() == "SL":
+    outcome_upper = str(outcome).upper()
+    sym_tag = f" | symbol={symbol}" if symbol else ""
+
+    if outcome_upper == "SL":
+        logger.info(f"[NOTIFY_OUTCOME] SL{sym_tag} → incrementing DB cooldown")
         _notify_sl_event()
-    elif str(outcome).upper() in ("TP", "MANUAL_SELL"):
+        # FIX I-1: RSI sell flag reset on trade close (new trade = new chance)
+        if symbol:
+            global _rsi_sell_fired
+            _rsi_sell_fired[symbol] = False
+
+    elif outcome_upper in ("TP", "MANUAL_SELL"):
+        logger.info(f"[NOTIFY_OUTCOME] {outcome_upper}{sym_tag} → resetting DB cooldown")
         _notify_tp_event()
+        # FIX I-1: RSI sell flag reset on trade close
+        if symbol:
+            global _rsi_sell_fired
+            _rsi_sell_fired[symbol] = False
