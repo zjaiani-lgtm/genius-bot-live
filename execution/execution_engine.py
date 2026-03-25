@@ -1260,11 +1260,8 @@ class ExecutionEngine:
         # 1. MAX_CONSECUTIVE_LOSSES — N consecutive SL-ის შემდეგ EXEC block
         if self.max_consecutive_losses > 0:
             try:
-                stats = get_trade_stats()
-                losses = int(stats.get("losses", 0))
-                wins   = int(stats.get("wins",   0))
-                # consecutive losses: ბოლო N trade-ი ვინახავ ბრუნვის გარეშე
-                # მარტივი proxy: ბოლო (losses-wins) streak თუ > limit
+                # FIX: stats/losses/wins ამოღებულია — streak-ში არ გამოიყენებოდა
+                # და get_trade_stats local variable conflict-ს იწვევდა
                 from execution.db.repository import get_closed_trades
                 closed = get_closed_trades()
                 if closed:
