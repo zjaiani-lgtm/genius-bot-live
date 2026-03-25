@@ -166,8 +166,14 @@ RSI_SELL_MIN = _env_int("RSI_SELL_MIN", 75)
 
 # Volume / Spread
 MIN_VOLUME_24H = _env_float("MIN_VOLUME_24H", 30_000_000)
-MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT",  0.08)
-SPREAD_LIMIT_PERCENT = _env_float("SPREAD_LIMIT_PERCENT", 0.12)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX I-4: SPREAD_LIMIT_PERCENT deprecated — გამოყენება შეწყდა.
+# MAX_SPREAD_PCT = ერთადერთი spread limit (execution_engine + exchange_client).
+# exchange_client.py კვლავ კითხულობს SPREAD_LIMIT_PERCENT env-ს fallback-ად,
+# მაგრამ config.py-დან ამოღებულია — .env-ში მხოლოდ MAX_SPREAD_PCT გამოიყენეთ.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MAX_SPREAD_PCT = _env_float("MAX_SPREAD_PCT", 0.08)
+# SPREAD_LIMIT_PERCENT — REMOVED (I-4 fix). Use MAX_SPREAD_PCT only.
 MIN_MOVE_PCT   = _env_float("MIN_MOVE_PCT",    0.20)
 MIN_NET_PROFIT_PCT = _env_float("MIN_NET_PROFIT_PCT", 0.20)
 
