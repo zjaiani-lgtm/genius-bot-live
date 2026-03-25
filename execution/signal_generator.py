@@ -759,31 +759,41 @@ def _macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #2 Multi-Timeframe — higher timeframe trend check
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-def _mtf_trend_ok(symbol: str) -> Tuple[bool, str]:
+def _mtf_trend_ok(symbol: str) -> Tuple[bool, str, str]:
     """
     1h (MTF_TIMEFRAME) trend-ი BULL-ია?
     სწრაფი check: EMA20 > EMA50 AND last > EMA20
-    Returns (ok, reason)
+
+    Returns (ok, reason, htf_regime)
+      htf_regime — regime_engine-ისთვის: "BULL" | "UNCERTAIN" | "BEAR" | None
+      None → data ნაკლებია ან fetch error (caller-ი None-ს გადასცემს apply()-ს)
     """
     try:
         ohlcv_h = EXCHANGE.fetch_ohlcv(symbol, timeframe=MTF_TIMEFRAME, limit=MTF_CANDLE_LIMIT)
         if not ohlcv_h or len(ohlcv_h) < 52:
-            return True, "not_enough_data→skip"  # data-ს ნაკლებობა → არ ვბლოკავთ
+            return True, "not_enough_data→skip", None  # data-ს ნაკლებობა → არ ვბლოკავთ
         ohlcv_h, _ = _drop_unclosed_candle(ohlcv_h, MTF_TIMEFRAME)
         if len(ohlcv_h) < 52:
-            return True, "not_enough_data→skip"
+            return True, "not_enough_data→skip", None
         closes_h = [float(c[4]) for c in ohlcv_h]
         ema20_h = _ema(closes_h, 20)
         ema50_h = _ema(closes_h, 50)
         last_h  = closes_h[-1]
         ok = (last_h > ema20_h[-1]) and (ema20_h[-1] > ema50_h[-1])
+
+        # ── htf_regime: 1h closes-ზე trend + ATR გამოვთვალოთ regime_engine-სთვის ──
+        trend_h = _trend_strength(closes_h, USE_MA_FILTERS)
+        atrp_h  = _atr_pct(ohlcv_h, n=14)
+        htf_regime = _regime().detect_regime(trend=trend_h, atr_pct=atrp_h)
+
         reason = (
             f"mtf={MTF_TIMEFRAME} last={last_h:.4f} "
-            f"ema20={ema20_h[-1]:.4f} ema50={ema50_h[-1]:.4f} ok={ok}"
+            f"ema20={ema20_h[-1]:.4f} ema50={ema50_h[-1]:.4f} "
+            f"htf_regime={htf_regime} ok={ok}"
         )
-        return ok, reason
+        return ok, reason, htf_regime
     except Exception as e:
-        return True, f"mtf_fetch_err→skip: {e}"  # fetch error → არ ვბლოკავთ
+        return True, f"mtf_fetch_err→skip: {e}", None  # fetch error → არ ვბლოკავთ
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1165,21 +1175,14 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # BUY PATH — მხოლოდ open_trade=False შემთხვევაში
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # AI_FILTER_LOW_CONFIDENCE — PRE-check (სტატიკური hard floor)
-        # მხოლოდ ძალიან დაბალი score-ები ბლოკდება რეჟიმის გარეშე.
-        # ADAPTIVE check (regime-based) — რეჟიმის შემდეგ ხდება.
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # AI_FILTER_LOW_CONFIDENCE — strict pre-filter (ყველა სხვა check-ის წინ)
         if AI_FILTER_LOW_CONFIDENCE:
             raw_ai = float(decision.get("ai_score", 0) or 0)
-            # hard floor: AI_SIGNAL_THRESHOLD (0.47) — ძალიან სუსტი სიგნალი
-            # adaptive floor (regime-based) — ქვემოთ, regime detection-ის შემდეგ
-            hard_floor = float(os.getenv("AI_SIGNAL_THRESHOLD", "0.35"))
-            if raw_ai < hard_floor:
+            if raw_ai < AI_FILTER_MIN_SCORE:
                 if GEN_DEBUG:
                     logger.info(
-                        f"[GEN] BLOCKED_AI_HARD_FLOOR | symbol={symbol} "
-                        f"ai={raw_ai:.3f} < hard_floor={hard_floor:.3f}"
+                        f"[GEN] BLOCKED_AI_FILTER | symbol={symbol} "
+                        f"ai={raw_ai:.3f} < min={AI_FILTER_MIN_SCORE:.3f}"
                     )
                 continue
 
@@ -1311,9 +1314,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #2 MULTI-TIMEFRAME FILTER
         # 1h EMA20 > EMA50 AND last > EMA20 → higher TF BULL
+        # FIX GAP-1: _mtf_trend_ok() ახლა htf_regime-საც აბრუნებს
+        # → apply()-ს htf_regime= გადაეცემა → MTF TP bonus/penalty მუშაობს
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        htf_regime: Optional[str] = None
         if USE_MTF_FILTER:
-            mtf_ok, mtf_reason = _mtf_trend_ok(symbol)
+            mtf_ok, mtf_reason, htf_regime = _mtf_trend_ok(symbol)
             if not mtf_ok:
                 if GEN_DEBUG:
                     logger.info(
@@ -1326,18 +1332,19 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # MARKET REGIME — ATR-based dynamic TP/SL
         # FIX #4c: apply() სწორი kwargs-ებით.
-        # ძველი კოდი: _regime().apply(trend=, vol=, atr_pct=, ai_score=, base_quote=)
-        # regime_engine.apply() signature: apply(regime, atr_pct, symbol, buy_time)
-        # trend=/vol=/ai_score=/base_quote= კვები იგნორდებოდა → atr_pct=0 ყოველთვის
-        # → _get_tp_sl() fallback static TP/SL → dynamic TP/SL NEVER worked in production
+        # FIX GAP-1: htf_regime= გადაეცემა → MTF bonus/penalty TP-ზე ამუშავდება
+        #   STRONG (15m=BULL + 1h=BULL)      → TP × 1.20
+        #   WEAK   (15m=BULL + 1h=UNCERTAIN) → TP × 0.85
+        #   DIVERGE (1h=BEAR/VOLATILE)        → SKIP_TRADING
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         regime_name = _regime().detect_regime(trend=trend, atr_pct=atrp)
         adaptive = _regime().apply(
             regime_name,
             atr_pct=atrp,
             symbol=symbol,
-            base_conf_min=BUY_CONFIDENCE_MIN,   # regime engine ადაპტირებს
-            base_quote=BOT_QUOTE_PER_TRADE,
+            htf_regime=htf_regime,          # ← GAP-1 FIX: MTF bonus/penalty ჩართულია
+            base_conf_min=BUY_CONFIDENCE_MIN,  # ← ეტაპი 2: adaptive conf threshold
+            base_quote=BOT_QUOTE_PER_TRADE,    # ← ეტაპი 1: regime-aware sizing
         )
 
         # BEAR/VOLATILE/SIDEWAYS → trade ბლოკდება
@@ -1349,30 +1356,6 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"atr%={atrp:.3f} trend={trend:.3f}"
                 )
             continue
-
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # ADAPTIVE AI CONFIDENCE CHECK — regime-based (ეტაპი 2)
-        # BULL:      BUY_CONFIDENCE_MIN × 0.85 → ნაკლები სიმკაცრე
-        # UNCERTAIN: BUY_CONFIDENCE_MIN × 1.20 → მეტი სიმკაცრე
-        # ეს არის "ბაზარს მიყოლა" — ძლიერ ბაზარზე ბოტი უფრო ადვილად ყიდულობს
-        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        if AI_FILTER_LOW_CONFIDENCE:
-            raw_ai       = float(decision.get("ai_score", 0) or 0)
-            adaptive_min = float(adaptive.get("CONF_MIN", BUY_CONFIDENCE_MIN))
-            if raw_ai < adaptive_min:
-                if GEN_DEBUG:
-                    logger.info(
-                        f"[GEN] BLOCKED_AI_FILTER | symbol={symbol} "
-                        f"ai={raw_ai:.3f} < min={adaptive_min:.3f} "
-                        f"regime={regime_name} (adaptive)"
-                    )
-                continue
-            elif GEN_DEBUG:
-                logger.info(
-                    f"[GEN] AI_FILTER_PASS | symbol={symbol} "
-                    f"ai={raw_ai:.3f} >= min={adaptive_min:.3f} "
-                    f"regime={regime_name}"
-                )
 
         # QUOTE_SIZE: dynamic sizing (ai_score-based) ან static BOT_QUOTE_PER_TRADE
         quote_size = adaptive.get("QUOTE_SIZE", 1.0)
@@ -1418,6 +1401,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 "macd":    macd_meta,
                 "ai_score": ai_for_sizing,
                 "mtf_tf":  MTF_TIMEFRAME if USE_MTF_FILTER else None,
+                "mtf_alignment": adaptive.get("MTF_ALIGNMENT"),   # GAP-1: STRONG/WEAK/DIVERGE/N/A
+                "mtf_confirmed": adaptive.get("MTF_CONFIRMED"),   # GAP-1: bool
             },
             "execution": {
                 "symbol":       symbol,
