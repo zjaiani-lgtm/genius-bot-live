@@ -173,6 +173,13 @@ class ExecutionEngine:
         # FIX: regime_engine reference — injected by main.py.
         # None → regime notify silently skipped (safe fallback).
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # FIX C-3: Double SL Cooldown — DB primary, in-memory secondary.
+        # DB-based cooldown (signal_generator._notify_sl_event) = primary.
+        # regime_engine in-memory (notify_outcome) = secondary (history).
+        # inject_regime_engine (C-1 fix main.py) → TP/SL reset სწორია.
+        # restart-ზე in-memory ნულდება, DB რჩება → DB გამარჯვებს.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         self._regime_engine = None  # set via engine.inject_regime_engine(re)
 
 
@@ -488,7 +495,13 @@ class ExecutionEngine:
                 tp_status = (tp_status or "").lower().strip()
                 sl_status = (sl_status or "").lower().strip()
 
-                filled = {"filled", "closed"}
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                # FIX C-6: "partially_filled" დამატებულია filled set-ში.
+                # Binance-ი TP/SL ბრძანებას "partially_filled" სტატუსში
+                # ტოვებს ზოგჯერ (partial execution). ადრე ეს სტატუსი
+                # არ ეცნობოდა → OCO სამუდამოდ "ღიად" რჩებოდა → stuck position.
+                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                filled = {"filled", "closed", "partially_filled"}
                 canceled_set = {"canceled", "cancelled", "expired", "rejected"}
 
                 def _safe_float(x):
@@ -1199,10 +1212,6 @@ class ExecutionEngine:
             log_event("EXEC_BLOCKED_LIVE_CONFIRMATION", f"{signal_id}")
             return
 
-        if signal.get("certified_signal") is not True:
-            log_event("REJECT_NOT_CERTIFIED", f"{signal_id}")
-            return
-
         execution = signal.get("execution") or {}
         symbol = execution.get("symbol")
         direction = str(execution.get("direction", "")).upper()
@@ -1214,6 +1223,15 @@ class ExecutionEngine:
 
         signal_hash = signal.get("_fingerprint") or signal.get("signal_hash")
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # FIX C-4: SELL verdict → certified_signal check-ის წინ.
+        # SELL (TREND_REVERSAL / PROTECTIVE_SELL) ყოველთვის უნდა
+        # სრულდებოდეს. ადრე certified_signal check SELL-ს ბლოკავდა
+        # თუ signal_generator-ის გარდა სხვა წყარო გამოიყენებოდა.
+        # KILL_SWITCH + LIVE_CONFIRMATION შემოწმებები ზევიდანვე ხდება —
+        # ისინი SELL-საც ბლოკავს (სწორია). მხოლოდ certified check
+        # გადადის SELL execution-ის შემდეგ BUY path-ისთვის.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if verdict == "SELL":
             if not symbol or direction != "LONG":
                 logger.warning(f"EXEC_REJECT | bad SELL payload | id={signal_id}")
@@ -1221,6 +1239,11 @@ class ExecutionEngine:
                 return
 
             self._execute_sell(signal_id=signal_id, symbol=str(symbol), signal_hash=signal_hash)
+            return
+
+        # BUY path only — certified_signal check
+        if signal.get("certified_signal") is not True:
+            log_event("REJECT_NOT_CERTIFIED", f"{signal_id}")
             return
 
         if not symbol or direction != "LONG" or entry_type != "MARKET":
@@ -1304,13 +1327,43 @@ class ExecutionEngine:
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 4. MAX_ACCOUNT_DRAWDOWN — session balance drop limit
+        # FIX I-5: _session_start_balance DB-ში ინახება — restart-safe.
+        # ადრე: in-memory → restart-ზე ნულდებოდა → drawdown protection
+        # bypass-ი შესაძლებელი იყო (6% drawdown + restart = სრული limit).
+        # ახლა: audit_log-ში "SESSION_START_BALANCE" event-ი ინახება.
+        # restart-ზე DB-დან წამოვიღებთ — protection გრძელდება.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if self.max_account_drawdown_pct > 0 and self.exchange is not None:
             try:
                 current_balance = float(self.exchange.fetch_balance_free("USDT"))
+
+                # I-5: in-memory None → DB-დან ვცდილობთ წამოღებას
                 if self._session_start_balance is None:
+                    try:
+                        from execution.db.repository import _fetchone
+                        row = _fetchone(
+                            "SELECT message FROM audit_log "
+                            "WHERE event_type = 'SESSION_START_BALANCE' "
+                            "ORDER BY id DESC LIMIT 1"
+                        )
+                        if row:
+                            self._session_start_balance = float(row[0])
+                            logger.info(
+                                f"[DRAWDOWN] session_start_balance restored from DB: "
+                                f"{self._session_start_balance:.2f} USDT"
+                            )
+                    except Exception:
+                        pass
+
+                if self._session_start_balance is None:
+                    # პირველი ჯერ — DB-ში ვინახავთ
                     self._session_start_balance = current_balance
-                    logger.info(f"[DRAWDOWN] session_start_balance={current_balance:.2f} USDT")
+                    logger.info(f"[DRAWDOWN] session_start_balance={current_balance:.2f} USDT (saved to DB)")
+                    try:
+                        log_event("SESSION_START_BALANCE", f"{current_balance:.4f}")
+                    except Exception:
+                        pass
+
                 elif self._session_start_balance > 0:
                     drawdown_pct = (self._session_start_balance - current_balance) / self._session_start_balance * 100.0
                     if drawdown_pct >= self.max_account_drawdown_pct:
