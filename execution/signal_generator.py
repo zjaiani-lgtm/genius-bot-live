@@ -16,6 +16,12 @@ from execution.db.repository import (
     increment_consecutive_sl,
     reset_consecutive_sl,
     is_sl_pause_active,
+    # FIX I-8 FULL: per-symbol SL cooldown (ახალი ცხრილი)
+    get_sl_cooldown_state_per_symbol,
+    increment_consecutive_sl_per_symbol,
+    reset_consecutive_sl_per_symbol,
+    is_sl_pause_active_per_symbol,
+    get_all_symbol_cooldown_states,
 )
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 from execution.regime_engine import MarketRegimeEngine
@@ -152,8 +158,7 @@ _last_emit_ts: float = 0.0
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FIX I-1: per-symbol RSI SELL one-shot flag
 # RSI >= RSI_SELL_MIN → SELL emit ხდება ერთხელ per open_trade.
-# flag ნულდება RSI-ის დაცემისას (< RSI_SELL_MIN - 3) ან trade close-ზე.
-# გარეშე: RSI 75+ ზოლზე ყოველ tick-ზე SELL emit → outbox spam.
+# flag ნულდება RSI-ის დაცემისას ან trade close-ზე.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 _rsi_sell_fired: dict = {}  # {symbol: bool}
 
@@ -325,8 +330,21 @@ def _get_outbox_path() -> str:
     return os.getenv("OUTBOX_PATH") or os.getenv("SIGNAL_OUTBOX_PATH") or "/var/data/signal_outbox.json"
 
 
-def _notify_sl_event() -> None:
-    """SL hit — DB-ში counter გაიზარდე (restart-safe)."""
+def _notify_sl_event(symbol: str = "") -> None:
+    """SL hit — DB-ში counter გაიზარდე (restart-safe).
+    FIX I-8 FULL: per-symbol isolation — BTC SL → ETH-ს ვეღარ ბლოკავს.
+    """
+    # per-symbol (ახალი, primary)
+    if symbol:
+        new_count_sym = increment_consecutive_sl_per_symbol(
+            symbol, pause_seconds=SL_COOLDOWN_PAUSE
+        )
+        logger.info(
+            f"[SL_TRACK_SYM] {symbol} | consecutive_sl={new_count_sym} "
+            f"limit={SL_COOLDOWN_COUNT} (DB-saved)"
+        )
+
+    # global (backward compat — signal_generator-ის _sl_pause_active() კვლავ global-ს კითხულობს)
     new_count = increment_consecutive_sl(pause_seconds=SL_COOLDOWN_PAUSE)
     logger.info(f"[SL_TRACK] consecutive_sl={new_count} limit={SL_COOLDOWN_COUNT} (DB-saved)")
     if new_count >= SL_COOLDOWN_COUNT:
@@ -336,8 +354,15 @@ def _notify_sl_event() -> None:
         )
 
 
-def _notify_tp_event() -> None:
-    """TP hit — DB-ში counter reset (restart-safe)."""
+def _notify_tp_event(symbol: str = "") -> None:
+    """TP hit — DB-ში counter reset (restart-safe).
+    FIX I-8 FULL: per-symbol reset — მხოლოდ ამ symbol-ის counter ნულდება.
+    """
+    # per-symbol reset (ახალი, primary)
+    if symbol:
+        reset_consecutive_sl_per_symbol(symbol)
+
+    # global reset (backward compat)
     state = get_sl_cooldown_state()
     if state["consecutive_sl"] > 0:
         logger.info(f"[SL_TRACK] TP hit → reset consecutive_sl {state['consecutive_sl']}→0 (DB)")
@@ -345,8 +370,17 @@ def _notify_tp_event() -> None:
 
 
 def _sl_pause_active() -> bool:
-    """DB-დან წაიკითხავს — restart-ზეც სწორია."""
+    """DB-დან წაიკითხავს — restart-ზეც სწორია. (global — backward compat)"""
     return is_sl_pause_active()
+
+
+def _sl_pause_active_for_symbol(symbol: str) -> bool:
+    """FIX I-8 FULL: symbol-specific pause check — global-ის ნაცვლად.
+    True თუ ამ კონკრეტული სიმბოლოს SL პაუზა აქტიურია.
+    """
+    if not symbol:
+        return is_sl_pause_active()  # fallback global
+    return is_sl_pause_active_per_symbol(symbol)
 
 
 def _trades_today_count() -> int:
@@ -775,6 +809,9 @@ def _dynamic_quote_size(ai_score: float, base: float) -> float:
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
+    # BUGFIX: global _rsi_sell_fired ფუნქციის სათავეში — Python requirement
+    global _rsi_sell_fired
+
     outbox_path = _get_outbox_path()
 
     # core singleton — ერთხელ იქმნება, ყველგან გამოიყენება
@@ -913,12 +950,16 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     # SL PAUSE — DB-based, restart-safe
     # consecutive_sl და sl_pause_until DB-შია → deploy bypass შეუძლებელია
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIX I-8 FULL: global pause კვლავ ამოწმებს global limit-ს.
+    # per-symbol pause → BUY loop-ში symbol-level-ზე ამოწმდება.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if _sl_pause_active():
         sl_state = get_sl_cooldown_state()
         pause_ts = sl_state.get("sl_pause_until") or 0.0
         remaining = max(0, int(pause_ts - time.time()))
         logger.info(
-            f"[SL_COOLDOWN] PAUSED (DB) | remaining={remaining}s "
+            f"[SL_COOLDOWN] GLOBAL PAUSED (DB) | remaining={remaining}s "
             f"({remaining//60}m{remaining%60}s) | "
             f"consecutive_sl={sl_state['consecutive_sl']}"
         )
@@ -968,6 +1009,22 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
         open_trade = _has_open_trade(symbol)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # FIX I-8 FULL: per-symbol SL pause check.
+        # BTC-ზე 2 SL → მხოლოდ BTC ბლოკდება, ETH/BNB კვლავ ვაჭრობს.
+        # open_trade-ის შემთხვევაში: SELL-ი კვლავ მუშაობს (bypass).
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if not open_trade and _sl_pause_active_for_symbol(symbol):
+            sym_state = get_sl_cooldown_state_per_symbol(symbol)
+            pause_ts  = sym_state.get("sl_pause_until") or 0.0
+            remaining = max(0, int(pause_ts - time.time()))
+            logger.info(
+                f"[SL_COOLDOWN_SYM] {symbol} PAUSED | "
+                f"remaining={remaining}s ({remaining//60}m{remaining%60}s) | "
+                f"consecutive_sl={sym_state['consecutive_sl']}"
+            )
+            continue
 
         try:
             ohlcv = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
@@ -1056,23 +1113,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             rsi_sell = _rsi(closes, RSI_PERIOD) if USE_RSI_FILTER else 50.0
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # FIX I-1: RSI SELL one-shot per open_trade per symbol.
-            # _rsi_sell_fired[symbol]=True → ამ trade-ზე RSI SELL გაისვრა.
-            # flag reset: RSI < RSI_SELL_MIN - 3 (cool-down zone).
-            # შედეგი: outbox spam აღარ იქნება, ერთი SELL per RSI spike.
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            global _rsi_sell_fired
-            rsi_cool_zone = RSI_SELL_MIN - 3  # e.g. 75 - 3 = 72
+            # FIX I-1: one-shot per open_trade — RSI spike = 1 SELL, არა spam
+            rsi_cool_zone = RSI_SELL_MIN - 3
             if rsi_sell < rsi_cool_zone:
-                _rsi_sell_fired[symbol] = False  # RSI დაეცა → reset flag
-
-            already_fired = _rsi_sell_fired.get(symbol, False)
-            rsi_sell_trigger = (
-                USE_RSI_FILTER
-                and rsi_sell >= RSI_SELL_MIN
-                and not already_fired
-            )
+                _rsi_sell_fired[symbol] = False
+            already_fired    = _rsi_sell_fired.get(symbol, False)
+            rsi_sell_trigger = USE_RSI_FILTER and rsi_sell >= RSI_SELL_MIN and not already_fired
 
             sell_triggered = (trend < -0.15 and mom1 < -0.01) or rsi_sell_trigger
 
@@ -1107,9 +1153,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"decision_was={decision['final_trade_decision']} — COOLDOWN BYPASSED"
                 )
                 # append_signal პირდაპირ — cooldown bypass (SELL არ ყოვნდება 60s)
-                # FIX I-1: flag → True, ამ trade-ზე RSI SELL აღარ გაიმეორდება
                 if rsi_sell_trigger:
-                    _rsi_sell_fired[symbol] = True
+                    _rsi_sell_fired[symbol] = True  # I-1: ერთხელ გაისვრა
                 append_signal(sig, outbox_path)
                 return sig
 
@@ -1384,26 +1429,25 @@ def notify_outcome(outcome: str, symbol: str = "") -> None:
     outcome: 'SL' ან 'TP' ან 'MANUAL_SELL'
     symbol:  რომელი სიმბოლოს trade დაიხურა (e.g. 'BTC/USDT')
 
-    FIX I-8: symbol parameter დამატებულია.
-    DB cooldown ჯერ კიდევ global-ია (system_state) — ეს ნიშნავს
-    BTC SL → ETH-საც ბლოკავს. symbol-ი log-ში ჩანს debugging-ისთვის.
-    სრული per-symbol DB isolation → repository.py migration (შემდეგი ეტაპი).
+    FIX I-8 FULL: symbol გადაეცემა per-symbol DB isolation-ისთვის.
+    BTC-ზე 2 SL → ETH trade-ებს ვეღარ ბლოკავს.
     """
+    # BUGFIX: global ფუნქციის სათავეში — Python მოითხოვს ამას
+    global _rsi_sell_fired
+
     outcome_upper = str(outcome).upper()
     sym_tag = f" | symbol={symbol}" if symbol else ""
 
     if outcome_upper == "SL":
         logger.info(f"[NOTIFY_OUTCOME] SL{sym_tag} → incrementing DB cooldown")
-        _notify_sl_event()
-        # FIX I-1: RSI sell flag reset on trade close (new trade = new chance)
+        _notify_sl_event(symbol=symbol)
+        # FIX I-1: RSI sell flag reset — ახალი trade-ი = ახალი შანსი
         if symbol:
-            global _rsi_sell_fired
             _rsi_sell_fired[symbol] = False
 
     elif outcome_upper in ("TP", "MANUAL_SELL"):
         logger.info(f"[NOTIFY_OUTCOME] {outcome_upper}{sym_tag} → resetting DB cooldown")
-        _notify_tp_event()
-        # FIX I-1: RSI sell flag reset on trade close
+        _notify_tp_event(symbol=symbol)
+        # FIX I-1: RSI sell flag reset
         if symbol:
-            global _rsi_sell_fired
             _rsi_sell_fired[symbol] = False
