@@ -152,6 +152,13 @@ def main():
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     regime_engine = MarketRegimeEngine()
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIX C-1: inject_regime_engine — execution_engine-ს regime_engine
+    # გადაეცემა, რათა TP/SL close-ზე in-memory SL counter სწორად reset-ს.
+    # გარეშე: _regime_engine=None → notify_outcome() არასოდეს გამოიძახება
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    engine.inject_regime_engine(regime_engine)
+
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
