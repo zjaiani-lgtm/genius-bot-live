@@ -4,10 +4,11 @@
 # get_connection() thread-local connection-ს აბრუნებს —
 # ერთხელ იხსნება, სამუდამოდ thread-ის სიცოცხლეში რჩება.
 #
-# ცვლილებები:
-#   _fetchone / _fetchall / _execute — conn.close() ამოღებულია
-#   _execute_many() — batch inserts/updates-ისთვის (ახალი)
-#   ყველა სხვა ფუნქცია — უცვლელი
+# FIX I-8: Per-symbol SL Cooldown isolation.
+#   ახალი ცხრილი: sl_cooldown_per_symbol
+#   ახალი ფუნქციები: get/increment/reset/is_paused _per_symbol()
+#   ძველი global ფუნქციები: შენარჩუნებულია (backward compat)
+#   შედეგი: BTC SL → ETH trade-ს ვეღარ ბლოკავს
 # ============================================================
 import sqlite3
 import time
@@ -191,6 +192,193 @@ def is_sl_pause_active() -> bool:
     if pause_until is None:
         return False
     return time.time() < pause_until
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX I-8: PER-SYMBOL SL COOLDOWN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# პრობლემა: global consecutive_sl — BTC-ზე 2 SL → ETH-საც 30 წუთი ბლოკდება.
+# გამოსწორება: sl_cooldown_per_symbol ცხრილი — თითო სიმბოლო დამოუკიდებელია.
+#
+# ცხრილი ავტომატურად იქმნება პირველი გამოძახებისას (_ensure_table).
+# ძველი global ფუნქციები (increment_consecutive_sl, reset_consecutive_sl,
+# is_sl_pause_active) შენარჩუნებულია — signal_generator-ი მათ კვლავ იყენებს
+# GLOBAL fallback-ისთვის. Per-symbol ფუნქციები ახალია.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_sl_table_ensured: bool = False
+
+
+def _ensure_sl_per_symbol_table() -> None:
+    """sl_cooldown_per_symbol ცხრილი ერთხელ იქმნება — idempotent."""
+    global _sl_table_ensured
+    if _sl_table_ensured:
+        return
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sl_cooldown_per_symbol (
+                symbol           TEXT PRIMARY KEY,
+                consecutive_sl   INTEGER NOT NULL DEFAULT 0,
+                sl_pause_until   TEXT    DEFAULT NULL,
+                updated_at       TEXT    NOT NULL
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS ix_sl_cooldown_symbol "
+            "ON sl_cooldown_per_symbol(symbol)"
+        )
+        conn.commit()
+        _sl_table_ensured = True
+    except Exception as e:
+        logger.warning(f"[SL_PER_SYMBOL] table ensure fail | {e}")
+
+
+def get_sl_cooldown_state_per_symbol(symbol: str) -> Dict[str, Any]:
+    """
+    symbol-ის SL cooldown state-ი DB-დან.
+    Returns: {"consecutive_sl": int, "sl_pause_until": float | None}
+    """
+    _ensure_sl_per_symbol_table()
+    sym = str(symbol or "").strip().upper()
+    row = _fetchone(
+        "SELECT consecutive_sl, sl_pause_until "
+        "FROM sl_cooldown_per_symbol WHERE symbol = ?",
+        (sym,),
+    )
+    if not row:
+        return {"consecutive_sl": 0, "sl_pause_until": None}
+
+    consecutive_sl = int(row[0] or 0)
+    sl_pause_raw   = row[1]
+    sl_pause_until: Optional[float] = None
+
+    if sl_pause_raw:
+        try:
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(str(sl_pause_raw).replace("Z", "+00:00"))
+            sl_pause_until = dt.timestamp()
+        except Exception:
+            sl_pause_until = None
+
+    return {"consecutive_sl": consecutive_sl, "sl_pause_until": sl_pause_until}
+
+
+def increment_consecutive_sl_per_symbol(
+    symbol: str,
+    pause_seconds: int = 1800,
+) -> int:
+    """
+    SL hit → symbol-ის consecutive_sl += 1.
+    limit-ს მიაღწია → sl_pause_until = now + pause_seconds.
+    Returns: ახალი consecutive_sl
+    """
+    import os
+    from datetime import datetime, timezone, timedelta
+
+    _ensure_sl_per_symbol_table()
+    sym   = str(symbol or "").strip().upper()
+    state = get_sl_cooldown_state_per_symbol(sym)
+    new_count = state["consecutive_sl"] + 1
+    limit     = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
+
+    pause_until_iso: Optional[str] = None
+    if new_count >= limit:
+        pause_dt        = datetime.now(timezone.utc) + timedelta(seconds=pause_seconds)
+        pause_until_iso = pause_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        logger.warning(
+            f"[SL_PER_SYMBOL] {sym} | {new_count} consecutive SL → "
+            f"PAUSE {pause_seconds // 60}min until {pause_until_iso}"
+        )
+    else:
+        logger.info(
+            f"[SL_PER_SYMBOL] {sym} | consecutive_sl={new_count} / {limit}"
+        )
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO sl_cooldown_per_symbol
+            (symbol, consecutive_sl, sl_pause_until, updated_at)
+        VALUES (?, ?, ?, datetime('now'))
+        ON CONFLICT(symbol) DO UPDATE SET
+            consecutive_sl = excluded.consecutive_sl,
+            sl_pause_until = excluded.sl_pause_until,
+            updated_at     = excluded.updated_at
+        """,
+        (sym, new_count, pause_until_iso),
+    )
+    conn.commit()
+    return new_count
+
+
+def reset_consecutive_sl_per_symbol(symbol: str) -> None:
+    """TP hit ან recovery → symbol-ის consecutive_sl = 0, pause = NULL."""
+    _ensure_sl_per_symbol_table()
+    sym   = str(symbol or "").strip().upper()
+    state = get_sl_cooldown_state_per_symbol(sym)
+    prev  = state["consecutive_sl"]
+
+    if prev > 0:
+        logger.info(f"[SL_PER_SYMBOL] {sym} | reset {prev}→0")
+
+    conn = get_connection()
+    cur  = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO sl_cooldown_per_symbol
+            (symbol, consecutive_sl, sl_pause_until, updated_at)
+        VALUES (?, 0, NULL, datetime('now'))
+        ON CONFLICT(symbol) DO UPDATE SET
+            consecutive_sl = 0,
+            sl_pause_until = NULL,
+            updated_at     = datetime('now')
+        """,
+        (sym,),
+    )
+    conn.commit()
+
+
+def is_sl_pause_active_per_symbol(symbol: str) -> bool:
+    """True თუ symbol-ის SL პაუზა ჯერ კიდევ აქტიურია."""
+    state      = get_sl_cooldown_state_per_symbol(symbol)
+    pause_until = state.get("sl_pause_until")
+    if pause_until is None:
+        return False
+    return time.time() < pause_until
+
+
+def get_all_symbol_cooldown_states() -> List[Dict[str, Any]]:
+    """
+    ყველა სიმბოლოს cooldown state — Telegram report-ისთვის / debug-ისთვის.
+    Returns: [{"symbol": str, "consecutive_sl": int, "paused": bool}, ...]
+    """
+    _ensure_sl_per_symbol_table()
+    rows = _fetchall(
+        "SELECT symbol, consecutive_sl, sl_pause_until "
+        "FROM sl_cooldown_per_symbol ORDER BY symbol"
+    )
+    result = []
+    for r in rows:
+        sym   = r[0]
+        count = int(r[1] or 0)
+        pause_raw = r[2]
+        paused = False
+        if pause_raw:
+            try:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(str(pause_raw).replace("Z", "+00:00"))
+                paused = time.time() < dt.timestamp()
+            except Exception:
+                pass
+        result.append({
+            "symbol":         sym,
+            "consecutive_sl": count,
+            "paused":         paused,
+        })
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
