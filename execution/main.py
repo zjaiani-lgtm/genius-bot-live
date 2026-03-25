@@ -249,45 +249,34 @@ def main():
 
                     elif verdict == "TRADE":
                         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # FIX #1: atr_pct top-level-დან წაიკითხება.
-                        # signal_generator.py sig["atr_pct"]-ს წერს top-level-ზე.
-                        # ძველი კოდი vol-ს გადასცემდა atr_pct-ის ნაცვლად →
-                        # detect_regime(trend, vol=raw_score) — ATR %-ი კი 0 იყო.
-                        # apply(regime) — atr_pct=0 → fallback static TP/SL ყოველთვის.
+                        # GAP-2 FIX: main.py-ი აღარ ახდენს TP/SL-ის recalc-ს.
+                        # signal_generator-მა უკვე გაითვლა adaptive (TP/SL + MTF bonus)
+                        # და sig["adaptive"]-ში ჩაწერა.
+                        # main.py-ი მხოლოდ SKIP safety-net-ია:
+                        # თუ სიგნალის emit-სა და execution-ს შორის (20 წამი)
+                        # ბაზარი BEAR/VOLATILE/SIDEWAYS-ად გადაბრუნდა → ბლოკავს.
                         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                         trend   = float(sig.get("trend",     0) or 0)
                         atr_pct = float(sig.get("atr_pct",   0) or 0)
                         symbol  = str((sig.get("execution") or {}).get("symbol", ""))
 
-                        # FIX #1a: detect_regime — atr_pct სწორი keyword-ით
                         regime  = regime_engine.detect_regime(trend=trend, atr_pct=atr_pct)
 
-                        # FIX #1b: apply — atr_pct + symbol გადაეცემა
-                        adaptive = regime_engine.apply(regime, atr_pct=atr_pct, symbol=symbol)
-
-                        logger.info(
-                            f"[AUTO] Regime={regime} trend={trend:.3f} "
-                            f"atr_pct={atr_pct:.3f} symbol={symbol}"
-                        )
-
-                        # FIX #2 (TRADE): skip ცუდ ბაზარზე — SELL-ს არ ეხება
-                        if adaptive.get("SKIP_TRADING"):
+                        # SKIP safety-net only — sig["adaptive"] არ გადაიწერება
+                        if regime in ("BEAR", "VOLATILE", "SIDEWAYS"):
                             logger.warning(
-                                f"[AUTO] Skip trade | regime={regime} "
-                                f"reason={adaptive.get('SKIP_REASON', '')} | "
-                                f"id={signal_id}"
+                                f"[AUTO] SKIP_SAFETY_NET | regime={regime} "
+                                f"trend={trend:.3f} atr={atr_pct:.3f} | id={signal_id}"
                             )
                             continue
 
-                        # adaptive-ი სიგნალში ჩაიწერება — execution_engine კითხულობს
-                        # adaptive-ში: TP_PCT, SL_PCT, REGIME, QUOTE_SIZE
-                        # signal_generator-ის adaptive override-ს ვინარჩუნებთ
-                        # (signal_generator-ი უკვე წერს sig["adaptive"])
-                        # main.py-ის regime მხოლოდ SKIP check-ისთვის — TP/SL sig-ში უკვეა
                         logger.info(
-                            f"[AUTO] Applied regime params: TP={adaptive.get('TP_PCT', 'n/a')}% "
-                            f"SL={adaptive.get('SL_PCT', 'n/a')}% "
-                            f"regime={regime} | id={signal_id}"
+                            f"[AUTO] Regime={regime} trend={trend:.3f} "
+                            f"atr_pct={atr_pct:.3f} symbol={symbol} "
+                            f"TP={sig.get('adaptive', {}).get('TP_PCT', 'n/a')}% "
+                            f"SL={sig.get('adaptive', {}).get('SL_PCT', 'n/a')}% "
+                            f"mtf={sig.get('meta', {}).get('mtf_alignment', 'N/A')} "
+                            f"| id={signal_id}"
                         )
 
                         engine.execute_signal(sig)
