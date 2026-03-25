@@ -1165,14 +1165,21 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # BUY PATH — მხოლოდ open_trade=False შემთხვევაში
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-        # AI_FILTER_LOW_CONFIDENCE — strict pre-filter (ყველა სხვა check-ის წინ)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # AI_FILTER_LOW_CONFIDENCE — PRE-check (სტატიკური hard floor)
+        # მხოლოდ ძალიან დაბალი score-ები ბლოკდება რეჟიმის გარეშე.
+        # ADAPTIVE check (regime-based) — რეჟიმის შემდეგ ხდება.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if AI_FILTER_LOW_CONFIDENCE:
             raw_ai = float(decision.get("ai_score", 0) or 0)
-            if raw_ai < AI_FILTER_MIN_SCORE:
+            # hard floor: AI_SIGNAL_THRESHOLD (0.47) — ძალიან სუსტი სიგნალი
+            # adaptive floor (regime-based) — ქვემოთ, regime detection-ის შემდეგ
+            hard_floor = float(os.getenv("AI_SIGNAL_THRESHOLD", "0.35"))
+            if raw_ai < hard_floor:
                 if GEN_DEBUG:
                     logger.info(
-                        f"[GEN] BLOCKED_AI_FILTER | symbol={symbol} "
-                        f"ai={raw_ai:.3f} < min={AI_FILTER_MIN_SCORE:.3f}"
+                        f"[GEN] BLOCKED_AI_HARD_FLOOR | symbol={symbol} "
+                        f"ai={raw_ai:.3f} < hard_floor={hard_floor:.3f}"
                     )
                 continue
 
@@ -1325,7 +1332,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # → _get_tp_sl() fallback static TP/SL → dynamic TP/SL NEVER worked in production
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         regime_name = _regime().detect_regime(trend=trend, atr_pct=atrp)
-        adaptive = _regime().apply(regime_name, atr_pct=atrp, symbol=symbol)
+        adaptive = _regime().apply(
+            regime_name,
+            atr_pct=atrp,
+            symbol=symbol,
+            base_conf_min=BUY_CONFIDENCE_MIN,   # regime engine ადაპტირებს
+            base_quote=BOT_QUOTE_PER_TRADE,
+        )
 
         # BEAR/VOLATILE/SIDEWAYS → trade ბლოკდება
         if adaptive.get("SKIP_TRADING"):
@@ -1336,6 +1349,30 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"atr%={atrp:.3f} trend={trend:.3f}"
                 )
             continue
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ADAPTIVE AI CONFIDENCE CHECK — regime-based (ეტაპი 2)
+        # BULL:      BUY_CONFIDENCE_MIN × 0.85 → ნაკლები სიმკაცრე
+        # UNCERTAIN: BUY_CONFIDENCE_MIN × 1.20 → მეტი სიმკაცრე
+        # ეს არის "ბაზარს მიყოლა" — ძლიერ ბაზარზე ბოტი უფრო ადვილად ყიდულობს
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if AI_FILTER_LOW_CONFIDENCE:
+            raw_ai       = float(decision.get("ai_score", 0) or 0)
+            adaptive_min = float(adaptive.get("CONF_MIN", BUY_CONFIDENCE_MIN))
+            if raw_ai < adaptive_min:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_AI_FILTER | symbol={symbol} "
+                        f"ai={raw_ai:.3f} < min={adaptive_min:.3f} "
+                        f"regime={regime_name} (adaptive)"
+                    )
+                continue
+            elif GEN_DEBUG:
+                logger.info(
+                    f"[GEN] AI_FILTER_PASS | symbol={symbol} "
+                    f"ai={raw_ai:.3f} >= min={adaptive_min:.3f} "
+                    f"regime={regime_name}"
+                )
 
         # QUOTE_SIZE: dynamic sizing (ai_score-based) ან static BOT_QUOTE_PER_TRADE
         quote_size = adaptive.get("QUOTE_SIZE", 1.0)
