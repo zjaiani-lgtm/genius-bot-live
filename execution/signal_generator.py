@@ -342,17 +342,27 @@ def _sl_pause_active() -> bool:
 
 
 def _trades_today_count() -> int:
-    """დღეს (UTC) დახურული + ღია trade-ების რაოდენობა DB-დან."""
+    """დღეს (UTC) დახურული + ღია trade-ების რაოდენობა DB-დან.
+    FIX C-5: ღია (open) trades-ც ითვლება, რომ MAX_TRADES_PER_DAY bypass
+    შეუძლებელი იყოს — ადრე მხოლოდ closed trades ითვლებოდა.
+    """
     try:
-        from execution.db.repository import get_closed_trades
-        trades = get_closed_trades()
+        from execution.db.repository import get_closed_trades, get_trade_stats
         from datetime import datetime, timezone
         today = datetime.now(timezone.utc).date().isoformat()
-        count = sum(
+
+        # დახურული trade-ები დღეს
+        trades = get_closed_trades()
+        closed_today = sum(
             1 for t in trades
-            if str(t.get("closed_at", "") or t.get("opened_at", ""))[:10] == today
+            if str(t.get("closed_at", "") or "")[:10] == today
         )
-        return count
+
+        # ღია trade-ები (ნებისმიერ დღეს გახსნილი, ჯერ კიდევ ღია)
+        stats = get_trade_stats()
+        open_trades = int(stats.get("open_trades", 0))
+
+        return closed_today + open_trades
     except Exception:
         return 0
 
