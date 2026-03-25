@@ -22,6 +22,7 @@ from execution.db.repository import (
     close_trade,
     get_trade_stats,
     count_open_trades_for_symbol,
+    get_all_open_trades,
 )
 from execution.kill_switch import is_kill_switch_active
 from execution.virtual_wallet import simulate_market_entry
@@ -1351,7 +1352,6 @@ class ExecutionEngine:
 
                 # FIX: open trade-ების ღირებულება დავამატოთ
                 try:
-                    from execution.db.repository import get_all_open_trades
                     open_rows = get_all_open_trades() or []
                     locked_value = 0.0
                     for row in open_rows:
