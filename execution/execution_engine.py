@@ -676,8 +676,9 @@ class ExecutionEngine:
                         )
 
                         # SL/TP tracker — consecutive SL counter reset
+                        # FIX I-8: symbol გადაეცემა per-symbol logging-ისთვის
                         try:
-                            _notify_sl_tp_outcome("TP")
+                            _notify_sl_tp_outcome("TP", symbol=str(symbol))
                         except Exception:
                             pass
 
@@ -755,8 +756,9 @@ class ExecutionEngine:
                         )
 
                         # SL/TP tracker — consecutive SL counter გაზარდე
+                        # FIX I-8: symbol გადაეცემა per-symbol logging-ისთვის
                         try:
-                            _notify_sl_tp_outcome("SL")
+                            _notify_sl_tp_outcome("SL", symbol=str(symbol))
                         except Exception:
                             pass
 
