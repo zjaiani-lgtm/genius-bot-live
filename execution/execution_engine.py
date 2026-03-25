@@ -196,7 +196,7 @@ class ExecutionEngine:
         if self.state_debug:
             logger.info(f"SYSTEM_STATE_RAW | type={type(raw)} value={raw}")
 
-        if isinstance(raw, (list, tuple)):
+        if raw is not None:
             status = raw[1] if len(raw) > 1 else ""
             sync = raw[2] if len(raw) > 2 else 0
             kill = raw[3] if len(raw) > 3 else 0
