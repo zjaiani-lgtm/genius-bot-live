@@ -1629,23 +1629,43 @@ class ExecutionEngine:
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # FIX PARTIAL_TP1_FAIL: amount წინასწარ ვყოფთ
-            # ძველი ქცევა: OCO=100% + PartialTP=50% → insufficient balance
-            # ახალი ქცევა: OCO=50%, PartialTP=50% → total=100% ✓
+            # FIX MIN_NOTIONAL: split მხოლოდ თუ ორივე ნაწილი >= min_notional
+            # $10 × 0.5 = $5 → Binance rejects (min $10) → fallback full OCO
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _adp = adaptive if adaptive else {}
             _use_partial = _adp.get("USE_PARTIAL_TP", self.use_partial_tp)
             _tp1_size    = float(_adp.get("PARTIAL_TP1_SIZE", self.partial_tp1_size))
 
+            # Binance minimum notional per order ($10 default)
+            try:
+                _min_notional = float(self.exchange.get_min_notional(symbol) or 10.0)
+            except Exception:
+                _min_notional = 10.0
+
             if _use_partial and 0 < _tp1_size < 1.0:
-                _oco_fraction  = 1.0 - _tp1_size                                          # e.g. 0.50
+                _oco_fraction  = 1.0 - _tp1_size
                 oco_amount     = self.exchange.floor_amount(symbol, sell_amount * _oco_fraction)
                 partial_amount = self.exchange.floor_amount(symbol, sell_amount * _tp1_size)
+
+                # MIN NOTIONAL CHECK: ორივე ნაწილი საკმარისი უნდა იყოს
+                _oco_notional     = oco_amount * float(buy_avg)
+                _partial_notional = partial_amount * float(buy_avg)
+
                 if oco_amount <= 0 or partial_amount <= 0:
-                    # precision rounding-მა 0-ზე ჩამოიყვანა → გათიშე partial
-                    oco_amount     = sell_amount
-                    partial_amount = 0.0
-                    _use_partial   = False
                     logger.warning(f"PARTIAL_TP_SPLIT_ZERO | fallback full OCO | id={signal_id}")
+                    oco_amount = sell_amount
+                    partial_amount = 0.0
+                    _use_partial = False
+                elif _oco_notional < _min_notional or _partial_notional < _min_notional:
+                    # FIX: split-ი Binance min-ზე ნაკლებია → გათიშე partial, OCO=100%
+                    logger.warning(
+                        f"PARTIAL_TP_BELOW_MIN_NOTIONAL | "
+                        f"oco={_oco_notional:.2f} partial={_partial_notional:.2f} "
+                        f"min={_min_notional:.2f} | fallback full OCO | id={signal_id}"
+                    )
+                    oco_amount = sell_amount
+                    partial_amount = 0.0
+                    _use_partial = False
             else:
                 oco_amount     = sell_amount
                 partial_amount = 0.0
