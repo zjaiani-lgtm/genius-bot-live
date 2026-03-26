@@ -115,6 +115,35 @@ MTF_TIMEFRAME         = os.getenv("MTF_TIMEFRAME", "1h").strip()
 MTF_CANDLE_LIMIT      = int(os.getenv("MTF_CANDLE_LIMIT", "50"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ADX Filter — Average Directional Index trend strength
+# USE_ADX_FILTER=true → trade only when ADX >= ADX_MIN_THRESHOLD
+# ADX < 20 = sideways/choppy = false signals
+# ADX > 25 = strong trend = good entries
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_ADX_FILTER        = os.getenv("USE_ADX_FILTER", "true").strip().lower() == "true"
+ADX_MIN_THRESHOLD     = float(os.getenv("ADX_MIN_THRESHOLD", "20.0"))
+ADX_PERIOD            = int(os.getenv("ADX_PERIOD", "14"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VWAP Filter — Volume Weighted Average Price entry
+# USE_VWAP_FILTER=true → buy only when price <= VWAP × (1 + tolerance)
+# ყიდვა VWAP-ზე ქვემოთ ან ახლოს = value zone entry
+# VWAP_TOLERANCE=0.003 = VWAP-ზე 0.3%-ზე მეტი ზევით არ ვყიდულობთ
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_VWAP_FILTER       = os.getenv("USE_VWAP_FILTER", "true").strip().lower() == "true"
+VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.003"))   # 0.3% above VWAP OK
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TIME-OF-DAY Filter — low liquidity session-ების თავიდან არიდება
+# USE_TIME_FILTER=true → trade only during active hours (UTC)
+# TRADE_HOUR_START=7, TRADE_HOUR_END=22 → 07:00-22:00 UTC
+# (22:00-07:00 UTC = Asia low liquidity + wide spreads)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_TIME_FILTER       = os.getenv("USE_TIME_FILTER", "true").strip().lower() == "true"
+TRADE_HOUR_START_UTC  = int(os.getenv("TRADE_HOUR_START_UTC", "7"))    # 07:00 UTC
+TRADE_HOUR_END_UTC    = int(os.getenv("TRADE_HOUR_END_UTC", "22"))     # 22:00 UTC
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #3 Trailing Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "false").strip().lower() == "true"
@@ -541,6 +570,89 @@ def _momentum(closes: List[float], n: int) -> float:
     if base == 0:
         return 0.0
     return (closes[-1] / base) - 1.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ADX — Average Directional Index (trend strength 0..100)
+# ADX > 25 → ძლიერი trend (trade OK)
+# ADX < 20 → sideways (false signals high)
+# institutional standard: Renaissance, Two Sigma გამოიყენებს ADX
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _adx(ohlcv: List[List[float]], n: int = 14) -> float:
+    """
+    Returns ADX value (0..100).
+    >25 = strong trend, <20 = sideways/weak.
+    """
+    if len(ohlcv) < n * 2 + 1:
+        return 0.0
+    try:
+        highs  = [float(c[2]) for c in ohlcv]
+        lows   = [float(c[3]) for c in ohlcv]
+        closes = [float(c[4]) for c in ohlcv]
+
+        # True Range + Directional Movement
+        tr_list, pdm_list, ndm_list = [], [], []
+        for i in range(1, len(ohlcv)):
+            h, l, pc = highs[i], lows[i], closes[i-1]
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            pdm = max(highs[i] - highs[i-1], 0) if (highs[i] - highs[i-1]) > (lows[i-1] - lows[i]) else 0
+            ndm = max(lows[i-1] - lows[i], 0) if (lows[i-1] - lows[i]) > (highs[i] - highs[i-1]) else 0
+            tr_list.append(tr)
+            pdm_list.append(pdm)
+            ndm_list.append(ndm)
+
+        # Wilder smoothing
+        def _wilder(vals, period):
+            result = [sum(vals[:period]) / period]
+            for v in vals[period:]:
+                result.append((result[-1] * (period - 1) + v) / period)
+            return result
+
+        atr_w  = _wilder(tr_list, n)
+        pdm_w  = _wilder(pdm_list, n)
+        ndm_w  = _wilder(ndm_list, n)
+
+        dx_list = []
+        for a, p, nd in zip(atr_w, pdm_w, ndm_w):
+            if a == 0:
+                dx_list.append(0.0)
+                continue
+            pdi = (p / a) * 100
+            ndi = (nd / a) * 100
+            denom = pdi + ndi
+            dx_list.append(abs(pdi - ndi) / denom * 100 if denom > 0 else 0.0)
+
+        if len(dx_list) < n:
+            return 0.0
+        adx = sum(dx_list[-n:]) / n
+        return round(adx, 2)
+    except Exception:
+        return 0.0
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VWAP — Volume Weighted Average Price
+# institutional entry rule: buy when price < VWAP (value zone)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _vwap(ohlcv: List[List[float]]) -> float:
+    """
+    Returns VWAP for given candles.
+    Typical price = (high + low + close) / 3
+    VWAP = Σ(typical × volume) / Σ(volume)
+    """
+    if len(ohlcv) < 2:
+        return 0.0
+    try:
+        cum_tp_vol = 0.0
+        cum_vol    = 0.0
+        for c in ohlcv:
+            h, l, cl, v = float(c[2]), float(c[3]), float(c[4]), float(c[5])
+            typical = (h + l + cl) / 3.0
+            cum_tp_vol += typical * v
+            cum_vol    += v
+        return cum_tp_vol / cum_vol if cum_vol > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
 def _slope_sma(closes: List[float]) -> float:
@@ -1058,6 +1170,24 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             continue
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # TIME-OF-DAY FILTER — low liquidity session-ების გამორიცხვა
+        # 00:00-07:00 UTC: Asian session — ვიწრო ბაზარი, false signals
+        # 22:00-00:00 UTC: late session — გაფართოებული spread-ები
+        # open_trade bypass: თუ trade ღიაა, SELL ყოველთვის მუშაობს
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_TIME_FILTER and not open_trade:
+            from datetime import timezone as _tz
+            _utc_hour = datetime.now(_tz.utc).hour
+            _in_window = TRADE_HOUR_START_UTC <= _utc_hour < TRADE_HOUR_END_UTC
+            if not _in_window:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_TIME | symbol={symbol} "
+                        f"utc_hour={_utc_hour} window=[{TRADE_HOUR_START_UTC},{TRADE_HOUR_END_UTC})"
+                    )
+                continue
+
         try:
             ohlcv = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=CANDLE_LIMIT)
         except Exception as e:
@@ -1332,6 +1462,50 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                         f"macd={macd_line:.6f} signal={macd_sig:.6f} hist={macd_hist:.6f}"
                     )
                 continue
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ADX FILTER — Average Directional Index trend strength
+        # ADX < ADX_MIN_THRESHOLD → sideways/choppy market → false signals
+        # ADX >= 25 → strong directional trend → good entry conditions
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_ADX_FILTER:
+            adx_val = _adx(ohlcv, ADX_PERIOD)
+            if adx_val < ADX_MIN_THRESHOLD:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_ADX | symbol={symbol} "
+                        f"adx={adx_val:.2f} < min={ADX_MIN_THRESHOLD}"
+                    )
+                continue
+            if GEN_DEBUG:
+                logger.info(f"[GEN] ADX_OK | symbol={symbol} adx={adx_val:.2f}")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # VWAP FILTER — Volume Weighted Average Price entry zone
+        # buy only when price <= VWAP × (1 + tolerance)
+        # price >> VWAP = overextended = bad risk/reward
+        # price ≈ VWAP or below = value zone = institutional entry
+        # VWAP uses current session candles (intraday context)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_VWAP_FILTER:
+            vwap_val = _vwap(ohlcv)
+            if vwap_val > 0:
+                vwap_upper = vwap_val * (1.0 + VWAP_TOLERANCE)
+                if last > vwap_upper:
+                    if GEN_DEBUG:
+                        logger.info(
+                            f"[GEN] BLOCKED_BY_VWAP | symbol={symbol} "
+                            f"last={last:.4f} vwap={vwap_val:.4f} "
+                            f"upper={vwap_upper:.4f} (+{VWAP_TOLERANCE*100:.1f}%)"
+                        )
+                    continue
+                if GEN_DEBUG:
+                    pct_from_vwap = (last - vwap_val) / vwap_val * 100
+                    logger.info(
+                        f"[GEN] VWAP_OK | symbol={symbol} "
+                        f"last={last:.4f} vwap={vwap_val:.4f} "
+                        f"delta={pct_from_vwap:+.3f}%"
+                    )
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #2 MULTI-TIMEFRAME FILTER
