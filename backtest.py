@@ -51,6 +51,30 @@ import itertools
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple, Any
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# AUTO-INSTALL DEPENDENCIES
+# Render Shell-ზე numpy/pandas არ არის ბოტის venv-ში.
+# გაშვებისას ავტომატურად ვაინსტალირებთ.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _ensure_deps():
+    import subprocess
+    _pkgs = ["numpy", "pandas", "ccxt", "openpyxl", "scipy"]
+    _missing = []
+    for _p in _pkgs:
+        try:
+            __import__(_p)
+        except ImportError:
+            _missing.append(_p)
+    if _missing:
+        print(f"[SETUP] Installing: {' '.join(_missing)} ...")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--quiet",
+             "--break-system-packages"] + _missing
+        )
+        print("[SETUP] Done ✅")
+
+_ensure_deps()
+
 import numpy as np
 import pandas as pd
 
