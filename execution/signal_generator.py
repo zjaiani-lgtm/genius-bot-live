@@ -765,38 +765,57 @@ def _macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9
 def _mtf_trend_ok(symbol: str) -> Tuple[bool, str, str]:
     """
     1h (MTF_TIMEFRAME) trend-ი BULL-ია?
-    სწრაფი check: EMA20 > EMA50 AND last > EMA20
+    FIX: მკაცრი check — ყველა პირობა უნდა სრულდებოდეს:
+      1. last > EMA20  (ფასი EMA20-ზე მაღლა)
+      2. EMA20 > EMA50 (მოკლე EMA გრძელ EMA-ზე მაღლა)
+      3. trend_h >= 0.25 (1h trend strength მინიმუმი)
+      4. ბოლო 3 სანთლიდან 2+ მწვანე (momentum დადებითია)
 
     Returns (ok, reason, htf_regime)
-      htf_regime — regime_engine-ისთვის: "BULL" | "UNCERTAIN" | "BEAR" | None
-      None → data ნაკლებია ან fetch error (caller-ი None-ს გადასცემს apply()-ს)
     """
     try:
         ohlcv_h = EXCHANGE.fetch_ohlcv(symbol, timeframe=MTF_TIMEFRAME, limit=MTF_CANDLE_LIMIT)
         if not ohlcv_h or len(ohlcv_h) < 52:
-            return True, "not_enough_data→skip", None  # data-ს ნაკლებობა → არ ვბლოკავთ
+            return True, "not_enough_data→skip", None
         ohlcv_h, _ = _drop_unclosed_candle(ohlcv_h, MTF_TIMEFRAME)
         if len(ohlcv_h) < 52:
             return True, "not_enough_data→skip", None
-        closes_h = [float(c[4]) for c in ohlcv_h]
-        ema20_h = _ema(closes_h, 20)
-        ema50_h = _ema(closes_h, 50)
-        last_h  = closes_h[-1]
-        ok = (last_h > ema20_h[-1]) and (ema20_h[-1] > ema50_h[-1])
 
-        # ── htf_regime: 1h closes-ზე trend + ATR გამოვთვალოთ regime_engine-სთვის ──
+        closes_h = [float(c[4]) for c in ohlcv_h]
+        ema20_h  = _ema(closes_h, 20)
+        ema50_h  = _ema(closes_h, 50)
+        last_h   = closes_h[-1]
+
+        # პირობა 1 & 2: EMA სტრუქტურა
+        c_ema = (last_h > ema20_h[-1]) and (ema20_h[-1] > ema50_h[-1])
+
+        # პირობა 3: 1h trend strength
         trend_h = _trend_strength(closes_h, USE_MA_FILTERS)
-        atrp_h  = _atr_pct(ohlcv_h, n=14)
+        c_trend = trend_h >= 0.20   # 0.25 → 0.20 (ოდნავ რბილი)
+
+        # პირობა 4: ბოლო 3 სანთლიდან მინიმუმ 2 მწვანე
+        last3 = closes_h[-3:]
+        opens3 = [float(c[1]) for c in ohlcv_h[-3:]]
+        green3 = sum(1 for c, o in zip(last3, opens3) if c > o)
+        c_momentum = green3 >= 2
+
+        # FIX: ყველა 3 პირობა
+        ok = c_ema and c_trend and c_momentum
+
+        # htf_regime
+        atrp_h     = _atr_pct(ohlcv_h, n=14)
         htf_regime = _regime().detect_regime(trend=trend_h, atr_pct=atrp_h)
 
         reason = (
             f"mtf={MTF_TIMEFRAME} last={last_h:.4f} "
             f"ema20={ema20_h[-1]:.4f} ema50={ema50_h[-1]:.4f} "
+            f"trend={trend_h:.3f} green3={green3}/3 "
+            f"c_ema={int(c_ema)} c_trend={int(c_trend)} c_mom={int(c_momentum)} "
             f"htf_regime={htf_regime} ok={ok}"
         )
         return ok, reason, htf_regime
     except Exception as e:
-        return True, f"mtf_fetch_err→skip: {e}", None  # fetch error → არ ვბლოკავთ
+        return True, f"mtf_fetch_err→skip: {e}", None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
