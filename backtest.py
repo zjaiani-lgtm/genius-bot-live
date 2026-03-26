@@ -136,9 +136,17 @@ SL_PAUSE_SECONDS = _ei("SL_COOLDOWN_PAUSE_SECONDS", 1800)
 # Breakeven
 BREAKEVEN_TRIGGER = _ef("BREAKEVEN_TRIGGER_PCT", 0.5)
 
+# ADX Filter (Strategy E)
+ADX_MIN_BT    = _ef("ADX_MIN_THRESHOLD", 20.0)
+ADX_PERIOD_BT = _ei("ADX_PERIOD",        14)
+
+# VWAP Filter (Strategy E)
+VWAP_TOL_BT      = _ef("VWAP_TOLERANCE",  0.003)   # 0.3% above VWAP OK
+VWAP_SESSION_BT  = _ei("VWAP_SESSION_BARS", 96)    # 96 × 15m = 24h
+
 # OHLCV — 1000 candle = ~10 days of 15m data (მეტი history = უფრო reliable)
 TIMEFRAME    = os.getenv("BOT_TIMEFRAME", "15m")
-CANDLE_LIMIT = _ei("BOT_CANDLE_LIMIT", 1000)  # FIX: default 500→1000
+CANDLE_LIMIT = _ei("BOT_CANDLE_LIMIT", 1000)
 ATR_PERIOD   = 14
 
 # Walk-Forward
@@ -151,9 +159,9 @@ MC_CAPITAL = 1000.0   # starting capital USDT
 
 # Parameter Optimization grid — შენი ENV-ის TP_PCT=1.20 ირგვლივ
 PARAM_GRID = {
-    "tp_pct":  [0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0],  # FIX: 1.20 ჩართულია
-    "sl_pct":  [0.4, 0.5, 0.7, 1.0, 1.25, 1.5],        # FIX: 0.70 ჩართულია
-    "rsi_min": [30, 35, 40, 45],
+    "tp_pct":  [0.8, 1.0, 1.2, 1.5, 2.0, 2.5, 3.0],
+    "sl_pct":  [0.4, 0.5, 0.6, 0.7, 1.0, 1.25, 1.5],
+    "rsi_min": [28, 30, 32, 35, 40],
     "rsi_max": [65, 70, 75, 80],
 }
 
@@ -260,6 +268,73 @@ def calc_volume_ratio(vol: pd.Series, n: int = 20) -> pd.Series:
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ADX — Average Directional Index (trend strength)
+# ADX > 25 → strong trend  |  ADX < 20 → sideways/choppy
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def calc_adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    """
+    Vectorized ADX using Wilder smoothing.
+    Returns Series of ADX values (0..100).
+    """
+    high  = df["high"].astype(float)
+    low   = df["low"].astype(float)
+    close = df["close"].astype(float)
+
+    # True Range
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low  - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    # Directional Movement
+    up_move   = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    pdm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move,   0.0), index=df.index)
+    ndm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+    # Wilder smoothing (EWM alpha = 1/n)
+    alpha = 1.0 / n
+    atr_w = tr.ewm(alpha=alpha,  adjust=False).mean()
+    pdm_w = pdm.ewm(alpha=alpha, adjust=False).mean()
+    ndm_w = ndm.ewm(alpha=alpha, adjust=False).mean()
+
+    pdi = (pdm_w / atr_w.replace(0, np.nan)) * 100
+    ndi = (ndm_w / atr_w.replace(0, np.nan)) * 100
+
+    dx  = ((pdi - ndi).abs() / (pdi + ndi).replace(0, np.nan)) * 100
+    adx = dx.ewm(alpha=alpha, adjust=False).mean()
+
+    return adx.fillna(0.0).rename("adx")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# VWAP — Volume Weighted Average Price
+# Institutional entry rule: buy when price <= VWAP
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def calc_vwap(df: pd.DataFrame, session_bars: int = None) -> pd.Series:
+    """
+    Rolling VWAP over last `session_bars` candles (default: 96 × 15m = 24h).
+    typical_price = (high + low + close) / 3
+    VWAP = rolling_sum(typical × volume) / rolling_sum(volume)
+    """
+    if session_bars is None: session_bars = VWAP_SESSION_BT
+    typical = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol     = df["volume"]
+    tp_vol  = typical * vol
+
+    vwap = (
+        tp_vol.rolling(session_bars, min_periods=1).sum() /
+        vol.rolling(session_bars, min_periods=1).sum()
+    )
+    return vwap.fillna(typical).rename("vwap")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # REGIME DETECTION (vectorized)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
@@ -305,6 +380,9 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out["macd_hist"] = hist
     out["ema20"]     = calc_ema(df["close"], 20)
     out["ema50"]     = calc_ema(df["close"], 50)
+    # NEW: ADX + VWAP
+    out["adx"]       = calc_adx(df)
+    out["vwap"]      = calc_vwap(df)
     return out.dropna(subset=["atr_pct", "rsi", "trend"])
 
 
@@ -339,6 +417,38 @@ def signals_strategy_d(feat: pd.DataFrame,
     vol_ok   = feat["vol_ratio"] >= 0.8
     regime_ok = feat["regime"].isin(["BULL", "UNCERTAIN"])
     return (rsi_ok & macd_ok & trend_ok & mtf_ok & vol_ok & regime_ok).rename("entry")
+
+
+def signals_strategy_e(feat: pd.DataFrame,
+                        rsi_min: float = RSI_MIN,
+                        rsi_max: float = RSI_MAX,
+                        adx_min: float = None,
+                        vwap_tol: float = None) -> pd.Series:
+    """
+    Strategy E — სრული Institutional სისტემა (D + ADX + VWAP)
+
+    ყველა filter ერთდროულად:
+      ✅ RSI oversold zone (არ ვყიდულობთ overbought-ში)
+      ✅ MACD bullish (histogram > 0)
+      ✅ Trend strength (>= BULL_TREND_MIN)
+      ✅ MTF: EMA20 > EMA50 (1h uptrend proxy)
+      ✅ Volume above average
+      ✅ Regime: BULL ან UNCERTAIN
+      ✅ ADX >= adx_min (strong trend, not sideways)
+      ✅ Price <= VWAP × (1 + tolerance) (value zone entry)
+    """
+    if adx_min  is None: adx_min  = ADX_MIN_BT
+    if vwap_tol is None: vwap_tol = VWAP_TOL_BT
+    rsi_ok    = feat["rsi"].between(rsi_min, rsi_max)
+    macd_ok   = feat["macd_hist"] > 0
+    trend_ok  = feat["trend"] >= BULL_TREND_MIN
+    mtf_ok    = feat["ema20"] > feat["ema50"]
+    vol_ok    = feat["vol_ratio"] >= 0.8
+    regime_ok = feat["regime"].isin(["BULL", "UNCERTAIN"])
+    adx_ok    = feat["adx"] >= adx_min                          # NEW: ADX filter
+    vwap_ok   = feat["close"] <= feat["vwap"] * (1 + vwap_tol) # NEW: VWAP entry zone
+    return (rsi_ok & macd_ok & trend_ok & mtf_ok & vol_ok &
+            regime_ok & adx_ok & vwap_ok).rename("entry")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -513,9 +623,116 @@ def calc_metrics(trades: pd.DataFrame, label: str = "") -> Dict[str, Any]:
         return {k: 0 for k in [
             "strategy", "trades", "wins", "losses", "winrate",
             "total_pnl", "avg_win", "avg_loss", "profit_factor",
-            "max_drawdown", "sharpe", "calmar", "expectancy",
-            "avg_hold_bars", "roi_pct"
+            "max_drawdown", "sharpe", "sortino", "calmar", "expectancy",
+            "avg_hold_bars", "roi_pct", "kelly_fraction", "p_value",
+            "edge_significant"
         ]}
+
+    wins   = trades[trades["outcome"] == "TP"]
+    losses = trades[trades["outcome"] == "SL"]
+    n      = len(trades)
+    wr     = len(wins) / n * 100 if n else 0.0
+
+    avg_w  = float(wins["pnl"].mean())   if len(wins)   else 0.0
+    avg_l  = float(losses["pnl"].abs().mean()) if len(losses) else 0.0
+    pf     = avg_w / avg_l if avg_l > 0 else (float("inf") if avg_w > 0 else 0.0)
+
+    total_pnl = float(trades["pnl"].sum())
+
+    # Max Drawdown
+    cumul  = trades["pnl"].cumsum()
+    peak   = cumul.cummax()
+    dd     = float((cumul - peak).min())
+
+    # Daily PnL series
+    trades2 = trades.copy()
+    trades2["date"] = pd.to_datetime(trades2["entry_ts"]).dt.date
+    daily  = trades2.groupby("date")["pnl"].sum()
+    if len(daily) >= 2:
+        dr = pd.date_range(daily.index.min(), daily.index.max(), freq="D")
+        daily = daily.reindex([d.date() for d in dr], fill_value=0.0)
+
+    std    = float(daily.std()) if len(daily) > 1 else 0.0
+    mean_d = float(daily.mean())
+
+    # ── Sharpe Ratio ──────────────────────────────────────────────
+    sharpe = (mean_d / std * (252 ** 0.5)) if std > 0 else 0.0
+
+    # ── Sortino Ratio (downside deviation only) ───────────────────
+    # Sortino = mean_return / downside_std × √252
+    # downside = only negative daily returns
+    downside = daily[daily < 0]
+    downside_std = float(downside.std()) if len(downside) > 1 else 0.0
+    sortino = (mean_d / downside_std * (252 ** 0.5)) if downside_std > 0 else 0.0
+
+    # ── Calmar Ratio ──────────────────────────────────────────────
+    calmar = (total_pnl / abs(dd)) if dd < 0 else float("inf")
+
+    # ── Expectancy ────────────────────────────────────────────────
+    expectancy = (wr / 100.0) * avg_w - (1 - wr / 100.0) * avg_l
+
+    # ── Kelly Criterion (Half-Kelly) ──────────────────────────────
+    # f* = (R×p − q) / R   |  Half-Kelly = f*/2
+    # p = win rate, q = 1-p, R = avg_win / avg_loss
+    p_win = wr / 100.0
+    R = avg_w / avg_l if avg_l > 0 else 0.0
+    if R > 0 and p_win > 0:
+        kelly_full = (R * p_win - (1 - p_win)) / R
+        kelly_half = max(0.0, kelly_full / 2.0)
+        kelly_frac = round(min(0.25, kelly_half), 4)  # cap at 25%
+    else:
+        kelly_frac = 0.0
+
+    # ── Statistical Significance (p-value) ───────────────────────
+    # Null hypothesis: strategy has no edge (mean_pnl = 0)
+    # One-sample t-test on trade PnLs
+    # p < 0.05 → statistically significant edge
+    p_value = 1.0
+    edge_significant = False
+    if n >= 30:  # minimum sample for t-test
+        try:
+            import scipy.stats as stats
+            t_stat, p_value = stats.ttest_1samp(trades["pnl"].values, 0.0)
+            p_value = float(p_value)
+            edge_significant = (p_value < 0.05) and (mean_d > 0)
+        except ImportError:
+            # scipy არ არის → manual t-test approximation
+            pnl_std = float(trades["pnl"].std())
+            if pnl_std > 0:
+                t_stat = (float(trades["pnl"].mean()) / (pnl_std / (n ** 0.5)))
+                # Approximate p-value using normal distribution
+                from math import erfc, sqrt
+                p_value = float(erfc(abs(t_stat) / sqrt(2)))
+                edge_significant = (p_value < 0.05) and (mean_d > 0)
+
+    # Average hold bars
+    avg_hold = float(trades["hold_bars"].mean()) if "hold_bars" in trades.columns else 0.0
+
+    # ROI
+    total_invested = float(trades["quote"].sum()) if "quote" in trades.columns else 1.0
+    roi_pct = (total_pnl / total_invested * 100.0) if total_invested > 0 else 0.0
+
+    return {
+        "strategy":         label or str(trades["strategy"].iloc[0]) if "strategy" in trades.columns else "",
+        "trades":           n,
+        "wins":             len(wins),
+        "losses":           len(losses),
+        "winrate":          round(wr, 1),
+        "total_pnl":        round(total_pnl, 4),
+        "avg_win":          round(avg_w, 4),
+        "avg_loss":         round(avg_l, 4),
+        "profit_factor":    round(pf, 3),
+        "max_drawdown":     round(dd, 4),
+        "sharpe":           round(sharpe, 2),
+        "sortino":          round(sortino, 2),          # NEW
+        "calmar":           round(calmar, 3),
+        "expectancy":       round(expectancy, 4),
+        "kelly_fraction":   kelly_frac,                 # NEW
+        "p_value":          round(p_value, 4),          # NEW
+        "edge_significant": edge_significant,           # NEW: True if p<0.05
+        "avg_hold_bars":    round(avg_hold, 1),
+        "roi_pct":          round(roi_pct, 3),
+    }
 
     wins   = trades[trades["outcome"] == "TP"]
     losses = trades[trades["outcome"] == "SL"]
@@ -724,6 +941,8 @@ def optimize_params(feat: pd.DataFrame,
             entries = signals_strategy_c(feat, rsi_min=rmin, rsi_max=rmax)
         elif strategy == "D":
             entries = signals_strategy_d(feat, rsi_min=rmin, rsi_max=rmax)
+        elif strategy == "E":
+            entries = signals_strategy_e(feat, rsi_min=rmin, rsi_max=rmax)
         else:
             entries = signals_strategy_b(feat)
 
@@ -815,15 +1034,19 @@ def generate_html_report(
         ("Losses",         "losses",        False),
         ("Winrate %",      "winrate",       True),
         ("Total PnL",      "total_pnl",     True),
-        ("Avg Win",        "avg_win",       True),
-        ("Avg Loss",       "avg_loss",      False),
-        ("Profit Factor",  "profit_factor", True),
-        ("Max Drawdown",   "max_drawdown",  False),
-        ("Sharpe Ratio",   "sharpe",        True),
-        ("Calmar Ratio",   "calmar",        True),
-        ("Expectancy",     "expectancy",    True),
-        ("ROI %",          "roi_pct",       True),
-        ("Avg Hold Bars",  "avg_hold_bars", False),
+        ("Avg Win",        "avg_win",         True),
+        ("Avg Loss",       "avg_loss",         False),
+        ("Profit Factor",  "profit_factor",    True),
+        ("Max Drawdown",   "max_drawdown",      False),
+        ("Sharpe Ratio",   "sharpe",            True),
+        ("Sortino Ratio",  "sortino",           True),   # NEW
+        ("Calmar Ratio",   "calmar",            True),
+        ("Kelly Fraction", "kelly_fraction",    True),   # NEW
+        ("p-value",        "p_value",           False),  # NEW (lower=better)
+        ("Edge Signif.",   "edge_significant",  True),   # NEW
+        ("Expectancy",     "expectancy",        True),
+        ("ROI %",          "roi_pct",           True),
+        ("Avg Hold Bars",  "avg_hold_bars",     False),
     ]
 
     header_cells = "".join(f"<th>{m['strategy']}</th>" for m in metrics_list)
@@ -1124,7 +1347,11 @@ def print_console_report(metrics_list: List[Dict], mc_results: Dict,
         ("Profit Factor",  "profit_factor"),
         ("Max Drawdown",   "max_drawdown"),
         ("Sharpe Ratio",   "sharpe"),
+        ("Sortino Ratio",  "sortino"),
         ("Calmar Ratio",   "calmar"),
+        ("Kelly Fraction", "kelly_fraction"),
+        ("p-value",        "p_value"),
+        ("Edge Signif.",   "edge_significant"),
         ("Expectancy",     "expectancy"),
         ("ROI %",          "roi_pct"),
     ]
@@ -1186,12 +1413,13 @@ def run_ohlcv_mode(symbols: List[str]) -> None:
     combined = pd.concat(all_feat.values(), ignore_index=False)
     combined = combined.sort_index()
 
-    # Run 4 strategies
+    # Run 5 strategies (E = full institutional with ADX + VWAP)
     strategies = {
-        "A_Fixed":     (signals_strategy_a, {"tp_pct_fixed": A_TP_PCT, "sl_pct_fixed": A_SL_PCT}),
-        "B_Regime":    (signals_strategy_b, {}),
-        "C_RSI_MACD":  (signals_strategy_c, {}),
-        "D_Full":      (signals_strategy_d, {"use_dynamic_sizing": True}),
+        "A_Fixed":        (signals_strategy_a, {"tp_pct_fixed": A_TP_PCT, "sl_pct_fixed": A_SL_PCT}),
+        "B_Regime":       (signals_strategy_b, {}),
+        "C_RSI_MACD":     (signals_strategy_c, {}),
+        "D_Full":         (signals_strategy_d, {"use_dynamic_sizing": True}),
+        "E_Institutional":(signals_strategy_e, {"use_dynamic_sizing": True}),  # NEW
     }
 
     all_trades:   Dict[str, pd.DataFrame] = {}
@@ -1352,7 +1580,7 @@ def run_optimize_mode(symbols: List[str]) -> None:
     if combined.empty:
         log.error("No data"); return
 
-    for strat in ["C", "D"]:
+    for strat in ["C", "D", "E"]:   # E_Institutional added
         log.info(f"Optimizing strategy {strat}...")
         opt = optimize_params(combined, strategy=strat)
         if not opt.empty:
@@ -1373,7 +1601,11 @@ def run_walkforward_mode(symbols: List[str]) -> None:
         log.error("No data"); return
 
     wf_results = {}
-    for name, fn in [("B_Regime", signals_strategy_b), ("D_Full", signals_strategy_d)]:
+    for name, fn in [
+        ("B_Regime",        signals_strategy_b),
+        ("D_Full",          signals_strategy_d),
+        ("E_Institutional", signals_strategy_e),   # NEW
+    ]:
         wf = walk_forward_test(combined, fn, label=name)
         wf_results[name] = wf
         if wf:
