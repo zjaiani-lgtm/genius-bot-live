@@ -626,12 +626,15 @@ def _structure_ok(closes: List[float], use_ma: bool, trend_strength: float) -> T
     if STRUCT_SOFT_OVERRIDE:
         sma_gap_pct = _pct(s5, s10)  # can be slightly negative
         c_soft_trend = trend_strength >= STRUCT_SOFT_MIN_TREND
-        c_soft_last = c_last_prev if STRUCT_SOFT_REQUIRE_LAST_UP > 0 else True
-        c_soft_ups = ups3 >= STRUCT_SOFT_REQUIRE_LAST_UP
+        c_soft_last  = c_last_prev if STRUCT_SOFT_REQUIRE_LAST_UP > 0 else True
+        c_soft_ups   = ups3 >= STRUCT_SOFT_REQUIRE_LAST_UP
         c_soft_sma_gap = sma_gap_pct >= (-1.0 * STRUCT_SOFT_MIN_MA_GAP)
-        c_soft_mom10 = mom10 > -0.004
+        # FIX: mom10 hardcoded -0.004 → ENV-დან, default გაფართოვდა -0.05
+        _soft_mom10_min = float(os.getenv("STRUCT_SOFT_MIN_MOM10", "-0.05"))
+        c_soft_mom10 = mom10 > _soft_mom10_min
 
-        soft_ok = c_soft_trend and c_soft_last and c_soft_ups and c_soft_sma_gap and c_soft_mom10
+        # FIX: soft_ok = მხოლოდ trend + mom10 (ups და sma_gap არჩევითია)
+        soft_ok = c_soft_trend and c_soft_mom10
         reason = (
             f"soft strict=0 last>prev={int(c_last_prev)} sma5>sma10={int(c_sma)} "
             f"ups3={ups3} mom10={mom10:.6f} trend={trend_strength:.3f} sma_gap%={sma_gap_pct:.3f} "
