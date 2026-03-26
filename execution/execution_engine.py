@@ -1485,6 +1485,89 @@ class ExecutionEngine:
             quote_amount = max(min_notional, regime_quote)
             quote_amount = round(quote_amount, 2)
 
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # WIN-RATE ADAPTIVE SIZING
+            # ბოლო closed trade-ების win rate → size multiplier
+            # winrate < 35% → ×0.6  (losing streak — reduce exposure)
+            # winrate 35-45% → ×0.8 (below avg — slightly reduce)
+            # winrate 45-60% → ×1.0 (neutral)
+            # winrate 50-60% → ×1.1 (above avg — slightly increase)
+            # winrate > 60%  → ×1.3 (winning streak — increase, capped)
+            # activation: min 10 closed trades required
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            _use_adaptive_sizing = os.getenv("USE_ADAPTIVE_SIZING", "true").lower() == "true"
+            if _use_adaptive_sizing:
+                try:
+                    from execution.db.repository import get_trade_stats
+                    _stats  = get_trade_stats()
+                    _closed = int(_stats.get("closed_trades", 0) or 0)
+                    _wins   = int(_stats.get("wins", 0) or 0)
+                    if _closed >= 10:
+                        _wr = _wins / _closed
+                        if   _wr < 0.35:  _wr_mult = 0.60
+                        elif _wr < 0.45:  _wr_mult = 0.80
+                        elif _wr > 0.60:  _wr_mult = 1.30
+                        elif _wr > 0.50:  _wr_mult = 1.10
+                        else:             _wr_mult = 1.00
+                        if _wr_mult != 1.0:
+                            _prev = quote_amount
+                            quote_amount = round(quote_amount * _wr_mult, 2)
+                            logger.info(
+                                f"[ADAPTIVE_SIZE] wr={_wr:.1%} ({_wins}/{_closed}) "
+                                f"mult={_wr_mult:.2f} "
+                                f"quote: {_prev:.2f} → {quote_amount:.2f}"
+                            )
+                except Exception as _e:
+                    logger.debug(f"[ADAPTIVE_SIZE] skip: {_e}")
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # KELLY CRITERION SIZING (Half-Kelly)
+            # f* = (R×p − q) / R   |  Half-Kelly = f*/2  (safer, lower variance)
+            # R = TP%/SL% (reward-to-risk ratio)
+            # p = historical win rate, q = 1-p
+            # Bounds: 5% ≤ kelly_fraction ≤ 25% of free balance
+            # Activation: min 15 closed trades for statistical reliability
+            # Kelly reduces quote when edge is low — never overrides upward
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            _use_kelly = os.getenv("USE_KELLY_SIZING", "true").lower() == "true"
+            if _use_kelly and balance > 0:
+                try:
+                    from execution.db.repository import get_trade_stats
+                    _stats  = get_trade_stats()
+                    _closed = int(_stats.get("closed_trades", 0) or 0)
+                    _wins   = int(_stats.get("wins", 0) or 0)
+                    if _closed >= 15:
+                        _p = _wins / _closed
+                        _q = 1.0 - _p
+                        _R = tp_pct / sl_pct if sl_pct > 0 else 1.5
+                        _kelly_full = (_R * _p - _q) / _R if _R > 0 else 0.0
+                        _kelly_half = _kelly_full / 2.0
+                        _kelly_frac = max(0.05, min(0.25, _kelly_half))
+                        if _kelly_full > 0:
+                            _kelly_quote = round(balance * _kelly_frac, 2)
+                            _kelly_quote = max(min_notional, _kelly_quote)
+                            _kelly_quote = min(
+                                _kelly_quote,
+                                float(os.getenv("MAX_QUOTE_PER_TRADE", "15"))
+                            )
+                            if _kelly_quote < quote_amount:
+                                _prev = quote_amount
+                                quote_amount = _kelly_quote
+                                logger.info(
+                                    f"[KELLY] p={_p:.2%} R={_R:.2f} "
+                                    f"f*={_kelly_full:.3f} half={_kelly_half:.3f} "
+                                    f"frac={_kelly_frac:.2%} "
+                                    f"quote: {_prev:.2f} → {quote_amount:.2f}"
+                                )
+                        else:
+                            logger.info(
+                                f"[KELLY] NEGATIVE_EDGE | p={_p:.2%} R={_R:.2f} "
+                                f"f*={_kelly_full:.3f} → min_notional"
+                            )
+                            quote_amount = min_notional
+                except Exception as _e:
+                    logger.debug(f"[KELLY] skip: {_e}")
+
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # MAX_RISK_PER_TRADE_PCT — hard ceiling on quote by % of balance
             # e.g. 1.0% of 200 USDT balance = max 2 USDT per trade
