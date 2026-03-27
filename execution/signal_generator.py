@@ -32,32 +32,32 @@ logger = logging.getLogger("gbm")
 # ENV
 # -----------------------------
 TIMEFRAME = os.getenv("BOT_TIMEFRAME", "15m").strip()
-CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "80"))
-COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "180"))
+CANDLE_LIMIT = int(os.getenv("BOT_CANDLE_LIMIT", "300"))        # ENV=300
+COOLDOWN_SECONDS = int(os.getenv("BOT_SIGNAL_COOLDOWN_SECONDS", "120"))  # ENV=120s
 
 ALLOW_LIVE_SIGNALS = os.getenv("ALLOW_LIVE_SIGNALS", "false").strip().lower() == "true"
 
-BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
+BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "10"))   # ENV=10
 # MAX_QUOTE_PER_TRADE — exchange_client._guard() hard ceiling
 # dynamic sizing ამ მნიშვნელობას ვერ გადააჭარბებს → LIVE_BLOCKED აღარ იქნება
-MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "15"))
+MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))   # ENV=10
 
 # Fee-aware edge gate
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))
-ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
-ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
-TP_PCT = float(os.getenv("TP_PCT", "1.3"))
-MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.60"))
+ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))  # ENV=0.14
+ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.05"))              # ENV=0.05
+TP_PCT = float(os.getenv("TP_PCT", "1.5"))                                               # ENV=1.5%
+MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.25"))                     # ENV=0.25
 
 # ATR sanity
-ATR_TO_TP_SANITY_FACTOR = float(os.getenv("ATR_TO_TP_SANITY_FACTOR", "0.20"))
+ATR_TO_TP_SANITY_FACTOR = float(os.getenv("ATR_TO_TP_SANITY_FACTOR", "0.10"))  # ENV=0.10
 
 # Optional MA filters
-USE_MA_FILTERS = os.getenv("USE_MA_FILTERS", "true").strip().lower() == "true"
+USE_MA_FILTERS = os.getenv("USE_MA_FILTERS", "false").strip().lower() == "true"  # ENV=false
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
 
 # Extra confidence guard (after Excel decision)
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.64"))
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.38"))  # ENV=0.38
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
@@ -69,17 +69,17 @@ GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # 1. Volume filter — 24h volume < MIN_VOLUME_24H → BUY skip
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "0"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "30000000"))  # ENV=30M USDT
 
 # 2. Signal expiration — signal ts_utc-დან SIGNAL_EXPIRATION_SECONDS გასული → skip
-SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "0"))
+SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "600"))  # ENV=600s
 
 # 3. AI confidence boost — ai_score * AI_CONFIDENCE_BOOST (>1.0 ამაღლებს score-ს)
-AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.0"))
+AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.05"))  # ENV=1.05
 
 # 4. Trade frequency limits
-MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "0"))
-MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "0"))
+MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "10"))  # ENV=10
+MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "3"))   # ENV=3
 
 # 5. AI_FILTER_LOW_CONFIDENCE — ai_score < threshold → hard reject before any other check
 # true = strict mode: ყველა low-confidence signal drop-ი ყველა filter-ის წინ
@@ -91,7 +91,7 @@ GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true
 
 # 7. BUY_LIQUIDITY_MIN_SCORE — volume_score minimum for BUY (0=off)
 # volume_score < this → skip (stricter than soft-volume-override)
-BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0"))
+BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0.40"))  # ENV=0.40
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #1 RSI + MACD filter
@@ -99,8 +99,8 @@ BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0"))
 USE_RSI_FILTER        = os.getenv("USE_RSI_FILTER", "true").strip().lower() == "true"
 RSI_PERIOD            = int(os.getenv("RSI_PERIOD", "14"))
 RSI_MIN               = float(os.getenv("RSI_MIN", "35"))
-RSI_MAX               = float(os.getenv("RSI_MAX", "70"))
-RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "60"))
+RSI_MAX               = float(os.getenv("RSI_MAX", "72"))          # ENV=72
+RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "72"))     # ENV=72
 
 USE_MACD_FILTER       = os.getenv("USE_MACD_FILTER", "true").strip().lower() == "true"
 MACD_FAST             = int(os.getenv("MACD_FAST", "12"))
@@ -152,7 +152,7 @@ TRADE_HOUR_END_UTC    = int(os.getenv("TRADE_HOUR_END_UTC", "22"))
 # FUNDING_MAX_LONG_PCT=0.10 → block if funding > 0.10%
 # FUNDING_CACHE_SEC=300 → cache 5min (funding updates every 8h)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-USE_FUNDING_FILTER    = os.getenv("USE_FUNDING_FILTER", "false").strip().lower() == "true"
+USE_FUNDING_FILTER    = os.getenv("USE_FUNDING_FILTER", "true").strip().lower() == "true"  # ENV=true
 FUNDING_MAX_LONG_PCT  = float(os.getenv("FUNDING_MAX_LONG_PCT",  "0.10"))  # >0.10% = overbought
 FUNDING_MIN_SHORT_PCT = float(os.getenv("FUNDING_MIN_SHORT_PCT", "-0.05")) # <-0.05% = oversold
 FUNDING_CACHE_SEC     = int(os.getenv("FUNDING_CACHE_SEC", "300"))         # 5min cache
@@ -166,42 +166,42 @@ FUNDING_CACHE_SEC     = int(os.getenv("FUNDING_CACHE_SEC", "300"))         # 5mi
 # MACD_HIST_ATR_FACTOR=0.3 → max negative hist = ATR × 0.3
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MACD_SMART_MODE       = os.getenv("MACD_SMART_MODE", "true").strip().lower() == "true"
-MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "3"))
-MACD_HIST_ATR_FACTOR  = float(os.getenv("MACD_HIST_ATR_FACTOR", "0.3"))
+MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "4"))        # ENV=4
+MACD_HIST_ATR_FACTOR  = float(os.getenv("MACD_HIST_ATR_FACTOR", "0.2"))  # ENV=0.2
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #3 Trailing Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "false").strip().lower() == "true"
+TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "true").strip().lower() == "true"   # ENV=true
 TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #4 Dynamic position sizing
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_DYNAMIC_SIZING    = os.getenv("USE_DYNAMIC_SIZING", "true").strip().lower() == "true"
-DYNAMIC_SIZE_MIN      = float(os.getenv("DYNAMIC_SIZE_MIN", "5.0"))
-DYNAMIC_SIZE_MAX      = float(os.getenv("DYNAMIC_SIZE_MAX", "15.0"))
+DYNAMIC_SIZE_MIN      = float(os.getenv("DYNAMIC_SIZE_MIN", "8.0"))    # ENV=8
+DYNAMIC_SIZE_MAX      = float(os.getenv("DYNAMIC_SIZE_MAX", "10.0"))   # ENV=10
 DYNAMIC_SIZE_AI_LOW   = float(os.getenv("DYNAMIC_SIZE_AI_LOW",  "0.55"))
 DYNAMIC_SIZE_AI_HIGH  = float(os.getenv("DYNAMIC_SIZE_AI_HIGH", "0.80"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #5 Partial Take Profit
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-USE_PARTIAL_TP        = os.getenv("USE_PARTIAL_TP", "false").strip().lower() == "true"
-PARTIAL_TP1_PCT       = float(os.getenv("PARTIAL_TP1_PCT", "1.5"))
+USE_PARTIAL_TP        = os.getenv("USE_PARTIAL_TP", "true").strip().lower() == "true"    # ENV=true
+PARTIAL_TP1_PCT       = float(os.getenv("PARTIAL_TP1_PCT", "1.0"))                        # ENV=1.0%
 PARTIAL_TP1_SIZE      = float(os.getenv("PARTIAL_TP1_SIZE", "0.5"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #7 Breakeven Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_BREAKEVEN_STOP    = os.getenv("USE_BREAKEVEN_STOP", "true").strip().lower() == "true"
-BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.5"))
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.40"))  # ENV=0.40%
 
 # Soft structure override (USED ONLY WHEN USE_MA_FILTERS=false)
 STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
-STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.10"))
-STRUCT_SOFT_MIN_MA_GAP = float(os.getenv("STRUCT_SOFT_MIN_MA_GAP", "0.05"))
-STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "0"))
+STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.25"))        # ENV=0.25
+STRUCT_SOFT_MIN_MA_GAP = float(os.getenv("STRUCT_SOFT_MIN_MA_GAP", "0.10"))      # ENV=0.10
+STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "1")) # ENV=1
 
 # Excel model path
 EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
@@ -220,7 +220,7 @@ _rsi_sell_fired: dict = {}  # {symbol: bool}
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL COOLDOWN — 2 SL-ის შემდეგ 30 წუთი პაუზა
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
+SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "3"))       # ENV=3
 SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
 RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
 # FIX: 0.25% → 0.10% default. 15m flat ბაზარზე სანთლები 0.15-0.35%-ია.
@@ -1228,24 +1228,16 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             return None
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # SL PAUSE — DB-based, restart-safe
-    # consecutive_sl და sl_pause_until DB-შია → deploy bypass შეუძლებელია
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX I-8 FULL: global pause კვლავ ამოწმებს global limit-ს.
-    # per-symbol pause → BUY loop-ში symbol-level-ზე ამოწმდება.
+    # SL PAUSE — DB-based, restart-safe, PER-SYMBOL ONLY
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    if _sl_pause_active():
-        sl_state = get_sl_cooldown_state()
-        pause_ts = sl_state.get("sl_pause_until") or 0.0
-        remaining = max(0, int(pause_ts - time.time()))
-        logger.info(
-            f"[SL_COOLDOWN] GLOBAL PAUSED (DB) | remaining={remaining}s "
-            f"({remaining//60}m{remaining%60}s) | "
-            f"consecutive_sl={sl_state['consecutive_sl']}"
-        )
-        return None
+    # FIX BUG-2: global _sl_pause_active() check ამოღებულია.
+    # პრობლემა: global pause return None-ს ისვრიდა ყველა symbol-ისთვის —
+    #   BTC 3 SL → global pause → ETH/BNB-საც ბლოკავდა (per-symbol isolation ტყუილი).
+    # გამოსწორება: per-symbol check მხოლოდ BUY loop-ში (line ~1302) — ეს სწორია.
+    #   BTC pause → მხოლოდ BTC-ი ბლოკდება, ETH/BNB კვლავ ვაჭრობს.
+    # GLOBAL pause-ი ნარჩუნდება მხოლოდ recovery check-ისთვის ქვემოთ.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
     sl_state = get_sl_cooldown_state()
     # FIX: თუ პაუზა დროით გაიარა (is_sl_pause_active()=False) მაგრამ
@@ -1465,6 +1457,17 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # BUY PATH — მხოლოდ open_trade=False შემთხვევაში
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+        # FIX BUG-1: BLOCK_SIGNALS_WHEN_ACTIVE_OCO enforcement
+        # active_oco იყო წაკითხული (line ~1294) მაგრამ BUY-ში არ შემოწმდებოდა →
+        # OCO-ს არსებობისას ახალი BUY emit-დებოდა → double position
+        if BLOCK_SIGNALS_WHEN_ACTIVE_OCO and active_oco:
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] BLOCKED_BY_ACTIVE_OCO | symbol={symbol} "
+                    f"BLOCK_SIGNALS_WHEN_ACTIVE_OCO=true → skip BUY"
+                )
+            continue
+
         # AI_FILTER_LOW_CONFIDENCE — strict pre-filter (ყველა სხვა check-ის წინ)
         if AI_FILTER_LOW_CONFIDENCE:
             raw_ai = float(decision.get("ai_score", 0) or 0)
@@ -1554,10 +1557,19 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     )
                 continue
 
-        if conf < BUY_CONFIDENCE_MIN:
+        # FIX: adaptive conf_min from regime_engine (ეტაპი 2)
+        # BULL regime:      0.38 × 0.85 = 0.323 (ნაკლები სიმკაცრე)
+        # UNCERTAIN regime: 0.38 × 1.20 = 0.456 (მეტი სიმკაცრე)
+        # adaptive["CONF_MIN"] = 0.0 if SKIP_TRADING (not reached here)
+        _eff_conf_min = adaptive.get("CONF_MIN") or BUY_CONFIDENCE_MIN
+        if _eff_conf_min <= 0:
+            _eff_conf_min = BUY_CONFIDENCE_MIN
+        if conf < _eff_conf_min:
             if GEN_DEBUG:
                 logger.info(
-                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
+                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} "
+                    f"conf={conf:.3f} < conf_min={_eff_conf_min:.3f} "
+                    f"(regime={adaptive.get('REGIME')} adaptive=True)"
                 )
             continue
 
@@ -1759,8 +1771,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # #4 DYNAMIC POSITION SIZING — ai_score → quote size
-        # ai_score=0.55 → DYNAMIC_SIZE_MIN=5 USDT
-        # ai_score=0.80 → DYNAMIC_SIZE_MAX=15 USDT
+        # ai_score=0.55 → DYNAMIC_SIZE_MIN=8 USDT  (ENV)
+        # ai_score=0.80 → DYNAMIC_SIZE_MAX=10 USDT (ENV)
         # between → linear interpolation
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         ai_for_sizing = float(decision["ai_score"])
