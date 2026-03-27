@@ -738,6 +738,28 @@ class ExecutionEngine:
                         f"exit={exitp:.6f} pnl={pnl_quote:.4f}"
                     )
 
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # FIX DUST-SWEEP-TP: partial TP1 fill-ის შემდეგ dust
+                    # residue შეიძლება exchange-ზე დარჩეს (rounding).
+                    # free_base < min_qty → ვერ იყიდება → dust sweep attempt.
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    try:
+                        _dust_base = str(symbol).split("/")[0].upper()
+                        _dust_free = float(self.exchange.fetch_balance_free(_dust_base))
+                        _dust_price = float(exitp) if exitp else 0.0
+                        _dust_sell = _safe_sell_amount(self.exchange, str(symbol), _dust_free, _dust_price)
+                        if _dust_sell > 0:
+                            self.exchange.place_market_sell(str(symbol), _dust_sell)
+                            logger.info(f"DUST_SWEEP_TP | sym={symbol} sold={_dust_sell:.8f}")
+                        elif _dust_free > 0:
+                            logger.info(
+                                f"DUST_IGNORED_TP | sym={symbol} "
+                                f"free_{_dust_base}={_dust_free:.8f} × price={_dust_price:.2f} "
+                                f"= {_dust_free*_dust_price:.4f} USDT (below Binance min — immaterial)"
+                            )
+                    except Exception as _ds_e:
+                        logger.debug(f"DUST_SWEEP_TP_FAIL | sym={symbol} err={_ds_e}")
+
                     try:
                         stats = get_trade_stats()
                         notify_trade_closed(
@@ -817,6 +839,26 @@ class ExecutionEngine:
                         f"TRADE_CLOSED | id={signal_id} outcome=SL "
                         f"exit={exitp:.6f} pnl={pnl_quote:.4f}"
                     )
+
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    # FIX DUST-SWEEP-SL: SL fill-ის შემდეგ dust residue sweep
+                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    try:
+                        _dust_base_sl = str(symbol).split("/")[0].upper()
+                        _dust_free_sl = float(self.exchange.fetch_balance_free(_dust_base_sl))
+                        _dust_price_sl = float(exitp) if exitp else 0.0
+                        _dust_sell_sl = _safe_sell_amount(self.exchange, str(symbol), _dust_free_sl, _dust_price_sl)
+                        if _dust_sell_sl > 0:
+                            self.exchange.place_market_sell(str(symbol), _dust_sell_sl)
+                            logger.info(f"DUST_SWEEP_SL | sym={symbol} sold={_dust_sell_sl:.8f}")
+                        elif _dust_free_sl > 0:
+                            logger.info(
+                                f"DUST_IGNORED_SL | sym={symbol} "
+                                f"free_{_dust_base_sl}={_dust_free_sl:.8f} = "
+                                f"{_dust_free_sl*_dust_price_sl:.4f} USDT (below Binance min)"
+                            )
+                    except Exception as _ds_sl_e:
+                        logger.debug(f"DUST_SWEEP_SL_FAIL | sym={symbol} err={_ds_sl_e}")
 
                     try:
                         stats = get_trade_stats()
@@ -1058,6 +1100,61 @@ class ExecutionEngine:
             logger.warning(msg)
             log_event("SELL_SKIP_BELOW_MIN", msg)
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_SKIP_BELOW_MIN", symbol=str(symbol))
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX DUST-CLOSE: OCO cancel-ი მოხდა, მაგრამ market sell ვერ
+            # შესრულდა (dust qty). Trade DB-ში open რჩება → stuck position.
+            # გამოსწორება: open trade DB-ში DUST_SELL-ად დახური.
+            # dust qty ≈ $0 value — pnl ≈ -quote_in (full loss tracking).
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            try:
+                tr = get_open_trade_for_symbol(symbol)
+                if tr:
+                    trade_signal_id, _, qty, quote_in, entry_price, *_ = tr
+                    dust_exit_price = float(last_price) if last_price > 0 else float(entry_price or 0)
+                    # pnl: dust position = value ≈ 0, so loss ≈ fee only
+                    dust_pnl_quote = (dust_exit_price - float(entry_price)) * float(qty) if float(qty) > 0 else 0.0
+                    dust_pnl_pct   = (dust_pnl_quote / float(quote_in) * 100.0) if float(quote_in) > 0 else 0.0
+                    close_trade(
+                        trade_signal_id,
+                        exit_price=dust_exit_price,
+                        outcome="DUST_SELL",
+                        pnl_quote=round(dust_pnl_quote, 6),
+                        pnl_pct=round(dust_pnl_pct, 4),
+                    )
+                    log_event(
+                        "TRADE_CLOSED_DUST",
+                        f"{trade_signal_id} {symbol} DUST_SELL "
+                        f"free={free_base:.8f} last={dust_exit_price:.4f} "
+                        f"pnl={dust_pnl_quote:.6f}"
+                    )
+                    logger.warning(
+                        f"DUST_SELL_AUTO_CLOSE | id={trade_signal_id} symbol={symbol} "
+                        f"free_{base_asset}={free_base:.8f} below_min → DB closed as DUST_SELL "
+                        f"pnl={dust_pnl_quote:.6f} USDT ({dust_pnl_pct:.3f}%)"
+                    )
+                    # Notify signal_generator SL cooldown (dust = treat as SL for streak tracking)
+                    try:
+                        _notify_sl_tp_outcome("SL", symbol=str(symbol))
+                    except Exception:
+                        pass
+                    # Telegram notify
+                    try:
+                        from execution.db.repository import get_trade_stats
+                        stats = get_trade_stats()
+                        notify_trade_closed(
+                            symbol=str(symbol),
+                            entry_price=float(entry_price),
+                            exit_price=dust_exit_price,
+                            pnl_quote=dust_pnl_quote,
+                            pnl_pct=dust_pnl_pct,
+                            outcome="DUST_SELL",
+                            stats=stats,
+                        )
+                    except Exception as _tg_e:
+                        logger.warning(f"DUST_SELL_TG_FAIL | {_tg_e}")
+            except Exception as _dust_e:
+                logger.error(f"DUST_CLOSE_FAIL | id={signal_id} symbol={symbol} err={_dust_e}")
             return
 
         try:
