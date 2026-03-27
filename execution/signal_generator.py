@@ -43,7 +43,7 @@ BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "15"))
 MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "15"))
 
 # Fee-aware edge gate
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.60"))
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.20"))
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.15"))
 TP_PCT = float(os.getenv("TP_PCT", "1.3"))
