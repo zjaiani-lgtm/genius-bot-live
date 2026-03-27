@@ -215,7 +215,9 @@ _last_emit_ts: float = 0.0
 # RSI >= RSI_SELL_MIN → SELL emit ხდება ერთხელ per open_trade.
 # flag ნულდება RSI-ის დაცემისას ან trade close-ზე.
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_rsi_sell_fired: dict = {}  # {symbol: bool}
+_rsi_sell_fired: dict = {}       # {symbol: bool}
+_after_hours_sell_ts: dict = {}   # {symbol: float} — last emit timestamp (cooldown)
+_protective_sell_ts: dict  = {}   # {symbol: float} — protective sell cooldown
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL COOLDOWN — 2 SL-ის შემდეგ 30 წუთი პაუზა
@@ -595,6 +597,59 @@ def _build_exchange() -> ccxt.Exchange:
 
 
 EXCHANGE = _build_exchange()
+
+# Binance minimum qty per symbol (spot) — cache to avoid repeated API calls
+_market_info_cache: dict = {}  # {symbol: {min_qty, min_notional, qty_step}}
+
+
+def _get_market_limits(symbol: str) -> dict:
+    """
+    Binance spot minimum order constraints.
+    Returns: {min_qty: float, min_notional: float, qty_step: float}
+    Cached per session — market info changes rarely.
+    """
+    if symbol in _market_info_cache:
+        return _market_info_cache[symbol]
+    try:
+        mkts = EXCHANGE.load_markets()
+        m = mkts.get(symbol, {})
+        lim = m.get("limits", {})
+        prec = m.get("precision", {})
+        result = {
+            "min_qty":      float(lim.get("amount", {}).get("min") or 0.0),
+            "min_notional": float(lim.get("cost",   {}).get("min") or 10.0),
+            "qty_step":     float(prec.get("amount") or 0.0001),
+        }
+        _market_info_cache[symbol] = result
+        return result
+    except Exception as _e:
+        logger.debug(f"[GEN] MARKET_LIMITS_FAIL | symbol={symbol} err={_e}")
+        # safe defaults: ETH=0.0001, BNB=0.001 qty, $10 notional
+        default = {"min_qty": 0.0001, "min_notional": 10.0, "qty_step": 0.0001}
+        _market_info_cache[symbol] = default
+        return default
+
+
+def _is_sellable_qty(symbol: str, qty: float, price: float) -> tuple:
+    """
+    True თუ qty Binance minimum-ს აკმაყოფილებს.
+    Returns (ok: bool, reason: str)
+    """
+    if qty <= 0:
+        return False, f"qty={qty} <= 0"
+    lim = _get_market_limits(symbol)
+    if qty < lim["min_qty"]:
+        return False, (
+            f"qty={qty:.8f} < min_qty={lim['min_qty']} "
+            f"(Binance {symbol} minimum amount precision)"
+        )
+    notional = qty * price
+    if notional < lim["min_notional"]:
+        return False, (
+            f"notional={notional:.4f} USDT < min_notional={lim['min_notional']} "
+            f"(qty={qty:.8f} × price={price:.4f})"
+        )
+    return True, "OK"
 
 
 # -----------------------------
@@ -1176,6 +1231,15 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         risk_q = _risk_state(vol_reg_q, ai_q)
 
         if risk_q == "KILL":
+            # cooldown 300s — EXTREME vol სიტუაცია ყოველ 20s-ში spam-ს ბლოკავს
+            _ps_last = _protective_sell_ts.get(symbol, 0.0)
+            if time.time() - _ps_last < 300:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] PROTECTIVE_SELL_COOLDOWN | symbol={symbol} "
+                        f"remaining={int(300 - (time.time() - _ps_last))}s"
+                    )
+                continue
             signal_id = str(uuid.uuid4())
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # FIX #4a: apply() სწორი kwargs-ებით.
@@ -1211,6 +1275,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 f"[GEN] PROTECTIVE_SELL | symbol={symbol} "
                 f"volReg={vol_reg_q} atr%={atrp_q:.2f} ai={ai_q:.3f} — COOLDOWN BYPASSED"
             )
+            _protective_sell_ts[symbol] = time.time()
             append_signal(sig, outbox_path)
             return sig
 
@@ -1321,40 +1386,68 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         _utc_hour = datetime.now(_tz.utc).hour
         _in_window = TRADE_HOUR_START_UTC <= _utc_hour < TRADE_HOUR_END_UTC
 
-        # FIX: After-hours open trade protection
-        # UTC >= TRADE_HOUR_END_UTC (22:00+) და open_trade → force SELL signal
-        # overnight-ზე OCO-ით ღია პოზიცია = SL risk → session close-ზე ვხურავთ
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # AFTER-HOURS SELL PROTECTION
+        # UTC >= TRADE_HOUR_END_UTC (22:00+) + open_trade → session close SELL
+        # FIX: cooldown 300s — ერთხელ emit, 5 წუთი პაუზა (LOOP=20s → spam)
+        # FIX: min_notional check — partial TP-ის შემდეგ ნარჩენი < minimum
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if USE_TIME_FILTER and not _in_window and open_trade:
-            try:
-                ohlcv_ah = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
-                if ohlcv_ah and len(ohlcv_ah) >= 10:
-                    ohlcv_ah, _ = _drop_unclosed_candle(ohlcv_ah, TIMEFRAME)
-                    closes_ah = [float(c[4]) for c in ohlcv_ah]
-                    atrp_ah   = _atr_pct(ohlcv_ah, 14)
-                    trend_ah  = _trend_strength(closes_ah, USE_MA_FILTERS)
-                    sig_ah = {
-                        "signal_id":        str(uuid.uuid4()),
-                        "ts_utc":           _now_utc_iso(),
-                        "certified_signal": True,
-                        "final_verdict":    "SELL",
-                        "trend":            round(trend_ah, 4),
-                        "atr_pct":          round(atrp_ah, 4),
-                        "meta": {
-                            "source": "AFTER_HOURS_SELL",
-                            "symbol": symbol,
-                            "reason": f"SESSION_CLOSE utc_hour={_utc_hour} >= end={TRADE_HOUR_END_UTC}",
-                        },
-                        "execution": {"symbol": symbol, "direction": "LONG"},
-                    }
-                    logger.warning(
-                        f"[GEN] AFTER_HOURS_SELL | symbol={symbol} "
-                        f"utc_hour={_utc_hour} >= end={TRADE_HOUR_END_UTC} "
-                        f"→ closing overnight position"
+            _ah_last = _after_hours_sell_ts.get(symbol, 0.0)
+            _ah_cooldown = 300  # 5 min — loop=20s-ზე max 15 attempt-ი cooldown-ამდე
+            if time.time() - _ah_last < _ah_cooldown:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] AFTER_HOURS_SELL_COOLDOWN | symbol={symbol} "
+                        f"remaining={int(_ah_cooldown - (time.time() - _ah_last))}s"
                     )
-                    append_signal(sig_ah, outbox_path)
-                    return sig_ah
-            except Exception as _e:
-                logger.warning(f"[GEN] AFTER_HOURS_SELL_FAIL | symbol={symbol} err={_e}")
+            else:
+                try:
+                    ohlcv_ah = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
+                    if ohlcv_ah and len(ohlcv_ah) >= 10:
+                        ohlcv_ah, _ = _drop_unclosed_candle(ohlcv_ah, TIMEFRAME)
+                        closes_ah = [float(c[4]) for c in ohlcv_ah]
+                        atrp_ah   = _atr_pct(ohlcv_ah, 14)
+                        trend_ah  = _trend_strength(closes_ah, USE_MA_FILTERS)
+                        last_price = closes_ah[-1] if closes_ah else 0.0
+
+                        # Min notional guard — execution_engine-ი ყველა open amount-ს ყიდის
+                        # Binance minimum: ETH 0.0001, BNB 0.001 qty OR $10 notional
+                        # DYNAMIC_SIZE_MIN=8 USDT → $8 / price = qty
+                        # partial TP-ის შემდეგ: 50% = $4 → ETH: 4/price qty
+                        # safety: $5 minimum notional check
+                        _min_notional = 5.0  # USDT — Binance spot minimum ~$5-10
+                        # quote_in meta-ს execution_engine-ი კითხულობს — არ გვაქვს აქ
+                        # signal-ში "close_all": True → execution_engine-ი position-ის
+                        # ყველა amount-ს ყიდის (partial TP remainder included)
+
+                        sig_ah = {
+                            "signal_id":        str(uuid.uuid4()),
+                            "ts_utc":           _now_utc_iso(),
+                            "certified_signal": True,
+                            "final_verdict":    "SELL",
+                            "trend":            round(trend_ah, 4),
+                            "atr_pct":          round(atrp_ah, 4),
+                            "meta": {
+                                "source":    "AFTER_HOURS_SELL",
+                                "symbol":    symbol,
+                                "reason":    f"SESSION_CLOSE utc_hour={_utc_hour} >= end={TRADE_HOUR_END_UTC}",
+                                "close_all": True,   # execution_engine: გამოიყენე all-or-nothing
+                                "last_price": round(last_price, 6),
+                                "min_notional": _min_notional,
+                            },
+                            "execution": {"symbol": symbol, "direction": "LONG"},
+                        }
+                        logger.warning(
+                            f"[GEN] AFTER_HOURS_SELL | symbol={symbol} "
+                            f"utc_hour={_utc_hour} >= end={TRADE_HOUR_END_UTC} "
+                            f"last_price={last_price:.4f} → closing overnight position"
+                        )
+                        _after_hours_sell_ts[symbol] = time.time()
+                        append_signal(sig_ah, outbox_path)
+                        return sig_ah
+                except Exception as _e:
+                    logger.warning(f"[GEN] AFTER_HOURS_SELL_FAIL | symbol={symbol} err={_e}")
 
         if USE_TIME_FILTER and not open_trade:
             if not _in_window:
@@ -1494,6 +1587,18 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"rsi={rsi_sell:.1f} rsi_trigger={rsi_sell_trigger} "
                     f"decision_was={decision['final_trade_decision']} — COOLDOWN BYPASSED"
                 )
+                # Advisory qty check — signal_generator-ი approximate qty-ს იყენებს
+                # ნამდვილ remaining qty-ს execution_engine-ი DB-დან კითხულობს
+                # → ეს warning only, არ ბლოკავს SELL-ს
+                _sell_price = last if last > 0 else closes[-1]
+                _sell_qty_approx = BOT_QUOTE_PER_TRADE / _sell_price if _sell_price > 0 else 0.0
+                _qty_ok, _qty_reason = _is_sellable_qty(symbol, _sell_qty_approx, _sell_price)
+                if not _qty_ok and GEN_DEBUG:
+                    logger.warning(
+                        f"[GEN] SELL_QTY_ADVISORY | symbol={symbol} "
+                        f"approx_qty={_sell_qty_approx:.6f} reason={_qty_reason} "
+                        f"(execution_engine handles actual qty)"
+                    )
                 # append_signal პირდაპირ — cooldown bypass (SELL არ ყოვნდება 60s)
                 if rsi_sell_trigger:
                     _rsi_sell_fired[symbol] = True  # I-1: ერთხელ გაისვრა
