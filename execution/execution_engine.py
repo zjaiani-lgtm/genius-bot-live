@@ -53,6 +53,69 @@ def _norm(s: Any) -> str:
     return str(s or "").strip().lower()
 
 
+def _safe_sell_amount(exchange, symbol: str, raw_qty: float, price: float = 0.0) -> float:
+    """
+    Production-safe sell amount calculator.
+
+    Steps:
+      1. floor_amount → step-size aligned qty
+      2. min_qty check (Binance LOT_SIZE filter)
+      3. min_notional check (Binance MIN_NOTIONAL filter, $10 default)
+
+    Returns 0.0 if qty is below any minimum — caller's <=0 guard catches it.
+
+    BNB example: step=0.001, min_qty=0.001, min_notional=$10
+      raw=0.004909 → floored=0.004 → 0.004 >= 0.001 ✓ → notional=0.004×610=$2.44 < $10 ✗
+      → returns 0.0 → SELL_SKIP_NO_FREE_BASE → position logged, no crash
+
+    This replaces direct floor_amount() calls before place_market_sell().
+    """
+    if raw_qty <= 0 or exchange is None:
+        return 0.0
+
+    try:
+        floored = float(exchange.floor_amount(symbol, raw_qty))
+    except Exception:
+        floored = raw_qty
+
+    if floored <= 0:
+        return 0.0
+
+    # ── min_qty check ──────────────────────────────────────────────
+    try:
+        mkts = exchange.exchange.load_markets() if hasattr(exchange, 'exchange') else {}
+        mkt  = mkts.get(symbol, {})
+        min_qty = float((mkt.get("limits") or {}).get("amount", {}).get("min") or 0.0)
+    except Exception:
+        min_qty = 0.0
+
+    if min_qty > 0 and floored < min_qty:
+        logger.warning(
+            f"[SAFE_SELL] qty_below_min | symbol={symbol} "
+            f"floored={floored:.8f} < min_qty={min_qty} → skip"
+        )
+        return 0.0
+
+    # ── min_notional check ─────────────────────────────────────────
+    if price > 0:
+        try:
+            min_notional = float(exchange.get_min_notional(symbol) or 0.0)
+        except Exception:
+            min_notional = 0.0
+
+        if min_notional > 0:
+            notional = floored * price
+            if notional < min_notional:
+                logger.warning(
+                    f"[SAFE_SELL] notional_below_min | symbol={symbol} "
+                    f"qty={floored:.8f} × price={price:.4f} = {notional:.4f} USDT "
+                    f"< min_notional={min_notional:.2f} → skip"
+                )
+                return 0.0
+
+    return floored
+
+
 class ExecutionEngine:
     def __init__(self):
         self.mode = os.getenv("MODE", "DEMO").upper()
@@ -550,14 +613,22 @@ class ExecutionEngine:
                         try:
                             free_base = float(self.exchange.fetch_balance_free(str(base_asset)))
                             if free_base > 0:
-                                sell_amt = self.exchange.floor_amount(
-                                    str(symbol), free_base * self.sell_buffer
+                                # FIX EE-5: _safe_sell_amount — min_qty + min_notional guard
+                                _r_price = self.exchange.fetch_last_price(str(symbol)) if hasattr(self.exchange, 'fetch_last_price') else 0.0
+                                sell_amt = _safe_sell_amount(
+                                    self.exchange, str(symbol),
+                                    free_base * self.sell_buffer, _r_price
                                 )
                                 if sell_amt > 0:
                                     self.exchange.place_market_sell(str(symbol), sell_amt)
                                     logger.warning(
                                         f"[SL_COOLDOWN][RECONCILE] market sold | "
                                         f"sym={symbol} amount={sell_amt}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[SL_COOLDOWN][RECONCILE] sell_skip_below_min | "
+                                        f"sym={symbol} free={free_base:.8f}"
                                     )
                         except Exception as e_ms:
                             logger.warning(f"[SL_COOLDOWN][RECONCILE] market sell fail | {e_ms}")
@@ -840,14 +911,22 @@ class ExecutionEngine:
                                     try:
                                         free_base = float(self.exchange.fetch_balance_free(str(ol_base)))
                                         if free_base > 0:
-                                            sell_amt = self.exchange.floor_amount(
-                                                str(ol_sym), free_base * self.sell_buffer
+                                            # FIX EE-4: _safe_sell_amount — min_qty guard
+                                            _cl_price = self.exchange.fetch_last_price(str(ol_sym)) if hasattr(self.exchange, 'fetch_last_price') else 0.0
+                                            sell_amt = _safe_sell_amount(
+                                                self.exchange, str(ol_sym),
+                                                free_base * self.sell_buffer, _cl_price
                                             )
                                             if sell_amt > 0:
                                                 self.exchange.place_market_sell(str(ol_sym), sell_amt)
                                                 logger.warning(
                                                     f"[SL_COOLDOWN] market sold remaining | "
                                                     f"sym={ol_sym} amount={sell_amt}"
+                                                )
+                                            else:
+                                                logger.warning(
+                                                    f"[SL_COOLDOWN] sell_skip_below_min | "
+                                                    f"sym={ol_sym} free={free_base:.8f}"
                                                 )
                                     except Exception as e2:
                                         logger.warning(f"[SL_COOLDOWN] market sell fail | sym={ol_sym} err={e2}")
@@ -958,16 +1037,24 @@ class ExecutionEngine:
                 logger.warning(f"SELL_OCO_LOOKUP_FAIL | id={signal_id} symbol={symbol} link={link_id} err={e}")
 
         base_asset = symbol.split("/")[0].upper()
-        free_base = float(self.exchange.fetch_balance_free(base_asset))
-        sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
+        free_base  = float(self.exchange.fetch_balance_free(base_asset))
+
+        # FIX EE-2: _safe_sell_amount — floor + min_qty + min_notional guard
+        # floor_amount alone does NOT check min_qty → InvalidOrder on Binance
+        last_price = self.exchange.fetch_last_price(symbol) if hasattr(self.exchange, 'fetch_last_price') else 0.0
+        sell_amount = _safe_sell_amount(self.exchange, symbol, free_base * self.sell_buffer, last_price)
         if sell_amount <= 0:
-            sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_retry_buffer)
+            sell_amount = _safe_sell_amount(self.exchange, symbol, free_base * self.sell_retry_buffer, last_price)
 
         if sell_amount <= 0:
-            msg = f"SELL_SKIP_NO_FREE_BASE | id={signal_id} symbol={symbol} free_{base_asset}={free_base}"
+            msg = (
+                f"SELL_SKIP_BELOW_MIN | id={signal_id} symbol={symbol} "
+                f"free_{base_asset}={free_base:.8f} last_price={last_price:.4f} "
+                f"(qty or notional below Binance minimum)"
+            )
             logger.warning(msg)
-            log_event("SELL_SKIP_NO_FREE_BASE", msg)
-            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_NO_FREE_BASE", symbol=str(symbol))
+            log_event("SELL_SKIP_BELOW_MIN", msg)
+            mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="SELL_SKIP_BELOW_MIN", symbol=str(symbol))
             return
 
         try:
@@ -1697,16 +1784,21 @@ class ExecutionEngine:
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_LIVE_BUY", symbol=str(symbol))
 
             base_asset = symbol.split("/")[0].upper()
-            free_base = float(self.exchange.fetch_balance_free(base_asset))
+            free_base  = float(self.exchange.fetch_balance_free(base_asset))
 
-            sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_buffer)
+            # FIX EE-3: _safe_sell_amount for OCO placement
+            sell_amount = _safe_sell_amount(self.exchange, symbol, free_base * self.sell_buffer, float(buy_avg))
             if sell_amount <= 0:
-                sell_amount = self.exchange.floor_amount(symbol, free_base * self.sell_retry_buffer)
+                sell_amount = _safe_sell_amount(self.exchange, symbol, free_base * self.sell_retry_buffer, float(buy_avg))
 
             if sell_amount <= 0:
-                msg = f"OCO_SKIP_NO_FREE_BASE | id={signal_id} free_{base_asset}={free_base}"
+                msg = (
+                    f"OCO_SKIP_BELOW_MIN | id={signal_id} symbol={symbol} "
+                    f"free_{base_asset}={free_base:.8f} buy_avg={buy_avg:.4f} "
+                    f"(qty or notional below Binance minimum)"
+                )
                 logger.warning(msg)
-                log_event("OCO_SKIP_NO_FREE_BASE", msg)
+                log_event("OCO_SKIP_BELOW_MIN", msg)
                 return
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
