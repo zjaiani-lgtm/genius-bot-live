@@ -43,7 +43,7 @@ BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "10"))   # ENV=10
 MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))   # ENV=10
 
 # Fee-aware edge gate
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.35"))
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.20"))  # FIX: 0.35→0.20; BTC flat ბაზარი atr≈0.20-0.30%
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))  # ENV=0.14
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.05"))              # ENV=0.05
 TP_PCT = float(os.getenv("TP_PCT", "1.5"))                                               # ENV=1.5%
@@ -131,7 +131,7 @@ ADX_PERIOD            = int(os.getenv("ADX_PERIOD", "14"))
 # VWAP_TOLERANCE=0.003 = VWAP-ზე 0.3%-ზე მეტი ზევით არ ვყიდულობთ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_VWAP_FILTER       = os.getenv("USE_VWAP_FILTER", "true").strip().lower() == "true"
-VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.003"))   # 0.3% above VWAP OK
+VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.006"))   # ENV=0.006 (0.6% above VWAP OK)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TIME-OF-DAY Filter — low liquidity session-ების თავიდან არიდება
@@ -340,13 +340,22 @@ def _vol_regime(atr_pct: float) -> str:
 
 
 def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
-    if atr_pct < MIN_MOVE_PCT:
-        return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
-
+    """
+    Edge quality gate — სამი შემოწმება:
+      1. Net profit: TP - fees - slippage >= MIN_NET_PROFIT_PCT
+      2. ATR sanity: atr >= TP × ATR_TO_TP_SANITY_FACTOR (dynamic TP-სთან)
+      3. MIN_MOVE: atr >= MIN_MOVE_PCT (flat ბაზრის გამოდევნა)
+    
+    ENV values:
+      TP_PCT=1.5, FEE=0.14, SLIP=0.05 → net=1.31 >= MIN_NET=0.25 ✓
+      ATR_TO_TP_SANITY_FACTOR=0.10 → min_atr=0.15% (BTC/ETH/BNB ყოველთვის გაივლის)
+      MIN_MOVE_PCT=0.20 (0.35 ძალიან მაღალი: BTC flat 01:00 UTC → atr=0.25-0.30%)
+    """
     assumed_gross_edge = TP_PCT
     assumed_cost = ESTIMATED_ROUNDTRIP_FEE_PCT + ESTIMATED_SLIPPAGE_PCT
     assumed_net = assumed_gross_edge - assumed_cost
 
+    # Check 1: Net profit gate
     if assumed_net < MIN_NET_PROFIT_PCT:
         return False, (
             "EDGE_TOO_SMALL "
@@ -354,18 +363,20 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
             f"< MIN_NET_PROFIT_PCT={MIN_NET_PROFIT_PCT:.2f}"
         )
 
-    # FIX: ATR_TO_TP_SANITY_FACTOR — dynamic TP-სთან ადაპტირებული შემოწმება
-    # ძველი: TP=3.0 × factor=0.10 = min_atr=0.30 → BNB atr=0.23 → BLOCKED_BY_EDGE
-    # ლოგი: "ATR_BELOW_TP atr%=0.23 < TP_PCT*ATR_TO_TP_SANITY_FACTOR=0.30 (TP_PCT=3.00 factor=0.10)"
-    # პრობლემა: TP=3.0% (regime-based) მაღალია → sanity check ბლოკავს ნორმალურ ბაზარს
-    # გამოსწორება: factor=0.10 → 0.06 — 15m flat ბაზარზე atr=0.20-0.35% რეალისტურია
-    # min_atr = 3.0 × 0.06 = 0.18% — BNB atr=0.23 გაივლის
+    # Check 2: ATR sanity vs TP — primary volatility guard
+    # ENV=0.10 → min_atr=1.5×0.10=0.15% — BTC/ETH/BNB ყოველთვის გაივლის
     min_atr_for_tp = assumed_gross_edge * ATR_TO_TP_SANITY_FACTOR
     if atr_pct < min_atr_for_tp:
         return False, (
-            f"ATR_BELOW_TP atr%={atr_pct:.2f} < TP_PCT*ATR_TO_TP_SANITY_FACTOR={min_atr_for_tp:.2f} "
+            f"ATR_BELOW_TP atr%={atr_pct:.2f} < TP×factor={min_atr_for_tp:.2f} "
             f"(TP_PCT={assumed_gross_edge:.2f} factor={ATR_TO_TP_SANITY_FACTOR:.2f})"
         )
+
+    # Check 3: MIN_MOVE_PCT — absolute floor (ENV=0.20)
+    # FIX: 0.35 → 0.20. BTC flat 15m ბაზარზე atr=0.20-0.30%, 0.35 მუდმივ block-ს იწვევდა
+    # USE_TIME_FILTER=true (07:00-22:00 UTC) უკვე dead hours-ს გამორიცხავს
+    if atr_pct < MIN_MOVE_PCT:
+        return False, f"ATR_TOO_LOW atr%={atr_pct:.2f} < MIN_MOVE_PCT={MIN_MOVE_PCT:.2f}"
 
     return True, "OK"
 
