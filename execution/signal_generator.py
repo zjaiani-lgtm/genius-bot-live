@@ -57,7 +57,11 @@ USE_MA_FILTERS = os.getenv("USE_MA_FILTERS", "false").strip().lower() == "true" 
 MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
 
 # Extra confidence guard (after Excel decision)
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.38"))  # ENV=0.38
+# FIX WIN-5: BUY_CONFIDENCE_MIN 0.38→0.32
+# Flat 15m market confidence_score ≈ 0.30-0.42 range.
+# 0.38 ბლოკავდა real signals — ვხედავდით BLOCKED_BY_CONF_STATIC ხშირად.
+# 0.32 = meaningful quality gate, still filters noise (score<0.25 = random)
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.32"))  # FIX: 0.38→0.32
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
@@ -84,14 +88,16 @@ MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "3"))   # ENV=3
 # 5. AI_FILTER_LOW_CONFIDENCE — ai_score < threshold → hard reject before any other check
 # true = strict mode: ყველა low-confidence signal drop-ი ყველა filter-ის წინ
 AI_FILTER_LOW_CONFIDENCE = os.getenv("AI_FILTER_LOW_CONFIDENCE", "false").strip().lower() == "true"
-AI_FILTER_MIN_SCORE      = float(os.getenv("BUY_CONFIDENCE_MIN", "0.38"))  # reuses BUY_CONFIDENCE_MIN
+AI_FILTER_MIN_SCORE      = float(os.getenv("BUY_CONFIDENCE_MIN", "0.32"))  # FIX: synced with BUY_CONFIDENCE_MIN default
 
 # 6. GEN_TEST_SIGNAL — force-emit one test signal for integration testing (true = one shot)
 GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true"
 
 # 7. BUY_LIQUIDITY_MIN_SCORE — volume_score minimum for BUY (0=off)
 # volume_score < this → skip (stricter than soft-volume-override)
-BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0.40"))  # ENV=0.40
+# FIX WIN-6: 0.40→0.25. Flat/night market volume_score ≈ 0.20-0.45.
+# 0.40 blocked legitimate low-volatility entries. 0.25 = still filters dead volume.
+BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0.25"))  # FIX: 0.40→0.25
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #1 RSI + MACD filter
@@ -100,7 +106,10 @@ USE_RSI_FILTER        = os.getenv("USE_RSI_FILTER", "true").strip().lower() == "
 RSI_PERIOD            = int(os.getenv("RSI_PERIOD", "14"))
 RSI_MIN               = float(os.getenv("RSI_MIN", "35"))
 RSI_MAX               = float(os.getenv("RSI_MAX", "72"))          # ENV=72
-RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "72"))     # ENV=72
+# FIX WIN-1: RSI_SELL_MIN 72→58. 72 = RSI spike-ი ძალიან rare 15m-ზე flat ბაზარში.
+# 58 = overbought territory on 15m — exits before momentum exhaustion.
+# ადრე: trade-ები 15 SL-ზე დაიხურა, RSI 72-ს არასოდეს მიაღწია.
+RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "58"))     # FIX: 72→58
 
 USE_MACD_FILTER       = os.getenv("USE_MACD_FILTER", "true").strip().lower() == "true"
 MACD_FAST             = int(os.getenv("MACD_FAST", "12"))
@@ -117,21 +126,27 @@ MTF_CANDLE_LIMIT      = int(os.getenv("MTF_CANDLE_LIMIT", "50"))
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ADX Filter — Average Directional Index trend strength
 # USE_ADX_FILTER=true → trade only when ADX >= ADX_MIN_THRESHOLD
-# ADX < 20 = sideways/choppy = false signals
-# ADX > 25 = strong trend = good entries
+# FIX WIN-3: ADX_MIN_THRESHOLD 20→18.
+# 15m flat/consolidating market ADX ≈ 15-22.
+# 20 ბლოკავდა legit entries flat range breakouts-ზე.
+# 18 = filters pure noise (ADX<15), allows range directional moves.
+# ADX > 25 = strong trend (still best entries)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_ADX_FILTER        = os.getenv("USE_ADX_FILTER", "true").strip().lower() == "true"
-ADX_MIN_THRESHOLD     = float(os.getenv("ADX_MIN_THRESHOLD", "20.0"))
+ADX_MIN_THRESHOLD     = float(os.getenv("ADX_MIN_THRESHOLD", "18.0"))  # FIX: 20→18
 ADX_PERIOD            = int(os.getenv("ADX_PERIOD", "14"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # VWAP Filter — Volume Weighted Average Price entry
 # USE_VWAP_FILTER=true → buy only when price <= VWAP × (1 + tolerance)
 # ყიდვა VWAP-ზე ქვემოთ ან ახლოს = value zone entry
-# VWAP_TOLERANCE=0.003 = VWAP-ზე 0.3%-ზე მეტი ზევით არ ვყიდულობთ
+# FIX WIN-4: VWAP_TOLERANCE 0.006→0.010
+# BTC/ETH trend upmoves: ფასი ხშირად 0.6-1.0% above VWAP
+# 0.6% ბლოკავდა momentum entries uptrend-ზე
+# 1.0% = allows institutional-quality momentum entries
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_VWAP_FILTER       = os.getenv("USE_VWAP_FILTER", "true").strip().lower() == "true"
-VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.006"))   # ENV=0.006 (0.6% above VWAP OK)
+VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.010"))   # FIX: 0.006→0.010 (1.0% above VWAP OK)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TIME-OF-DAY Filter — low liquidity session-ების თავიდან არიდება
@@ -166,14 +181,20 @@ FUNDING_CACHE_SEC     = int(os.getenv("FUNDING_CACHE_SEC", "300"))         # 5mi
 # MACD_HIST_ATR_FACTOR=0.3 → max negative hist = ATR × 0.3
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 MACD_SMART_MODE       = os.getenv("MACD_SMART_MODE", "true").strip().lower() == "true"
-MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "4"))        # ENV=4
+# FIX WIN-7: MACD_IMPROVING_BARS 4→3.
+# 4 bars on 15m = 60min confirmation — too slow for short moves.
+# 3 bars = 45min momentum check — enough signal, faster entry.
+MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "3"))        # FIX: 4→3
 MACD_HIST_ATR_FACTOR  = float(os.getenv("MACD_HIST_ATR_FACTOR", "0.2"))  # ENV=0.2
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #3 Trailing Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "true").strip().lower() == "true"   # ENV=true
-TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))
+# FIX WIN-8: TRAILING_STOP_DISTANCE 0.25→0.35
+# BTC/ETH 15m candle noise ≈ 0.20-0.30%. 0.25% trailing = noise trigger.
+# 0.35% = beyond typical 15m noise, still locks in profits on real moves.
+TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.35"))  # FIX: 0.25→0.35
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #4 Dynamic position sizing
@@ -195,7 +216,11 @@ PARTIAL_TP1_SIZE      = float(os.getenv("PARTIAL_TP1_SIZE", "0.5"))
 # #7 Breakeven Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_BREAKEVEN_STOP    = os.getenv("USE_BREAKEVEN_STOP", "true").strip().lower() == "true"
-BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.40"))  # ENV=0.40%
+# FIX WIN-9: BREAKEVEN_TRIGGER_PCT 0.40→0.30
+# Activates breakeven protection when price is 0.30% above entry (was 0.40%).
+# Earlier activation = more trades protected from reverting to SL loss.
+# 0.30% is safely above 15m typical noise (0.20%) so minimal false triggers.
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.30"))  # FIX: 0.40→0.30
 
 # Soft structure override (USED ONLY WHEN USE_MA_FILTERS=false)
 STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
@@ -1552,10 +1577,12 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             already_fired    = _rsi_sell_fired.get(symbol, False)
             rsi_sell_trigger = USE_RSI_FILTER and rsi_sell >= RSI_SELL_MIN and not already_fired
 
-            # FIX: trend threshold -0.15 → -0.10
-            # flat ბაზარი (22:00+ UTC) trend=-0.05~-0.12 → -0.15-ზე SELL არ trigger-ება
-            # overnight open position = SL risk → ადრე გასვლა სჯობს
-            sell_triggered = (trend < -0.10 and mom1 < -0.005) or rsi_sell_trigger
+            # FIX WIN-2: trend threshold -0.10→-0.05, mom1 -0.005→-0.002
+            # Log analysis: trend=0.000 mom1=-0.0001 ვერ trigger-ებდა SELL-ს
+            # 15m flat ბაზარი: trend oscillates [-0.05..+0.05] — -0.10 UNREACHABLE
+            # -0.05 = სუსტი downtrend sufficient for exit protection
+            # mom1 -0.002 = მცირე negative momentum — ადრე exit = better SL avoidance
+            sell_triggered = (trend < -0.05 and mom1 < -0.002) or rsi_sell_trigger
 
             if sell_triggered:
                 signal_id = str(uuid.uuid4())
@@ -1609,7 +1636,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             if GEN_DEBUG:
                 logger.info(
                     f"[GEN] SELL_NOT_TRIGGERED | symbol={symbol} "
-                    f"trend={trend:.3f} (need<-0.10) mom1={mom1:.4f} (need<-0.005) "
+                    f"trend={trend:.3f} (need<-0.05) mom1={mom1:.4f} (need<-0.002) "
                     f"rsi={_rsi(closes, RSI_PERIOD):.1f} (sell_min={RSI_SELL_MIN}) "
                     f"→ holding position"
                 )
