@@ -260,21 +260,24 @@ class ExecutionEngine:
         if self.state_debug:
             logger.info(f"SYSTEM_STATE_RAW | type={type(raw)} value={raw}")
 
-        if raw is not None:
-            status = raw[1] if len(raw) > 1 else ""
-            sync = raw[2] if len(raw) > 2 else 0
-            kill = raw[3] if len(raw) > 3 else 0
-            return {
-                "status": str(status or "").upper(),
-                "startup_sync_ok": _to_bool01(sync),
-                "kill_switch": _to_bool01(kill),
-            }
-
+        # FIX EE-CRITICAL: dict check MUST come before tuple/sequence check.
+        # dict is not None → the old code entered tuple branch and did raw[1]
+        # on a dict → KeyError / unexpected behavior.
         if isinstance(raw, dict):
             return {
                 "status": str(raw.get("status") or "").upper(),
                 "startup_sync_ok": _to_bool01(raw.get("startup_sync_ok")),
                 "kill_switch": _to_bool01(raw.get("kill_switch")),
+            }
+
+        if raw is not None and hasattr(raw, '__len__') and len(raw) > 1:
+            status = raw[1] if len(raw) > 1 else ""
+            sync   = raw[2] if len(raw) > 2 else 0
+            kill   = raw[3] if len(raw) > 3 else 0
+            return {
+                "status": str(status or "").upper(),
+                "startup_sync_ok": _to_bool01(sync),
+                "kill_switch": _to_bool01(kill),
             }
 
         return {"status": "", "startup_sync_ok": False, "kill_switch": False}
