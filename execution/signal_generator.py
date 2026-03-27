@@ -871,7 +871,7 @@ def _structure_ok(closes: List[float], use_ma: bool, trend_strength: float) -> T
         c_soft_ups   = ups3 >= STRUCT_SOFT_REQUIRE_LAST_UP
         c_soft_sma_gap = sma_gap_pct >= (-1.0 * STRUCT_SOFT_MIN_MA_GAP)
         # FIX: mom10 hardcoded -0.004 → ENV-დან, default გაფართოვდა -0.05
-        _soft_mom10_min = float(os.getenv("STRUCT_SOFT_MIN_MOM10", "-0.05"))
+        _soft_mom10_min = float(os.getenv("STRUCT_SOFT_MIN_MOM10", "-0.02"))  # ENV=-0.02 (was -0.05)
         c_soft_mom10 = mom10 > _soft_mom10_min
 
         # FIX: soft_ok = მხოლოდ trend + mom10 (ups და sma_gap არჩევითია)
@@ -1317,10 +1317,46 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         # 22:00-00:00 UTC: late session — გაფართოებული spread-ები
         # open_trade bypass: თუ trade ღიაა, SELL ყოველთვის მუშაობს
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        from datetime import timezone as _tz
+        _utc_hour = datetime.now(_tz.utc).hour
+        _in_window = TRADE_HOUR_START_UTC <= _utc_hour < TRADE_HOUR_END_UTC
+
+        # FIX: After-hours open trade protection
+        # UTC >= TRADE_HOUR_END_UTC (22:00+) და open_trade → force SELL signal
+        # overnight-ზე OCO-ით ღია პოზიცია = SL risk → session close-ზე ვხურავთ
+        if USE_TIME_FILTER and not _in_window and open_trade:
+            try:
+                ohlcv_ah = EXCHANGE.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=30)
+                if ohlcv_ah and len(ohlcv_ah) >= 10:
+                    ohlcv_ah, _ = _drop_unclosed_candle(ohlcv_ah, TIMEFRAME)
+                    closes_ah = [float(c[4]) for c in ohlcv_ah]
+                    atrp_ah   = _atr_pct(ohlcv_ah, 14)
+                    trend_ah  = _trend_strength(closes_ah, USE_MA_FILTERS)
+                    sig_ah = {
+                        "signal_id":        str(uuid.uuid4()),
+                        "ts_utc":           _now_utc_iso(),
+                        "certified_signal": True,
+                        "final_verdict":    "SELL",
+                        "trend":            round(trend_ah, 4),
+                        "atr_pct":          round(atrp_ah, 4),
+                        "meta": {
+                            "source": "AFTER_HOURS_SELL",
+                            "symbol": symbol,
+                            "reason": f"SESSION_CLOSE utc_hour={_utc_hour} >= end={TRADE_HOUR_END_UTC}",
+                        },
+                        "execution": {"symbol": symbol, "direction": "LONG"},
+                    }
+                    logger.warning(
+                        f"[GEN] AFTER_HOURS_SELL | symbol={symbol} "
+                        f"utc_hour={_utc_hour} >= end={TRADE_HOUR_END_UTC} "
+                        f"→ closing overnight position"
+                    )
+                    append_signal(sig_ah, outbox_path)
+                    return sig_ah
+            except Exception as _e:
+                logger.warning(f"[GEN] AFTER_HOURS_SELL_FAIL | symbol={symbol} err={_e}")
+
         if USE_TIME_FILTER and not open_trade:
-            from datetime import timezone as _tz
-            _utc_hour = datetime.now(_tz.utc).hour
-            _in_window = TRADE_HOUR_START_UTC <= _utc_hour < TRADE_HOUR_END_UTC
             if not _in_window:
                 if GEN_DEBUG:
                     logger.info(
@@ -1423,7 +1459,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             already_fired    = _rsi_sell_fired.get(symbol, False)
             rsi_sell_trigger = USE_RSI_FILTER and rsi_sell >= RSI_SELL_MIN and not already_fired
 
-            sell_triggered = (trend < -0.15 and mom1 < -0.01) or rsi_sell_trigger
+            # FIX: trend threshold -0.15 → -0.10
+            # flat ბაზარი (22:00+ UTC) trend=-0.05~-0.12 → -0.15-ზე SELL არ trigger-ება
+            # overnight open position = SL risk → ადრე გასვლა სჯობს
+            sell_triggered = (trend < -0.10 and mom1 < -0.005) or rsi_sell_trigger
 
             if sell_triggered:
                 signal_id = str(uuid.uuid4())
@@ -1461,7 +1500,14 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 append_signal(sig, outbox_path)
                 return sig
 
-            # open trade-ია, მაგრამ SELL პირობა არ დასრულდა — BUY-ს ნუ ვცდილობთ
+            # open trade-ია, SELL პირობა არ სრულდება — BUY-ს ნუ ვცდილობთ
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] SELL_NOT_TRIGGERED | symbol={symbol} "
+                    f"trend={trend:.3f} (need<-0.10) mom1={mom1:.4f} (need<-0.005) "
+                    f"rsi={_rsi(closes, RSI_PERIOD):.1f} (sell_min={RSI_SELL_MIN}) "
+                    f"→ holding position"
+                )
             continue
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
