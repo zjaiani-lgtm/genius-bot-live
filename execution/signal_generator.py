@@ -140,8 +140,34 @@ VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.003"))   # 0.3% abo
 # (22:00-07:00 UTC = Asia low liquidity + wide spreads)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_TIME_FILTER       = os.getenv("USE_TIME_FILTER", "true").strip().lower() == "true"
-TRADE_HOUR_START_UTC  = int(os.getenv("TRADE_HOUR_START_UTC", "7"))    # 07:00 UTC
-TRADE_HOUR_END_UTC    = int(os.getenv("TRADE_HOUR_END_UTC", "22"))     # 22:00 UTC
+TRADE_HOUR_START_UTC  = int(os.getenv("TRADE_HOUR_START_UTC", "7"))
+TRADE_HOUR_END_UTC    = int(os.getenv("TRADE_HOUR_END_UTC", "22"))
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FUNDING RATE FILTER (Binance Futures)
+# Crypto-specific institutional signal:
+#   funding > +THRESHOLD → longs overheated → avoid BUY
+#   funding < -THRESHOLD → shorts overheated → contrarian BUY ok
+# USE_FUNDING_FILTER=true → fetch from Binance Futures API
+# FUNDING_MAX_LONG_PCT=0.10 → block if funding > 0.10%
+# FUNDING_CACHE_SEC=300 → cache 5min (funding updates every 8h)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+USE_FUNDING_FILTER    = os.getenv("USE_FUNDING_FILTER", "false").strip().lower() == "true"
+FUNDING_MAX_LONG_PCT  = float(os.getenv("FUNDING_MAX_LONG_PCT",  "0.10"))  # >0.10% = overbought
+FUNDING_MIN_SHORT_PCT = float(os.getenv("FUNDING_MIN_SHORT_PCT", "-0.05")) # <-0.05% = oversold
+FUNDING_CACHE_SEC     = int(os.getenv("FUNDING_CACHE_SEC", "300"))         # 5min cache
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# MACD SMART MODE
+# MACD_SMART_MODE=true → catches early reversals in downtrend
+#   Standard:  hist > 0 (0% pass in downtrend)
+#   Smart:     hist > 0 OR (hist improving 3 bars AND hist > -ATR×factor)
+# MACD_IMPROVING_BARS=3  → need N consecutive improving bars
+# MACD_HIST_ATR_FACTOR=0.3 → max negative hist = ATR × 0.3
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+MACD_SMART_MODE       = os.getenv("MACD_SMART_MODE", "true").strip().lower() == "true"
+MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "3"))
+MACD_HIST_ATR_FACTOR  = float(os.getenv("MACD_HIST_ATR_FACTOR", "0.3"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #3 Trailing Stop
@@ -655,6 +681,98 @@ def _vwap(ohlcv: List[List[float]]) -> float:
         return 0.0
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FUNDING RATE — Binance Futures
+# Institutional signal: high funding = crowded longs = reversal risk
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+_funding_cache: Dict[str, Tuple[float, float]] = {}  # symbol → (rate, timestamp)
+
+
+def _get_funding_rate(symbol: str) -> Optional[float]:
+    """
+    Fetch current funding rate from Binance Futures for spot symbol.
+    Returns funding rate as float (e.g. 0.001 = 0.1%) or None on error.
+
+    Caches result for FUNDING_CACHE_SEC seconds (default 5min).
+    Funding updates every 8h on Binance — cache is safe.
+
+    symbol: spot format "BTC/USDT" → futures "BTCUSDT"
+    """
+    import time as _time
+    now = _time.time()
+
+    # Check cache
+    if symbol in _funding_cache:
+        cached_rate, cached_ts = _funding_cache[symbol]
+        if now - cached_ts < FUNDING_CACHE_SEC:
+            return cached_rate
+
+    try:
+        # Convert spot symbol to futures format
+        fut_symbol = symbol.replace("/", "")   # BTC/USDT → BTCUSDT
+
+        import urllib.request
+        import json as _json
+        url = (
+            f"https://fapi.binance.com/fapi/v1/premiumIndex"
+            f"?symbol={fut_symbol}"
+        )
+        req  = urllib.request.Request(url, headers={"User-Agent": "GeniusBot/1.0"})
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = _json.loads(resp.read().decode())
+
+        rate = float(data.get("lastFundingRate", 0.0))
+        _funding_cache[symbol] = (rate, now)
+
+        if GEN_DEBUG:
+            logger.info(
+                f"[FUNDING] {symbol} rate={rate*100:.4f}% "
+                f"(threshold: max={FUNDING_MAX_LONG_PCT}% min={FUNDING_MIN_SHORT_PCT}%)"
+            )
+        return rate
+
+    except Exception as e:
+        logger.debug(f"[FUNDING] fetch_fail | {symbol} err={e}")
+        _funding_cache[symbol] = (0.0, now)  # cache 0 to avoid spam
+        return None
+
+
+def _funding_allows_buy(symbol: str) -> Tuple[bool, str]:
+    """
+    Returns (ok, reason).
+    ok=True  → funding is neutral or favorable for BUY
+    ok=False → longs overheated, avoid BUY
+
+    Logic:
+      rate > FUNDING_MAX_LONG_PCT  → crowded longs → BLOCK
+      rate < FUNDING_MIN_SHORT_PCT → crowded shorts → BUY signal (contrarian)
+      otherwise                    → neutral → ALLOW
+    """
+    if not USE_FUNDING_FILTER:
+        return True, "FUNDING_FILTER_DISABLED"
+
+    rate = _get_funding_rate(symbol)
+    if rate is None:
+        return True, "FUNDING_FETCH_FAILED_ALLOW"  # fail-open: don't block on error
+
+    rate_pct = rate * 100.0  # convert to percentage
+
+    if rate_pct > FUNDING_MAX_LONG_PCT:
+        return False, (
+            f"FUNDING_OVERHEATED | rate={rate_pct:.4f}% > max={FUNDING_MAX_LONG_PCT}% "
+            f"(longs crowded → reversal risk)"
+        )
+    if rate_pct < FUNDING_MIN_SHORT_PCT:
+        # Contrarian: shorts overcrowded = good BUY opportunity
+        return True, (
+            f"FUNDING_CONTRARIAN_BUY | rate={rate_pct:.4f}% < {FUNDING_MIN_SHORT_PCT}% "
+            f"(shorts crowded → squeeze potential)"
+        )
+
+    return True, f"FUNDING_OK | rate={rate_pct:.4f}%"
+
+
 def _slope_sma(closes: List[float]) -> float:
     if len(closes) < 10:
         return 0.0
@@ -859,7 +977,6 @@ def _macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9
         return 0.0, 0.0, 0.0
     ema_fast = _ema(closes, fast)
     ema_slow = _ema(closes, slow)
-    # align lengths
     min_len = min(len(ema_fast), len(ema_slow))
     macd_series = [ema_fast[i] - ema_slow[i] for i in range(-min_len, 0)]
     if len(macd_series) < signal:
@@ -869,6 +986,27 @@ def _macd(closes: List[float], fast: int = 12, slow: int = 26, signal: int = 9
     signal_val = sig_ema[-1]
     hist       = macd_val - signal_val
     return round(macd_val, 8), round(signal_val, 8), round(hist, 8)
+
+
+def _macd_series(closes: List[float], fast: int = 12, slow: int = 26,
+                 signal: int = 9, n_bars: int = 5) -> List[float]:
+    """
+    Returns last n_bars histogram values (oldest→newest).
+    Used for MACD Smart Mode: detecting improving momentum.
+    Empty list if not enough data.
+    """
+    if len(closes) < slow + signal + n_bars:
+        return []
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    min_len  = min(len(ema_fast), len(ema_slow))
+    macd_s   = [ema_fast[i] - ema_slow[i] for i in range(-min_len, 0)]
+    if len(macd_s) < signal + n_bars:
+        return []
+    sig_ema  = _ema(macd_s, signal)
+    min_s    = min(len(macd_s), len(sig_ema))
+    hists    = [macd_s[i] - sig_ema[i] for i in range(-min_s, 0)]
+    return hists[-n_bars:]
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1450,18 +1588,77 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 continue
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # #1 MACD FILTER
-        # macd_line > signal_line AND histogram > 0 → bullish momentum
+        # #1 MACD FILTER — Smart Mode
+        #
+        # STANDARD (MACD_SMART_MODE=false):
+        #   hist > 0 AND macd > signal → bullish
+        #   Problem: 0% pass in downtrend → 0 trades all day
+        #
+        # SMART MODE (MACD_SMART_MODE=true):
+        #   Condition A: hist > 0 AND macd > signal (classic bullish) ✅
+        #   Condition B: hist improving N consecutive bars AND
+        #                hist > -ATR × factor (recovering, not deep bear)
+        #   → catches early reversals = +4-6 trades/day in downtrend
+        #   → safe: ATR threshold prevents entries in strong downtrend
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if USE_MACD_FILTER:
             macd_line, macd_sig, macd_hist = _macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL_PERIOD)
-            if macd_hist <= 0 or macd_line <= macd_sig:
+
+            macd_classic_ok = (macd_hist > 0 and macd_line > macd_sig)
+            macd_smart_ok   = False
+            macd_mode       = "classic"
+
+            if not macd_classic_ok and MACD_SMART_MODE:
+                # Smart: check if histogram is consistently improving
+                hist_series = _macd_series(closes, MACD_FAST, MACD_SLOW,
+                                           MACD_SIGNAL_PERIOD, MACD_IMPROVING_BARS + 1)
+                if len(hist_series) >= MACD_IMPROVING_BARS + 1:
+                    # All last N bars improving (each > previous)
+                    improving = all(
+                        hist_series[i] > hist_series[i - 1]
+                        for i in range(-MACD_IMPROVING_BARS, 0)
+                    )
+                    # Not in deep downtrend: hist > -ATR × factor
+                    not_deep_bear = macd_hist > -(atrp * MACD_HIST_ATR_FACTOR)
+
+                    if improving and not_deep_bear:
+                        macd_smart_ok = True
+                        macd_mode     = f"smart_improving_{MACD_IMPROVING_BARS}bars"
+
+            macd_ok = macd_classic_ok or macd_smart_ok
+
+            if not macd_ok:
                 if GEN_DEBUG:
                     logger.info(
                         f"[GEN] BLOCKED_BY_MACD | symbol={symbol} "
-                        f"macd={macd_line:.6f} signal={macd_sig:.6f} hist={macd_hist:.6f}"
+                        f"macd={macd_line:.6f} signal={macd_sig:.6f} "
+                        f"hist={macd_hist:.6f} smart={MACD_SMART_MODE}"
                     )
                 continue
+
+            if GEN_DEBUG and macd_mode != "classic":
+                logger.info(
+                    f"[GEN] MACD_SMART_PASS | symbol={symbol} "
+                    f"mode={macd_mode} hist={macd_hist:.6f} atr={atrp:.4f}"
+                )
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # FUNDING RATE FILTER (Crypto-specific institutional signal)
+        # High funding = longs overheated = reversal risk → BLOCK BUY
+        # Only active when USE_FUNDING_FILTER=true (default: false)
+        # Fail-open: fetch error → allow trade (don't miss opportunity)
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if USE_FUNDING_FILTER:
+            funding_ok, funding_reason = _funding_allows_buy(symbol)
+            if not funding_ok:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_BY_FUNDING | symbol={symbol} "
+                        f"reason={funding_reason}"
+                    )
+                continue
+            if GEN_DEBUG and "CONTRARIAN" in funding_reason:
+                logger.info(f"[GEN] FUNDING_BOOST | symbol={symbol} {funding_reason}")
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # ADX FILTER — Average Directional Index trend strength
