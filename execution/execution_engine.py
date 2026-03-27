@@ -1662,7 +1662,6 @@ class ExecutionEngine:
                 log_event("EXEC_BLOCKED_TRADE_STATE_CHECK_FAIL", msg)
                 return
 
-            min_notional = 0.0
             try:
                 min_notional = float(self.exchange.get_min_notional(symbol))
             except Exception:
