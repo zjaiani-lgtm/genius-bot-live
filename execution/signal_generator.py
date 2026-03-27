@@ -1557,19 +1557,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     )
                 continue
 
-        # FIX: adaptive conf_min from regime_engine (ეტაპი 2)
-        # BULL regime:      0.38 × 0.85 = 0.323 (ნაკლები სიმკაცრე)
-        # UNCERTAIN regime: 0.38 × 1.20 = 0.456 (მეტი სიმკაცრე)
-        # adaptive["CONF_MIN"] = 0.0 if SKIP_TRADING (not reached here)
-        _eff_conf_min = adaptive.get("CONF_MIN") or BUY_CONFIDENCE_MIN
-        if _eff_conf_min <= 0:
-            _eff_conf_min = BUY_CONFIDENCE_MIN
-        if conf < _eff_conf_min:
+        # conf < BUY_CONFIDENCE_MIN — static pre-check (adaptive check ქვემოთ, regime apply()-ის შემდეგ)
+        # NOTE: ეს მხოლოდ static floor — adaptive (regime-aware) check line ~1763-ზეა
+        if conf < BUY_CONFIDENCE_MIN:
             if GEN_DEBUG:
                 logger.info(
-                    f"[GEN] BLOCKED_BY_CONF | symbol={symbol} "
-                    f"conf={conf:.3f} < conf_min={_eff_conf_min:.3f} "
-                    f"(regime={adaptive.get('REGIME')} adaptive=True)"
+                    f"[GEN] BLOCKED_BY_CONF_STATIC | symbol={symbol} "
+                    f"conf={conf:.3f} < BUY_CONFIDENCE_MIN={BUY_CONFIDENCE_MIN:.3f}"
                 )
             continue
 
@@ -1759,6 +1753,24 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                     f"[GEN] BLOCKED_BY_REGIME | symbol={symbol} "
                     f"regime={adaptive.get('REGIME')} "
                     f"atr%={atrp:.3f} trend={trend:.3f}"
+                )
+            continue
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # ADAPTIVE CONF_MIN — ეტაპი 2 (regime_engine)
+        # BULL:      0.38 × 0.85 = 0.323 (ნაკლები სიმკაცრე)
+        # UNCERTAIN: 0.38 × 1.20 = 0.456 (მეტი სიმკაცრე)
+        # სწორი ადგილი: adaptive განსაზღვრის შემდეგ
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        _eff_conf_min = adaptive.get("CONF_MIN") or BUY_CONFIDENCE_MIN
+        if _eff_conf_min <= 0:
+            _eff_conf_min = BUY_CONFIDENCE_MIN
+        if conf < _eff_conf_min:
+            if GEN_DEBUG:
+                logger.info(
+                    f"[GEN] BLOCKED_BY_CONF_ADAPTIVE | symbol={symbol} "
+                    f"conf={conf:.3f} < conf_min={_eff_conf_min:.3f} "
+                    f"regime={adaptive.get('REGIME')}"
                 )
             continue
 
