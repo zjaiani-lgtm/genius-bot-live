@@ -22,6 +22,8 @@ from execution.db.repository import (
     reset_consecutive_sl_per_symbol,
     is_sl_pause_active_per_symbol,
     get_all_symbol_cooldown_states,
+    # FIX GLOBAL-1: global open trade count for MAX_OPEN_TRADES guard
+    get_all_open_trades,
 )
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 from execution.regime_engine import MarketRegimeEngine
@@ -84,6 +86,12 @@ AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.05"))  # ENV=1.0
 # 4. Trade frequency limits
 MAX_TRADES_PER_DAY  = int(os.getenv("MAX_TRADES_PER_DAY",  "10"))  # ENV=10
 MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "3"))   # ENV=3
+
+# FIX GLOBAL-1: MAX_OPEN_TRADES — ადრე config.py-ში განსაზღვრული, მაგრამ
+# სიგნალ-გენერატორში ᲐᲠᲐᲡᲝᲓᲔᲡ იმპორტირებული და გამოყენებული.
+# ეს ნიშნავდა: MAX_OPEN_TRADES=4 ENV-ში → dead code → ბოტი 3 symbol-ზე
+# ერთდროულად შედიოდა შეზღუდვის გარეშე.
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))  # FIX: was dead code
 
 # 5. AI_FILTER_LOW_CONFIDENCE — ai_score < threshold → hard reject before any other check
 # true = strict mode: ყველა low-confidence signal drop-ი ყველა filter-ის წინ
@@ -1329,6 +1337,36 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             )
             return None
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIX GLOBAL-1: MAX_OPEN_TRADES — global cross-symbol hard limit.
+    # ადრე: MAX_OPEN_TRADES=4 ENV-ში განსაზღვრული, მაგრამ ამ ფაილში
+    # არასოდეს გამოყენებული → 3 symbol-ზე ერთდროული entry შეუზღუდავი.
+    # ახლა: get_all_open_trades() → total count ყველა სიმბოლოზე.
+    # BUY loop-ის წინ: total >= MAX_OPEN_TRADES → return None.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if MAX_OPEN_TRADES > 0:
+        try:
+            _total_open = len(get_all_open_trades() or [])
+            if _total_open >= MAX_OPEN_TRADES:
+                logger.info(
+                    f"[GEN] BLOCKED_MAX_OPEN_TRADES | total_open={_total_open} >= MAX_OPEN_TRADES={MAX_OPEN_TRADES}"
+                )
+                return None
+        except Exception as _e:
+            logger.warning(f"[GEN] MAX_OPEN_TRADES_CHECK_FAIL | err={_e} → skipped (fail-open)")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FIX GLOBAL-2: CROSS-SYMBOL CORRELATION FILTER.
+    # BTC/USDT ↔ ETH/USDT კორელაცია ≈ 0.85-0.95 (30-day rolling).
+    # ორი კორელირებული სიმბოლო ერთდროულად = double exposure, არა
+    # დივერსიფიკაცია. BNB ასევე BTC-კორელირებული (≈0.70-0.80).
+    # წესი: BTC/ETH ერთდროულად დაბლოკილია (highest correlation).
+    # BNB შეუძლია BTC ან ETH-თან ერთად (დაბალი კორელაცია).
+    # გამონაკლისი: SELL სიგნალები კორელაციის შემოწმებას არ საჭიროებს.
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    _corr_btc_open = _has_open_trade("BTC/USDT")
+    _corr_eth_open = _has_open_trade("ETH/USDT")
+
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # SL PAUSE — DB-based, restart-safe, PER-SYMBOL ONLY
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1384,6 +1422,28 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     for symbol in SYMBOLS:
         active_oco = _has_active_oco(symbol)
         open_trade = _has_open_trade(symbol)
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # FIX GLOBAL-2 (per-symbol): CORRELATION GUARD.
+        # BTC/ETH ერთდროული BUY → double correlated exposure.
+        # open_trade=True მხოლოდ BUY path-ს ბლოკავს — SELL
+        # ყოველთვის გადის (open_trade check ქვემოთ bypass-ავს).
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        if not open_trade:
+            if symbol == "ETH/USDT" and _corr_btc_open:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_CORRELATION | symbol=ETH/USDT "
+                        f"BTC/USDT open → correlated pair exposure blocked"
+                    )
+                continue
+            if symbol == "BTC/USDT" and _corr_eth_open:
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] BLOCKED_CORRELATION | symbol=BTC/USDT "
+                        f"ETH/USDT open → correlated pair exposure blocked"
+                    )
+                continue
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # FIX I-8 FULL: per-symbol SL pause check.
