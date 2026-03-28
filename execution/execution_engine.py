@@ -23,6 +23,8 @@ from execution.db.repository import (
     get_trade_stats,
     count_open_trades_for_symbol,
     get_all_open_trades,
+    # FIX GLOBAL-3: OCO failure rollback — orphaned trade cleanup
+    delete_orphaned_trade,
 )
 from execution.kill_switch import is_kill_switch_active
 from execution.virtual_wallet import simulate_market_entry
@@ -1526,6 +1528,35 @@ class ExecutionEngine:
                 return
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 3b. MAX_OPEN_TRADES — global cross-symbol hard limit (LAST GATE).
+        # FIX GLOBAL-1: signal_generator-შიც შემოწმდება, მაგრამ execution
+        # engine-ი last-gate-ია — race condition-ის წინააღმდეგ.
+        # სცენარი: signal_generator signal-ს აგენერირებს → outbox-ში
+        # ელოდება → სანამ execution engine-ი კითხულობს, სხვა trade-ი
+        # გაიხსნა → total open >= MAX. ეს check ამ სიტუაციას ხურავს.
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        _max_open = int(os.getenv("MAX_OPEN_TRADES", "4"))
+        if _max_open > 0:
+            try:
+                _total_open_now = len(get_all_open_trades() or [])
+                if _total_open_now >= _max_open:
+                    msg = (
+                        f"EXEC_REJECT | MAX_OPEN_TRADES | "
+                        f"total_open={_total_open_now} >= limit={_max_open} | id={signal_id}"
+                    )
+                    logger.warning(msg)
+                    log_event("EXEC_REJECT_MAX_OPEN_TRADES", msg)
+                    mark_signal_id_executed(
+                        signal_id,
+                        signal_hash=signal_hash,
+                        action="REJECT_MAX_OPEN_TRADES",
+                        symbol=str(symbol)
+                    )
+                    return
+            except Exception as _e:
+                logger.warning(f"MAX_OPEN_TRADES_CHECK_FAIL | err={_e} → skipped (fail-open)")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 4. MAX_ACCOUNT_DRAWDOWN — session balance drop limit
         # FIX I-5: _session_start_balance DB-ში ინახება — restart-safe.
         # FIX DRAWDOWN: total balance = free_USDT + open_trades_value
@@ -1961,13 +1992,66 @@ class ExecutionEngine:
             sl_stop = self.exchange.floor_price(symbol, sl_stop)
             sl_limit = self.exchange.floor_price(symbol, sl_limit)
 
-            oco = self.exchange.place_oco_sell(
-                symbol=str(symbol),
-                base_amount=float(oco_amount),   # FIX: partial portion reserved
-                tp_price=float(tp_price),
-                sl_stop_price=float(sl_stop),
-                sl_limit_price=float(sl_limit),
-            )
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX GLOBAL-3: OCO PLACEMENT WITH ROLLBACK.
+            # ძველი კოდი: open_trade() DB INSERT → place_oco_sell() fail →
+            #   Exception caught → return. მაგრამ DB row დარჩა closed_at=NULL
+            #   → "phantom open" → MAX_OPEN_TRADES count გაფუჭებული,
+            #   has_open_trade_for_symbol() = True, position unprotected.
+            # ახალი: place_oco_sell() fail → delete_orphaned_trade() rollback
+            #   → market sell-ი (position დაცვა) → log + TG notification.
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            try:
+                oco = self.exchange.place_oco_sell(
+                    symbol=str(symbol),
+                    base_amount=float(oco_amount),   # FIX: partial portion reserved
+                    tp_price=float(tp_price),
+                    sl_stop_price=float(sl_stop),
+                    sl_limit_price=float(sl_limit),
+                )
+            except Exception as _oco_err:
+                # ━━ ROLLBACK: DB row-ი წაიშალოს — orphaned trade-ი თავიდან ავიცილოთ
+                logger.error(
+                    f"OCO_PLACE_FAIL | id={signal_id} symbol={symbol} err={_oco_err} "
+                    f"→ rolling back DB open_trade + emergency market sell"
+                )
+                log_event("OCO_PLACE_FAIL_ROLLBACK", f"{signal_id} {symbol} err={_oco_err}")
+                try:
+                    delete_orphaned_trade(signal_id)
+                    logger.warning(f"OCO_ROLLBACK_OK | id={signal_id} trade row deleted")
+                except Exception as _rb_err:
+                    logger.error(f"OCO_ROLLBACK_FAIL | id={signal_id} err={_rb_err} — manual intervention needed")
+                # ━━ Emergency market sell — position exchange-ზე ღიაა, ბოტი ვერ მართავს
+                try:
+                    _emg_free = float(self.exchange.fetch_balance_free(str(base_asset)))
+                    if _emg_free > 0:
+                        from execution.exchange_client import _safe_sell_amount
+                        _emg_price = float(self.exchange.fetch_last_price(str(symbol)))
+                        _emg_qty = _safe_sell_amount(
+                            self.exchange, str(symbol), _emg_free * self.sell_buffer, _emg_price
+                        )
+                        if _emg_qty > 0:
+                            self.exchange.place_market_sell(str(symbol), _emg_qty)
+                            logger.warning(
+                                f"OCO_FAIL_EMERGENCY_SELL | id={signal_id} symbol={symbol} "
+                                f"qty={_emg_qty:.8f} price≈{_emg_price:.4f}"
+                            )
+                            log_event("OCO_FAIL_EMERGENCY_SELL", f"{signal_id} {symbol} qty={_emg_qty:.8f}")
+                        else:
+                            logger.error(f"OCO_FAIL_EMERGENCY_SELL_SKIP | id={signal_id} qty below min")
+                except Exception as _emg_err:
+                    logger.error(
+                        f"OCO_FAIL_EMERGENCY_SELL_ERROR | id={signal_id} symbol={symbol} "
+                        f"err={_emg_err} — MANUAL INTERVENTION REQUIRED"
+                    )
+                    log_event("OCO_FAIL_EMERGENCY_SELL_ERROR", f"{signal_id} {symbol} err={_emg_err}")
+                mark_signal_id_executed(
+                    signal_id,
+                    signal_hash=signal_hash,
+                    action="OCO_PLACE_FAIL_ROLLED_BACK",
+                    symbol=str(symbol)
+                )
+                return
 
             raw = oco.get("raw") or {}
             orders = raw.get("orders") or []
