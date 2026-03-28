@@ -126,14 +126,15 @@ GREEN='\033[0;32m'; CYAN='\033[0;36m'; NC='\033[0m'
 try:
     conn = sqlite3.connect(db)
     rows = conn.execute("""
-        SELECT symbol, qty, quote_in, entry_price, opened_at
+        SELECT symbol, qty, quote_in, entry_price, opened_at, outcome
         FROM trades WHERE closed_at IS NULL
         ORDER BY opened_at DESC
     """).fetchall()
     if rows:
         print(f'{GREEN}[OK]{NC}   ღია trade-ები: {len(rows)}')
         for r in rows:
-            print(f'{CYAN}[INFO]{NC}   └─ {r[0]} qty={r[1]:.6f} invested={r[2]:.2f} USDT entry={r[3]:.4f} opened={r[4]}')
+            outcome_str = f" outcome={r[5]}" if r[5] else " (open)"
+            print(f'{CYAN}[INFO]{NC}   └─ {r[0]} qty={r[1]:.6f} invested={r[2]:.2f} USDT entry={r[3]:.4f} opened={r[4]}{outcome_str}')
     else:
         print(f'{CYAN}[INFO]{NC} ღია trade-ები: 0')
     conn.close()
@@ -278,7 +279,8 @@ try:
     sl_count = sum(1 for r in rows if str(r[0]).upper() == 'SL')
     tp_count = sum(1 for r in rows if str(r[0]).upper() == 'TP')
     print(f'{CYAN}[INFO]{NC} ბოლო 1 სთ: {sl_count} SL | {tp_count} TP')
-    limit = 2
+    import os as _os
+    limit = int(_os.getenv("SL_COOLDOWN_AFTER_N", "3"))
     if sl_count >= limit:
         print(f'{YELLOW}[WARN]{NC} {sl_count} consecutive SL — Cooldown შეიძლება active იყოს (limit={limit})')
     else:
@@ -419,15 +421,34 @@ else:
 
         # SL Cooldown (მხოლოდ ახალ ვერსიაში)
         if is_new:
+            import os as _os2
+            sl_limit_test = int(_os2.getenv("SL_COOLDOWN_AFTER_N", "3"))
             t0 = datetime(2025, 1, 1, 10, 0, 0)
-            eng.notify_outcome("BTC/USDT", "SL", t0)
-            eng.notify_outcome("BTC/USDT", "SL", t0)
-            if eng.is_paused("BTC/USDT", t0 + timedelta(minutes=5)):
-                ok("SL Cooldown — 2×SL → pause ✓")
+            # Fire SL sl_limit_test times to trigger pause
+            for _ in range(sl_limit_test):
+                try:
+                    eng.notify_outcome("BTC/USDT", "SL", t0)
+                except TypeError:
+                    eng.notify_outcome("BTC/USDT", "SL")
+            paused_check = False
+            try:
+                paused_check = eng.is_paused("BTC/USDT", t0 + timedelta(minutes=5))
+            except TypeError:
+                paused_check = eng.is_paused("BTC/USDT")
+            if paused_check:
+                ok(f"SL Cooldown — {sl_limit_test}×SL → pause ✓")
             else:
-                fail("SL Cooldown — 2×SL შემდეგ pause არ ავიდა!")
-            eng.notify_outcome("BTC/USDT", "TP", t0)
-            if not eng.is_paused("BTC/USDT"):
+                fail(f"SL Cooldown — {sl_limit_test}×SL შემდეგ pause არ ავიდა!")
+            try:
+                eng.notify_outcome("BTC/USDT", "TP", t0)
+            except TypeError:
+                eng.notify_outcome("BTC/USDT", "TP")
+            not_paused = True
+            try:
+                not_paused = not eng.is_paused("BTC/USDT")
+            except TypeError:
+                not_paused = not eng.is_paused("BTC/USDT")
+            if not_paused:
                 ok("SL Cooldown — TP reset ✓")
             else:
                 fail("SL Cooldown — TP-ზე reset ვერ მოხდა!")
@@ -459,9 +480,9 @@ else:
 try:
     fee_rt = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))
     slip   = float(os.getenv("ESTIMATED_SLIPPAGE_PCT",      "0.05"))
-    tp_pct = float(os.getenv("TP_PCT",  "1.8"))
-    sl_pct = float(os.getenv("SL_PCT",  "0.5"))
-    quote  = float(os.getenv("BOT_QUOTE_PER_TRADE", "7.0"))
+    tp_pct = float(os.getenv("TP_PCT",  "1.5"))
+    sl_pct = float(os.getenv("SL_PCT",  "0.80"))
+    quote  = float(os.getenv("BOT_QUOTE_PER_TRADE", "10.0"))
     cost   = (fee_rt + slip) / 100.0
 
     tp_net = quote * (tp_pct / 100.0) - quote * cost
@@ -509,8 +530,8 @@ except Exception as e:
 # 5. ENV threshold კონსისტენტობა
 # ══════════════════════════════════════════════════
 try:
-    bull_min  = float(os.getenv("REGIME_BULL_TREND_MIN",   "0.45"))
-    th_trend  = float(os.getenv("THRESHOLD_TREND",         "0.60"))
+    bull_min  = float(os.getenv("REGIME_BULL_TREND_MIN",   "0.30"))
+    th_trend  = float(os.getenv("THRESHOLD_TREND",         "0.45"))
     th_conf   = float(os.getenv("THRESHOLD_CONF",          "0.55"))
     conf_min  = float(os.getenv("BUY_CONFIDENCE_MIN",      "0.55"))
     ai_thresh = 0.60  # ExcelLiveCore hardcoded
