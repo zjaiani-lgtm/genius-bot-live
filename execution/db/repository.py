@@ -566,6 +566,25 @@ def open_trade(
     )
 
 
+def delete_orphaned_trade(signal_id: str) -> None:
+    """
+    FIX GLOBAL-3: OCO placement failure rollback.
+    open_trade() DB INSERT-ის შემდეგ place_oco_sell() exception-ი →
+    trade DB-ში ღიად რჩება (closed_at IS NULL) მაგრამ Binance-ზე
+    OCO არ არსებობს → unprotected orphaned position.
+    ეს ფუნქცია ამ "phantom" row-ს შლის, რათა:
+      - has_open_trade_for_symbol() → False (BUY retry შეიძლება)
+      - MAX_OPEN_TRADES count სწორი იყოს
+      - reconcile_oco() არ ეძებს არარსებულ OCO-ს
+    გამოიძახება ᲛᲮᲝᲚᲝᲓ OCO placement failure-ის შემდეგ,
+    position asset-ი exchange-ზე გასაყიდად.
+    """
+    _execute(
+        "DELETE FROM trades WHERE signal_id = ? AND closed_at IS NULL",
+        (str(signal_id),),
+    )
+
+
 def get_trade(signal_id: str):
     return _fetchone(
         """
