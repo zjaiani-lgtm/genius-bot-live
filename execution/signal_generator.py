@@ -236,11 +236,6 @@ STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.25"))       
 STRUCT_SOFT_MIN_MA_GAP = float(os.getenv("STRUCT_SOFT_MIN_MA_GAP", "0.10"))      # ENV=0.10
 STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "1")) # ENV=1
 
-# Excel model path
-EXCEL_MODEL_PATH = os.getenv("EXCEL_MODEL_PATH", "/var/data/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx").strip()
-if EXCEL_MODEL_PATH.lower().startswith("excel_model_path="):
-    EXCEL_MODEL_PATH = EXCEL_MODEL_PATH.split("=", 1)[1].strip()
-
 _last_emit_ts: float = 0.0
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
