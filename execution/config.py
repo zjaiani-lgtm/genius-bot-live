@@ -169,9 +169,16 @@ AI_FILTER_LOW_CONFIDENCE = _env_bool("AI_FILTER_LOW_CONFIDENCE", "false")  # SYN
 BUY_CONFIDENCE_MIN      = _env_float("BUY_CONFIDENCE_MIN",      0.32)  # SYNC: 0.36→0.32
 BUY_LIQUIDITY_MIN_SCORE = _env_float("BUY_LIQUIDITY_MIN_SCORE", 0.25)  # SYNC: 0.30→0.25
 
-THRESHOLD_CONF   = _env_float("THRESHOLD_CONF",   0.32)  # SYNC: 0.38→0.32
-THRESHOLD_TREND  = _env_float("THRESHOLD_TREND",  0.30)
-THRESHOLD_VOLUME = _env_float("THRESHOLD_VOLUME", 0.25)  # SYNC: 0.50→0.25
+# FIX GLOBAL-6: THRESHOLD_CONF / THRESHOLD_TREND / THRESHOLD_VOLUME —
+# ეს სამი ცვლადი DEAD CODE-ია: signal_generator.py და execution_engine.py
+# BUY_CONFIDENCE_MIN / WEIGHT_* ცვლადებს იყენებს პირდაპირ (os.getenv-ით).
+# THRESHOLD_CONF=0.32 == BUY_CONFIDENCE_MIN=0.32 == AI_EXECUTE_MIN_SCORE=0.32
+# სამი სახელი, ერთი მნიშვნელობა — კონფუზიის წყარო.
+# ყველა ემყარება BUY_CONFIDENCE_MIN-ს. THRESHOLD_* ამოღება safe:
+# ბოტი არ კითხულობს ამ ცვლადებს სადამე სიგნალ-გენერაციაში.
+THRESHOLD_CONF   = _env_float("THRESHOLD_CONF",   0.32)  # DEAD: alias of BUY_CONFIDENCE_MIN
+THRESHOLD_TREND  = _env_float("THRESHOLD_TREND",  0.30)  # DEAD: use REGIME_BULL_TREND_MIN
+THRESHOLD_VOLUME = _env_float("THRESHOLD_VOLUME", 0.25)  # DEAD: alias of BUY_LIQUIDITY_MIN_SCORE
 
 # SYNC: config.py had RSI_MAX=70, RSI_SELL_MIN=75
 # signal_generator.py uses 72/58 → align
