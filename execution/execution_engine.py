@@ -2025,9 +2025,16 @@ class ExecutionEngine:
                 try:
                     _emg_free = float(self.exchange.fetch_balance_free(str(base_asset)))
                     if _emg_free > 0:
-                        from execution.exchange_client import _safe_sell_amount
+                        # FIX UNBOUNDLOCAL: import with alias (_safe_sell_amount_emg)
+                        # to avoid Python scoping conflict with the module-level
+                        # _safe_sell_amount function used earlier in this same function.
+                        # Python treats any name that appears in a local import as a
+                        # local variable throughout the ENTIRE function scope — so
+                        # 'from x import _safe_sell_amount' here caused UnboundLocalError
+                        # at line 1921 where the module-level version was called first.
+                        from execution.exchange_client import _safe_sell_amount as _safe_sell_amount_emg
                         _emg_price = float(self.exchange.fetch_last_price(str(symbol)))
-                        _emg_qty = _safe_sell_amount(
+                        _emg_qty = _safe_sell_amount_emg(
                             self.exchange, str(symbol), _emg_free * self.sell_buffer, _emg_price
                         )
                         if _emg_qty > 0:
