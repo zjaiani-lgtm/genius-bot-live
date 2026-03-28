@@ -300,14 +300,6 @@ USE_ADAPTIVE_SIZING   = _env_bool("USE_ADAPTIVE_SIZING",   "true")
 PORTFOLIO_ENABLED = _env_bool("PORTFOLIO_ENABLED", "false")
 
 
-# ─────────────────────────────────────────────
-# EXCEL MODEL / SIGNAL PATHS
-# ─────────────────────────────────────────────
-
-EXCEL_MODEL_PATH = _env_str(
-    "EXCEL_MODEL_PATH",
-    "/opt/render/project/src/assets/DYZEN_CAPITAL_OS_AI_LIVE_CORE_READY.xlsx"
-)
 SIGNAL_OUTBOX_PATH = _env_str("SIGNAL_OUTBOX_PATH", "/var/data/signal_outbox.json")
 
 
