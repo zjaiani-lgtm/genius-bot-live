@@ -1356,16 +1356,59 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             logger.warning(f"[GEN] MAX_OPEN_TRADES_CHECK_FAIL | err={_e} → skipped (fail-open)")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX GLOBAL-2: CROSS-SYMBOL CORRELATION FILTER.
-    # BTC/USDT ↔ ETH/USDT კორელაცია ≈ 0.85-0.95 (30-day rolling).
-    # ორი კორელირებული სიმბოლო ერთდროულად = double exposure, არა
-    # დივერსიფიკაცია. BNB ასევე BTC-კორელირებული (≈0.70-0.80).
-    # წესი: BTC/ETH ერთდროულად დაბლოკილია (highest correlation).
-    # BNB შეუძლია BTC ან ETH-თან ერთად (დაბალი კორელაცია).
-    # გამონაკლისი: SELL სიგნალები კორელაციის შემოწმებას არ საჭიროებს.
+    # FIX GLOBAL-2 v2: CROSS-SYMBOL CORRELATION FILTER (FULL).
+    #
+    # პრობლემა v1-ში:
+    #   - მხოლოდ BTC↔ETH mutual block (hardcoded strings)
+    #   - BNB კორელაციაში არ იყო (BNB/BTC ≈0.75 — significant)
+    #   - hardcoded "BTC/USDT" string → fragile (BTCUSDT format breaks)
+    #
+    # გამოსწორება v2:
+    #   - CORRELATED_GROUPS: სიმბოლოების ჯგუფები რომლებშიც
+    #     ერთდროულად მხოლოდ 1 პოზიცია არის დაშვებული.
+    #   - BTC/ETH/BNB ერთ ჯგუფშია (ყველა BTC-ბეტა coin-ია).
+    #   - symbol-ი ნებისმიერ format-ში მუშაობს: "BTC/USDT" ან "BTCUSDT"
+    #     → base asset extraction-ით შემოწმება.
+    #   - loop-ის წინ snapshot: generate_signal() returns after first BUY
+    #     → staleness არ არის (single-threaded, single return per call).
+    #   - SELL path bypass: open_trade=True → correlation skip (SELL needs to run).
+    #
+    # კორელაციის ჯგუფები (ENV-ით override შეიძლება):
+    #   CORR_GROUP_1 = BTC,ETH,BNB  (high BTC-beta, ≥0.70 correlation)
+    # ENV: CORRELATION_GROUPS="BTC,ETH,BNB|SOL,AVAX" — pipe-separated groups,
+    #      comma-separated bases. Default = ყველა symbol ერთ ჯგუფშია.
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    _corr_btc_open = _has_open_trade("BTC/USDT")
-    _corr_eth_open = _has_open_trade("ETH/USDT")
+
+    def _base_asset(sym: str) -> str:
+        """Extract base from 'BTC/USDT' → 'BTC', 'BTCUSDT' → 'BTC'."""
+        if "/" in sym:
+            return sym.split("/")[0].upper()
+        # No slash: strip common quote suffixes
+        for q in ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB"):
+            if sym.upper().endswith(q) and len(sym) > len(q):
+                return sym.upper()[: -len(q)]
+        return sym.upper()
+
+    # Parse correlation groups from ENV (default: all symbols in one group)
+    _raw_corr_groups = os.getenv("CORRELATION_GROUPS", "").strip()
+    if _raw_corr_groups:
+        _corr_groups: List[set] = [
+            {b.strip().upper() for b in grp.split(",") if b.strip()}
+            for grp in _raw_corr_groups.split("|")
+            if grp.strip()
+        ]
+    else:
+        # Default: all active symbols form one correlated group (conservative)
+        _corr_groups = [{_base_asset(s) for s in SYMBOLS}]
+
+    # Snapshot: which bases currently have an open trade (DB query once per call)
+    _open_bases: set = set()
+    for _s in SYMBOLS:
+        try:
+            if has_open_trade_for_symbol(_s):
+                _open_bases.add(_base_asset(_s))
+        except Exception:
+            pass
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # SL PAUSE — DB-based, restart-safe, PER-SYMBOL ONLY
@@ -1424,24 +1467,26 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         open_trade = _has_open_trade(symbol)
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        # FIX GLOBAL-2 (per-symbol): CORRELATION GUARD.
-        # BTC/ETH ერთდროული BUY → double correlated exposure.
-        # open_trade=True მხოლოდ BUY path-ს ბლოკავს — SELL
-        # ყოველთვის გადის (open_trade check ქვემოთ bypass-ავს).
+        # FIX GLOBAL-2 v2 (per-symbol): CORRELATION GROUP GUARD.
+        # თუ ამ symbol-ის ჯგუფში უკვე რომელიმე სიმბოლოს
+        # open trade აქვს → BUY დაბლოკილია (double exposure).
+        # SELL path-ი bypass-ავს (open_trade=True case ქვემოთ).
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         if not open_trade:
-            if symbol == "ETH/USDT" and _corr_btc_open:
+            _sym_base = _base_asset(symbol)
+            _blocked_by_corr: Optional[str] = None
+            for _grp in _corr_groups:
+                if _sym_base in _grp:
+                    # ამ ჯგუფის რომელიმე სხვა base open-ია?
+                    _conflicting = _grp.intersection(_open_bases) - {_sym_base}
+                    if _conflicting:
+                        _blocked_by_corr = ",".join(sorted(_conflicting))
+                        break
+            if _blocked_by_corr:
                 if GEN_DEBUG:
                     logger.info(
-                        f"[GEN] BLOCKED_CORRELATION | symbol=ETH/USDT "
-                        f"BTC/USDT open → correlated pair exposure blocked"
-                    )
-                continue
-            if symbol == "BTC/USDT" and _corr_eth_open:
-                if GEN_DEBUG:
-                    logger.info(
-                        f"[GEN] BLOCKED_CORRELATION | symbol=BTC/USDT "
-                        f"ETH/USDT open → correlated pair exposure blocked"
+                        f"[GEN] BLOCKED_CORRELATION | symbol={symbol} "
+                        f"corr_group_open={_blocked_by_corr} → same-group exposure blocked"
                     )
                 continue
 
