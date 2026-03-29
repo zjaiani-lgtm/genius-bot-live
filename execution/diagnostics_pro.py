@@ -338,8 +338,9 @@ def check_system_state(rep: Report, conn: sqlite3.Connection):
 
 def check_open_trades(rep: Report, conn: sqlite3.Connection) -> List[Dict]:
     try:
+        # FIX: trades ცხრილს არ აქვს 'status' სვეტი — closed_at IS NULL გამოვიყენოთ
         rows = conn.execute(
-            "SELECT * FROM trades WHERE status='open' ORDER BY opened_at DESC"
+            "SELECT * FROM trades WHERE closed_at IS NULL ORDER BY opened_at DESC"
         ).fetchall()
         trades = [dict(r) for r in rows]
         rep.add("ღია_trade/count", True, f"ღია trade-ები: {len(trades)}")
@@ -389,8 +390,9 @@ def check_oco_links(rep: Report, conn: sqlite3.Connection) -> int:
 
 def check_performance(rep: Report, conn: sqlite3.Connection):
     try:
+        # FIX: status სვეტი არ არის — closed_at IS NOT NULL გამოვიყენოთ
         rows = conn.execute(
-            "SELECT * FROM trades WHERE status IN ('closed_tp','closed_sl','closed_manual') "
+            "SELECT * FROM trades WHERE closed_at IS NOT NULL "
             "ORDER BY closed_at DESC"
         ).fetchall()
         trades = [dict(r) for r in rows]
@@ -650,8 +652,9 @@ def check_sl_cooldown(rep: Report, conn: sqlite3.Connection):
         )
 
         # Verify: loss count vs DB consecutive_sl
+        # FIX: status სვეტი არ არის — outcome სვეტი გამოვიყენოთ
         row_losses = conn.execute(
-            "SELECT COUNT(*) as cnt FROM trades WHERE status='closed_sl'"
+            "SELECT COUNT(*) as cnt FROM trades WHERE outcome='SL'"
         ).fetchone()
         actual_sl_count = dict(row_losses)["cnt"] if row_losses else 0
         rep.add(
@@ -697,9 +700,15 @@ def check_signal_outbox(rep: Report):
         try:
             with open(path) as f:
                 content = f.read().strip()
-            # Could be JSON list or newline-delimited
+            # FIX: {} ან empty object → ცარიელი outbox (არა სიგნალი)
+            if content in ("{}", ""):
+                rep.add("signal_outbox/parse", True, "Outbox ცარიელია — {} (OK)")
+                return
             if content.startswith("["):
                 sigs = json.loads(content)
+            elif content.startswith("{"):
+                # single signal object
+                sigs = [json.loads(content)]
             else:
                 sigs = [json.loads(line) for line in content.splitlines() if line.strip()]
             rep.add("signal_outbox/parse", True, f"Outbox სიგნალები: {len(sigs)}")
@@ -971,22 +980,23 @@ def check_pnl_consistency(rep: Report, conn: sqlite3.Connection):
     - Inconsistency → DB ან execution_engine bug
     """
     try:
+        # FIX: status სვეტი არ არის — outcome სვეტი გამოვიყენოთ
         rows = conn.execute(
-            "SELECT signal_id, status, pnl_quote, entry_price, exit_price, qty "
-            "FROM trades WHERE status IN ('closed_tp','closed_sl') "
+            "SELECT signal_id, outcome, pnl_quote, entry_price, exit_price, qty "
+            "FROM trades WHERE closed_at IS NOT NULL "
             "ORDER BY closed_at DESC LIMIT 50"
         ).fetchall()
 
         inconsistent = []
         for row in rows:
             d = dict(row)
-            status  = d.get("status", "")
+            outcome = str(d.get("outcome", "") or "").upper()
             pnl     = _safe_float(d.get("pnl_quote") or 0)
             sig_id  = d.get("signal_id", "?")[:8]
 
-            if status == "closed_tp" and pnl is not None and pnl <= 0:
+            if outcome == "TP" and pnl is not None and pnl <= 0:
                 inconsistent.append(f"TP trade {sig_id} has pnl={pnl:.4f} (should be >0)")
-            elif status == "closed_sl" and pnl is not None and pnl >= 0:
+            elif outcome == "SL" and pnl is not None and pnl >= 0:
                 inconsistent.append(f"SL trade {sig_id} has pnl={pnl:.4f} (should be <0)")
 
         ok = len(inconsistent) == 0
@@ -1003,7 +1013,8 @@ def check_pnl_consistency(rep: Report, conn: sqlite3.Connection):
         )
 
         # Fee sanity: avg pnl for SL trades should be around -SL_PCT - fees
-        sl_trades  = [dict(r) for r in rows if dict(r).get("status") == "closed_sl"]
+        # FIX: outcome სვეტი status-ის მაგივრად
+        sl_trades  = [dict(r) for r in rows if str(dict(r).get("outcome","") or "").upper() == "SL"]
         if sl_trades:
             avg_sl_pnl = sum(_safe_float(t.get("pnl_quote") or 0) for t in sl_trades) / len(sl_trades)
             sl_pct     = _safe_float(os.getenv("SL_PCT", "0.80")) or 0.80
