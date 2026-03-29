@@ -45,7 +45,7 @@ BOT_QUOTE_PER_TRADE = float(os.getenv("BOT_QUOTE_PER_TRADE", "10"))   # ENV=10
 MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))   # ENV=10
 
 # Fee-aware edge gate
-MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.12"))  # SYNC: 0.20→0.12 (LOG: ETH atr=0.17 blocked at 0.20)
+MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.22"))  # ENV=0.22 (synced)
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))  # ENV=0.14
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.05"))              # ENV=0.05
 TP_PCT = float(os.getenv("TP_PCT", "1.5"))                                               # ENV=1.5%
@@ -63,7 +63,7 @@ MA_GAP_PCT = float(os.getenv("MA_GAP_PCT", "0.15"))
 # Flat 15m market confidence_score ≈ 0.30-0.42 range.
 # 0.38 ბლოკავდა real signals — ვხედავდით BLOCKED_BY_CONF_STATIC ხშირად.
 # 0.32 = meaningful quality gate, still filters noise (score<0.25 = random)
-BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.32"))  # FIX: 0.38→0.32
+BUY_CONFIDENCE_MIN = float(os.getenv("BUY_CONFIDENCE_MIN", "0.46"))  # ENV=0.46 (synced)
 
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = os.getenv("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true").strip().lower() == "true"
 
@@ -91,12 +91,12 @@ MAX_TRADES_PER_HOUR = int(os.getenv("MAX_TRADES_PER_HOUR", "3"))   # ENV=3
 # სიგნალ-გენერატორში ᲐᲠᲐᲡᲝᲓᲔᲡ იმპორტირებული და გამოყენებული.
 # ეს ნიშნავდა: MAX_OPEN_TRADES=4 ENV-ში → dead code → ბოტი 3 symbol-ზე
 # ერთდროულად შედიოდა შეზღუდვის გარეშე.
-MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "4"))  # FIX: was dead code
+MAX_OPEN_TRADES = int(os.getenv("MAX_OPEN_TRADES", "2"))  # ENV=2 (synced)
 
 # 5. AI_FILTER_LOW_CONFIDENCE — ai_score < threshold → hard reject before any other check
 # true = strict mode: ყველა low-confidence signal drop-ი ყველა filter-ის წინ
 AI_FILTER_LOW_CONFIDENCE = os.getenv("AI_FILTER_LOW_CONFIDENCE", "false").strip().lower() == "true"
-AI_FILTER_MIN_SCORE      = float(os.getenv("BUY_CONFIDENCE_MIN", "0.32"))  # FIX: synced with BUY_CONFIDENCE_MIN default
+AI_FILTER_MIN_SCORE      = float(os.getenv("BUY_CONFIDENCE_MIN", "0.46"))  # ENV=0.46 synced
 
 # 6. GEN_TEST_SIGNAL — force-emit one test signal for integration testing (true = one shot)
 GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true"
@@ -105,7 +105,7 @@ GEN_TEST_SIGNAL = os.getenv("GEN_TEST_SIGNAL", "false").strip().lower() == "true
 # volume_score < this → skip (stricter than soft-volume-override)
 # FIX WIN-6: 0.40→0.25. Flat/night market volume_score ≈ 0.20-0.45.
 # 0.40 blocked legitimate low-volatility entries. 0.25 = still filters dead volume.
-BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0.25"))  # FIX: 0.40→0.25
+BUY_LIQUIDITY_MIN_SCORE = float(os.getenv("BUY_LIQUIDITY_MIN_SCORE", "0.40"))  # ENV=0.40 (synced)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #1 RSI + MACD filter
@@ -117,7 +117,7 @@ RSI_MAX               = float(os.getenv("RSI_MAX", "72"))          # ENV=72
 # FIX WIN-1: RSI_SELL_MIN 72→58. 72 = RSI spike-ი ძალიან rare 15m-ზე flat ბაზარში.
 # 58 = overbought territory on 15m — exits before momentum exhaustion.
 # ადრე: trade-ები 15 SL-ზე დაიხურა, RSI 72-ს არასოდეს მიაღწია.
-RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "58"))     # FIX: 72→58
+RSI_SELL_MIN          = float(os.getenv("RSI_SELL_MIN", "72"))     # ENV=72 (synced)
 
 USE_MACD_FILTER       = os.getenv("USE_MACD_FILTER", "true").strip().lower() == "true"
 MACD_FAST             = int(os.getenv("MACD_FAST", "12"))
@@ -141,7 +141,7 @@ MTF_CANDLE_LIMIT      = int(os.getenv("MTF_CANDLE_LIMIT", "50"))
 # ADX > 25 = strong trend (still best entries)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_ADX_FILTER        = os.getenv("USE_ADX_FILTER", "true").strip().lower() == "true"
-ADX_MIN_THRESHOLD     = float(os.getenv("ADX_MIN_THRESHOLD", "18.0"))  # FIX: 20→18
+ADX_MIN_THRESHOLD     = float(os.getenv("ADX_MIN_THRESHOLD", "23.0"))  # ENV=23 (synced)
 ADX_PERIOD            = int(os.getenv("ADX_PERIOD", "14"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -154,7 +154,7 @@ ADX_PERIOD            = int(os.getenv("ADX_PERIOD", "14"))
 # 1.0% = allows institutional-quality momentum entries
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_VWAP_FILTER       = os.getenv("USE_VWAP_FILTER", "true").strip().lower() == "true"
-VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.010"))   # FIX: 0.006→0.010 (1.0% above VWAP OK)
+VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.006"))   # ENV=0.006 (synced)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TIME-OF-DAY Filter — low liquidity session-ების თავიდან არიდება
@@ -192,7 +192,7 @@ MACD_SMART_MODE       = os.getenv("MACD_SMART_MODE", "true").strip().lower() == 
 # FIX WIN-7: MACD_IMPROVING_BARS 4→3.
 # 4 bars on 15m = 60min confirmation — too slow for short moves.
 # 3 bars = 45min momentum check — enough signal, faster entry.
-MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "3"))        # FIX: 4→3
+MACD_IMPROVING_BARS   = int(os.getenv("MACD_IMPROVING_BARS", "4"))        # ENV=4 (synced)
 MACD_HIST_ATR_FACTOR  = float(os.getenv("MACD_HIST_ATR_FACTOR", "0.2"))  # ENV=0.2
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -202,7 +202,7 @@ TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "true").strip().low
 # FIX WIN-8: TRAILING_STOP_DISTANCE 0.25→0.35
 # BTC/ETH 15m candle noise ≈ 0.20-0.30%. 0.25% trailing = noise trigger.
 # 0.35% = beyond typical 15m noise, still locks in profits on real moves.
-TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.35"))  # FIX: 0.25→0.35
+TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))  # ENV=0.25 (synced)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #4 Dynamic position sizing
@@ -228,7 +228,7 @@ USE_BREAKEVEN_STOP    = os.getenv("USE_BREAKEVEN_STOP", "true").strip().lower() 
 # Activates breakeven protection when price is 0.30% above entry (was 0.40%).
 # Earlier activation = more trades protected from reverting to SL loss.
 # 0.30% is safely above 15m typical noise (0.20%) so minimal false triggers.
-BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.30"))  # FIX: 0.40→0.30
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "0.48"))  # ENV=0.48 (synced)
 
 # Soft structure override (USED ONLY WHEN USE_MA_FILTERS=false)
 STRUCT_SOFT_OVERRIDE = os.getenv("STRUCT_SOFT_OVERRIDE", "true").strip().lower() == "true"
@@ -256,7 +256,7 @@ RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
 # FIX: 0.25% → 0.10% default. 15m flat ბაზარზე სანთლები 0.15-0.35%-ია.
 # 0.25% ძალიან მაღალია → recovery 30+ წუთი არ გადის.
 # ENV-ში: RECOVERY_CANDLE_PCT=0.15 (ან 0.10 flat ბაზრისთვის)
-RECOVERY_CANDLE_PCT = float(os.getenv("RECOVERY_CANDLE_PCT", "0.10"))
+RECOVERY_CANDLE_PCT = float(os.getenv("RECOVERY_CANDLE_PCT", "0.05"))  # ENV=0.05 (synced)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL Cooldown state — DB-based (restart-safe)
