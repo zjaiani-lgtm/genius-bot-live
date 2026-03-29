@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# GENIUS BOT — სრული დიაგნოსტიკა
+# GENIUS BOT — სრული დიაგნოსტიკა (diagnose.sh + diagnostics_pro.py)
 # გამოყენება: bash /opt/render/project/src/execution/diagnose.sh
 # ============================================================
 
@@ -22,10 +22,11 @@ info() { echo -e "${CYAN}[INFO]${NC} $1"; }
 section() { echo; echo -e "${BOLD}${CYAN}━━━ $1 ━━━${NC}"; }
 
 echo
-echo -e "${BOLD}╔══════════════════════════════════════════╗${NC}"
-echo -e "${BOLD}║     GENIUS BOT — სრული დიაგნოსტიკა      ║${NC}"
-echo -e "${BOLD}╚══════════════════════════════════════════╝${NC}"
-echo -e "$(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║           GENIUS BOT — სრული დიაგნოსტიკა (diagnose + pro)              ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
+echo -e "  $(date '+%Y-%m-%d %H:%M:%S')"
+echo
 
 # ─────────────────────────────────────────
 section "1. Python ფაილები — სინტაქსი"
@@ -559,15 +560,16 @@ print()
 print(f"{CYAN}[INFO]{NC} ლოგიკის აუდიტი: {GREEN}OK={ok_c}{NC}  {YELLOW}WARN={warn_c}{NC}  {RED}FAIL={fail_c}{NC}")
 PYEOF
 
-# ─────────────────────────────────────────
-section "საბოლოო ვერდიქტი"
-# ─────────────────────────────────────────
+echo
+echo -e "${BOLD}╔══════════════════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}║                          საბოლოო ვერდიქტი                              ║${NC}"
+echo -e "${BOLD}╚══════════════════════════════════════════════════════════════════════════╝${NC}"
 TOTAL=$((PASS + FAIL_COUNT + WARN_COUNT))
 echo
-echo -e "  სულ შემოწმება : ${TOTAL}"
-echo -e "  ${GREEN}OK   : ${PASS}${NC}"
-echo -e "  ${YELLOW}WARN : ${WARN_COUNT}${NC}"
-echo -e "  ${RED}FAIL : ${FAIL_COUNT}${NC}"
+echo -e "  სულ შემოწმება : ${BOLD}${TOTAL}${NC}"
+echo -e "  ${GREEN}${BOLD}OK   : ${PASS}${NC}"
+echo -e "  ${YELLOW}${BOLD}WARN : ${WARN_COUNT}${NC}"
+echo -e "  ${RED}${BOLD}FAIL : ${FAIL_COUNT}${NC}"
 echo
 
 if [ "$FAIL_COUNT" -eq 0 ] && [ "$WARN_COUNT" -eq 0 ]; then
@@ -577,4 +579,5 @@ elif [ "$FAIL_COUNT" -eq 0 ]; then
 else
     echo -e "${RED}${BOLD}  ❌ ${FAIL_COUNT} კრიტიკული პრობლემა გამოვლინდა!${NC}"
 fi
+echo -e "  $(date '+%Y-%m-%d %H:%M:%S')"
 echo
