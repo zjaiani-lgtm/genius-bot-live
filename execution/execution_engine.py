@@ -146,8 +146,8 @@ class ExecutionEngine:
         self.min_net_profit_pct = _cfg.MIN_NET_PROFIT_PCT
 
         self.entry_mode = os.getenv("ENTRY_MODE", "MARKET").strip().upper()
-        self.limit_entry_offset_pct = float(os.getenv("LIMIT_ENTRY_OFFSET_PCT", "0.02"))
-        self.limit_entry_timeout_sec = int(os.getenv("LIMIT_ENTRY_TIMEOUT_SEC", "6"))
+        self.limit_entry_offset_pct = float(os.getenv("LIMIT_ENTRY_OFFSET_PCT", "0.03"))   # ENV=0.03
+        self.limit_entry_timeout_sec = int(os.getenv("LIMIT_ENTRY_TIMEOUT_SEC", "15"))     # ENV=15
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # DEAD PARAMS ACTIVATED — ადრე ENV-ში იყო, კოდი არ კითხულობდა
@@ -915,7 +915,7 @@ class ExecutionEngine:
                         try:
                             from execution.db.repository import get_sl_cooldown_state
                             sl_state = get_sl_cooldown_state()
-                            sl_limit = int(os.getenv("SL_COOLDOWN_AFTER_N", "2"))
+                            sl_limit = int(os.getenv("SL_COOLDOWN_AFTER_N", "3"))   # ENV=3
                             cur_sl   = sl_state["consecutive_sl"]
 
                             # ── ნებისმიერ SL hit-ზე: სხვა სიმბოლოს OCO-ები გაუქმდეს ──
@@ -1535,7 +1535,7 @@ class ExecutionEngine:
         # ელოდება → სანამ execution engine-ი კითხულობს, სხვა trade-ი
         # გაიხსნა → total open >= MAX. ეს check ამ სიტუაციას ხურავს.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        _max_open = int(os.getenv("MAX_OPEN_TRADES", "4"))
+        _max_open = int(os.getenv("MAX_OPEN_TRADES", "2"))   # ENV=2
         if _max_open > 0:
             try:
                 _total_open_now = len(get_all_open_trades() or [])
@@ -1688,7 +1688,7 @@ class ExecutionEngine:
             quote_amount = float(quote_amount)
 
             min_notional = float(self.exchange.get_min_notional(symbol) or 5.0)
-            env_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "5"))
+            env_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "10"))   # ENV=10
 
             balance = float(self.exchange.fetch_balance_free("USDT"))
             risk_pct = float(os.getenv("RISK_PER_TRADE_PCT", "1.0"))
@@ -1766,7 +1766,7 @@ class ExecutionEngine:
                             _kelly_quote = max(min_notional, _kelly_quote)
                             _kelly_quote = min(
                                 _kelly_quote,
-                                float(os.getenv("MAX_QUOTE_PER_TRADE", "15"))
+                                float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))   # ENV=10
                             )
                             if _kelly_quote < quote_amount:
                                 _prev = quote_amount
