@@ -58,22 +58,22 @@ class ExcelLiveCore:
     ENV-based Live Core — Excel dependency ამოღებულია.
 
     წონები (ENV-ით კონფიგურირებადი):
-      WEIGHT_TREND        default=0.25
-      WEIGHT_STRUCTURE    default=0.20
-      WEIGHT_VOLUME       default=0.15
-      WEIGHT_RISK         default=0.15
-      WEIGHT_CONFIDENCE   default=0.15
-      WEIGHT_VOLATILITY   default=0.10
+      WEIGHT_TREND        default=0.30  (ENV=0.30)
+      WEIGHT_STRUCTURE    default=0.20  (ENV=0.20)
+      WEIGHT_VOLUME       default=0.13  (ENV=0.13)
+      WEIGHT_RISK         default=0.15  (ENV=0.15)
+      WEIGHT_CONFIDENCE   default=0.15  (ENV=0.15)
+      WEIGHT_VOLATILITY   default=0.07  (ENV=0.07)
 
     Threshold-ები (ENV-ით კონფიგურირებადი):
-      THRESHOLD_TREND     default=0.60
-      THRESHOLD_VOLUME    default=0.50
-      THRESHOLD_CONF      default=0.64
+      THRESHOLD_TREND     default=0.30  (ENV=0.30)
+      THRESHOLD_VOLUME    default=0.25  (ENV=0.25)
+      THRESHOLD_CONF      default=0.32  (ENV=0.32)
 
     Soft Volume Override:
       ENABLE_SOFT_VOLUME_OVERRIDE  default=true
-      SOFT_VOLUME_AI_MIN           default=0.60
-      SOFT_VOLUME_RELAX            default=0.20
+      SOFT_VOLUME_AI_MIN           default=0.40  (ENV=0.40)
+      SOFT_VOLUME_RELAX            default=0.10  (ENV=0.10)
       SOFT_VOLUME_REQUIRE_VOLBAND  default=false
     """
 
@@ -82,23 +82,24 @@ class ExcelLiveCore:
         # (signal_generator.py-ი კვლავ გადასცემს — უბრალოდ იგნორდება)
 
         # --- წონები Excel-ის WEIGHT_THRESHOLD_MATRIX-იდან ---
-        self.w_trend    = _env_float("WEIGHT_TREND",      0.25)
-        self.w_struct   = _env_float("WEIGHT_STRUCTURE",  0.20)
-        self.w_volconf  = _env_float("WEIGHT_VOLUME",     0.15)
-        self.w_risk     = _env_float("WEIGHT_RISK",       0.15)
-        self.w_conf     = _env_float("WEIGHT_CONFIDENCE", 0.15)
-        self.w_vol      = _env_float("WEIGHT_VOLATILITY", 0.10)
+        # ENV-synced defaults — კოდის default = ENV მნიშვნელობა
+        self.w_trend    = _env_float("WEIGHT_TREND",      0.30)   # ENV=0.30
+        self.w_struct   = _env_float("WEIGHT_STRUCTURE",  0.20)   # ENV=0.20
+        self.w_volconf  = _env_float("WEIGHT_VOLUME",     0.13)   # ENV=0.13
+        self.w_risk     = _env_float("WEIGHT_RISK",       0.15)   # ENV=0.15
+        self.w_conf     = _env_float("WEIGHT_CONFIDENCE", 0.15)   # ENV=0.15
+        self.w_vol      = _env_float("WEIGHT_VOLATILITY", 0.07)   # ENV=0.07
 
-        # --- threshold-ები Excel-ის WEIGHT_THRESHOLD_MATRIX-იდან ---
-        self.th_trend   = _env_float("THRESHOLD_TREND",  0.60)
-        self.th_volume  = _env_float("THRESHOLD_VOLUME", 0.50)
-        self.th_conf    = _env_float("THRESHOLD_CONF",   0.64)
+        # --- threshold-ები ---
+        self.th_trend   = _env_float("THRESHOLD_TREND",  0.30)   # ENV=0.30
+        self.th_volume  = _env_float("THRESHOLD_VOLUME", 0.25)   # ENV=0.25
+        self.th_conf    = _env_float("THRESHOLD_CONF",   0.32)   # ENV=0.32
 
-        # --- AI execute threshold (ENV-ით კონტროლირებადი) ---
-        self.ai_execute_min = _env_float("AI_EXECUTE_MIN_SCORE", 0.55)
+        # --- AI execute threshold ---
+        self.ai_execute_min = _env_float("AI_EXECUTE_MIN_SCORE", 0.40)   # ENV=0.40
         self.enable_soft_volume_override  = _env_bool("ENABLE_SOFT_VOLUME_OVERRIDE", True)
-        self.soft_volume_ai_min           = _env_float("SOFT_VOLUME_AI_MIN",  0.60)
-        self.soft_volume_relax            = _env_float("SOFT_VOLUME_RELAX",   0.20)
+        self.soft_volume_ai_min           = _env_float("SOFT_VOLUME_AI_MIN",  0.40)  # ENV=0.40
+        self.soft_volume_relax            = _env_float("SOFT_VOLUME_RELAX",   0.10)  # ENV=0.10
         self.soft_volume_require_volband  = _env_bool("SOFT_VOLUME_REQUIRE_VOLBAND", False)
 
     def _macro_gate(self, inp: CoreInputs) -> str:
