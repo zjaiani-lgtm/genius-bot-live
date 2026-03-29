@@ -105,7 +105,7 @@ VIRTUAL_START_BALANCE = _env_float("VIRTUAL_START_BALANCE", 100000.0)
 # RISK MANAGEMENT
 # ─────────────────────────────────────────────
 
-MAX_OPEN_TRADES          = _env_int("MAX_OPEN_TRADES",          4)    # SYNC: 5→4
+MAX_OPEN_TRADES          = _env_int("MAX_OPEN_TRADES",          2)    # ENV=2
 MAX_POSITIONS_PER_SYMBOL = _env_int("MAX_POSITIONS_PER_SYMBOL", 1)
 # SYNC: was 25/8 in config.py — signal_generator.py uses 10/3 → align
 MAX_TRADES_PER_DAY       = _env_int("MAX_TRADES_PER_DAY",      10)   # SYNC: 25→10
@@ -122,14 +122,14 @@ MAX_RISK_PER_TRADE_PCT   = _env_float("MAX_RISK_PER_TRADE_PCT", 0.0)
 
 # SYNC: config.py had 1.0 — signal_generator.py uses 1.5 → align to 1.5
 TP_PCT = _env_float("TP_PCT", 1.5)   # SYNC: 1.0→1.5
-SL_PCT = _env_float("SL_PCT", 2.0)   # SYNC: 0.70→2.0
+SL_PCT = _env_float("SL_PCT", 0.80)   # ENV=0.80
 
 ATR_MULT_TP_BULL = _env_float("ATR_MULT_TP_BULL", 4.0)   # SYNC: 3.0→4.0
 ATR_MULT_SL_BULL = _env_float("ATR_MULT_SL_BULL", 2.0)   # SYNC: 1.2→2.0
 
 # SYNC: signal_generator.py=0.10, config.py=0.15, ENV=0.07 → default=0.07
 # LOG: BTC/BNB atr≈0.13-0.14%, old 0.15 factor → min_atr=0.225% BLOCKED everything
-ATR_TO_TP_SANITY_FACTOR = _env_float("ATR_TO_TP_SANITY_FACTOR", 0.07)  # SYNC: 0.15→0.07
+ATR_TO_TP_SANITY_FACTOR = _env_float("ATR_TO_TP_SANITY_FACTOR", 0.08)  # ENV=0.08
 
 USE_PARTIAL_TP   = _env_bool("USE_PARTIAL_TP", "true")
 # SYNC: config.py had 1.5 — signal_generator.py uses 1.0 → align
@@ -137,11 +137,11 @@ PARTIAL_TP1_PCT  = _env_float("PARTIAL_TP1_PCT",  1.0)   # SYNC: 1.5→1.0
 PARTIAL_TP1_SIZE = _env_float("PARTIAL_TP1_SIZE", 0.5)
 
 USE_BREAKEVEN_STOP    = _env_bool("USE_BREAKEVEN_STOP",    "true")
-BREAKEVEN_TRIGGER_PCT = _env_float("BREAKEVEN_TRIGGER_PCT", 0.30)  # SYNC: already 0.3
+BREAKEVEN_TRIGGER_PCT = _env_float("BREAKEVEN_TRIGGER_PCT", 0.48)  # ENV=0.48
 
 # SYNC: config.py had false/0.25 — signal_generator.py uses true/0.35 → align
 TRAILING_STOP_ENABLED  = _env_bool("TRAILING_STOP_ENABLED",  "true")  # SYNC: false→true
-TRAILING_STOP_DISTANCE = _env_float("TRAILING_STOP_DISTANCE", 0.35)   # SYNC: 0.25→0.35
+TRAILING_STOP_DISTANCE = _env_float("TRAILING_STOP_DISTANCE", 0.25)   # ENV=0.25
 
 # SYNC: config.py had 2 — signal_generator.py uses 3 → align
 SL_COOLDOWN_AFTER_N       = _env_int("SL_COOLDOWN_AFTER_N",      3)   # SYNC: 2→3
@@ -149,8 +149,8 @@ SL_COOLDOWN_PAUSE_SECONDS = _env_int("SL_COOLDOWN_PAUSE_SECONDS", 1800)
 SL_LIMIT_GAP_PCT          = _env_float("SL_LIMIT_GAP_PCT",        0.15)
 
 # SYNC: config.py had 0.005/1 — signal_generator.py uses 0.10/3 → align
-RECOVERY_CANDLE_PCT    = _env_float("RECOVERY_CANDLE_PCT",    0.10)  # SYNC: 0.005→0.10
-RECOVERY_GREEN_CANDLES = _env_int("RECOVERY_GREEN_CANDLES",   3)     # SYNC: 1→3
+RECOVERY_CANDLE_PCT    = _env_float("RECOVERY_CANDLE_PCT",    0.05)  # ENV=0.05
+RECOVERY_GREEN_CANDLES = _env_int("RECOVERY_GREEN_CANDLES",   2)     # ENV=2
 
 
 # ─────────────────────────────────────────────
@@ -159,15 +159,15 @@ RECOVERY_GREEN_CANDLES = _env_int("RECOVERY_GREEN_CANDLES",   3)     # SYNC: 1�
 
 # SYNC: was 1.15 in config.py — signal_generator.py uses 1.05 → align
 AI_CONFIDENCE_BOOST      = _env_float("AI_CONFIDENCE_BOOST",    1.05)  # SYNC: 1.15→1.05
-AI_EXECUTE_MIN_SCORE     = _env_float("AI_EXECUTE_MIN_SCORE",   0.32)  # SYNC: 0.55→0.32
+AI_EXECUTE_MIN_SCORE     = _env_float("AI_EXECUTE_MIN_SCORE",   0.40)  # ENV=0.40
 # SYNC: was 0.45 — disabled in ENV (=0) → default 0 = disabled
 AI_SIGNAL_THRESHOLD      = _env_float("AI_SIGNAL_THRESHOLD",    0.0)   # SYNC: 0.45→0 (disabled)
 # SYNC: was true — blocks too aggressively in live market → false
-AI_FILTER_LOW_CONFIDENCE = _env_bool("AI_FILTER_LOW_CONFIDENCE", "false")  # SYNC: true→false
+AI_FILTER_LOW_CONFIDENCE = _env_bool("AI_FILTER_LOW_CONFIDENCE", "true")   # ENV=true
 
 # SYNC: config.py had 0.36/0.30 — signal_generator.py uses 0.32/0.25 → align
-BUY_CONFIDENCE_MIN      = _env_float("BUY_CONFIDENCE_MIN",      0.32)  # SYNC: 0.36→0.32
-BUY_LIQUIDITY_MIN_SCORE = _env_float("BUY_LIQUIDITY_MIN_SCORE", 0.25)  # SYNC: 0.30→0.25
+BUY_CONFIDENCE_MIN      = _env_float("BUY_CONFIDENCE_MIN",      0.46)  # ENV=0.46
+BUY_LIQUIDITY_MIN_SCORE = _env_float("BUY_LIQUIDITY_MIN_SCORE", 0.40)  # ENV=0.40
 
 # FIX GLOBAL-6: THRESHOLD_CONF / THRESHOLD_TREND / THRESHOLD_VOLUME —
 # ეს სამი ცვლადი DEAD CODE-ია: signal_generator.py და execution_engine.py
@@ -184,12 +184,12 @@ THRESHOLD_VOLUME = _env_float("THRESHOLD_VOLUME", 0.25)  # DEAD: alias of BUY_LI
 # signal_generator.py uses 72/58 → align
 RSI_MIN      = _env_int("RSI_MIN",      35)
 RSI_MAX      = _env_int("RSI_MAX",      72)   # SYNC: 70→72
-RSI_SELL_MIN = _env_int("RSI_SELL_MIN", 58)   # SYNC: 75→58
+RSI_SELL_MIN = _env_int("RSI_SELL_MIN", 72)   # ENV=72
 
 MIN_VOLUME_24H = _env_float("MIN_VOLUME_24H", 30_000_000)
 
 MAX_SPREAD_PCT     = _env_float("MAX_SPREAD_PCT",      0.08)
-MIN_MOVE_PCT       = _env_float("MIN_MOVE_PCT",        0.12)  # SYNC: 0.20→0.12 (LOG: ETH blocked)
+MIN_MOVE_PCT       = _env_float("MIN_MOVE_PCT",        0.22)  # ENV=0.22
 # SYNC: config.py had 0.20 — signal_generator.py uses 0.25 → align
 MIN_NET_PROFIT_PCT = _env_float("MIN_NET_PROFIT_PCT",  0.25)  # SYNC: 0.20→0.25
 
@@ -214,13 +214,13 @@ USE_VWAP_FILTER = _env_bool("USE_VWAP_FILTER", "true")
 USE_TIME_FILTER = _env_bool("USE_TIME_FILTER", "true")
 USE_FUNDING_FILTER = _env_bool("USE_FUNDING_FILTER", "true")
 
-ADX_MIN_THRESHOLD = _env_float("ADX_MIN_THRESHOLD", 18.0)
+ADX_MIN_THRESHOLD = _env_float("ADX_MIN_THRESHOLD", 23.0)  # ENV=23
 ADX_PERIOD        = _env_int("ADX_PERIOD", 14)
 
-VWAP_TOLERANCE    = _env_float("VWAP_TOLERANCE", 0.010)  # SYNC: not in old config → add
+VWAP_TOLERANCE    = _env_float("VWAP_TOLERANCE", 0.006)   # ENV=0.006
 
 MACD_SMART_MODE      = _env_bool("MACD_SMART_MODE",      "true")
-MACD_IMPROVING_BARS  = _env_int("MACD_IMPROVING_BARS",   3)
+MACD_IMPROVING_BARS  = _env_int("MACD_IMPROVING_BARS",   4)   # ENV=4
 MACD_HIST_ATR_FACTOR = _env_float("MACD_HIST_ATR_FACTOR", 0.2)
 
 TRADE_HOUR_START_UTC = _env_int("TRADE_HOUR_START_UTC", 7)
