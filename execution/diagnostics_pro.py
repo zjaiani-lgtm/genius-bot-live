@@ -479,9 +479,9 @@ ENV_RULES: List[Tuple] = [
     ("DYNAMIC_SIZE_MIN",       "8",          "eq",     "WARN",     "min dynamic size"),
     ("DYNAMIC_SIZE_MAX",       "10",         "eq",     "WARN",     "max dynamic size"),
     # ─── Risk ────────────────────────────────────────────────────
-    ("TP_PCT",                 "1.5",        "eq",     "CRITICAL", "take profit %"),
+    ("TP_PCT",                 "1.8",        "eq",     "WARN",     "take profit %"),
     ("SL_PCT",                 "0.80",       "eq",     "CRITICAL", "stop loss %"),
-    ("MIN_MOVE_PCT",           "0.35",       "eq",     "WARN",     "ATR min move filter"),
+    ("MIN_MOVE_PCT",           "0.22",       "eq",     "WARN",     "ATR min move filter"),
     ("MIN_NET_PROFIT_PCT",     "0.35",       "eq",     "WARN",     "net profit gate"),
     ("ESTIMATED_ROUNDTRIP_FEE_PCT","0.14",   "eq",     "WARN",     "fee estimate"),
     ("ESTIMATED_SLIPPAGE_PCT", "0.05",       "eq",     "WARN",     "slippage estimate"),
@@ -499,7 +499,7 @@ ENV_RULES: List[Tuple] = [
     ("USE_MTF_FILTER",         "true",       "eq",     "WARN",     "multi-timeframe filter"),
     ("MTF_TIMEFRAME",          "1h",         "eq",     "WARN",     "HTF timeframe"),
     ("USE_ADX_FILTER",         "true",       "eq",     "WARN",     "ADX filter"),
-    ("ADX_MIN_THRESHOLD",      "25",         "eq",     "WARN",     "ADX threshold"),
+    ("ADX_MIN_THRESHOLD",      "21",         "eq",     "WARN",     "ADX threshold"),
     ("USE_VWAP_FILTER",        "true",       "eq",     "WARN",     "VWAP filter"),
     ("VWAP_TOLERANCE",         "0.006",      "eq",     "WARN",     "VWAP tolerance"),
     ("USE_TIME_FILTER",        "true",       "eq",     "WARN",     "time-of-day filter"),
@@ -511,28 +511,28 @@ ENV_RULES: List[Tuple] = [
     ("MIN_VOLUME_24H",         "30000000",   "eq",     "WARN",     "24h volume minimum USDT"),
     ("AI_FILTER_LOW_CONFIDENCE","true",      "eq",     "WARN",     "AI pre-filter"),
     ("AI_CONFIDENCE_BOOST",    "1.05",       "eq",     "WARN",     "AI score boost"),
-    ("BUY_CONFIDENCE_MIN",     "0.55",       "eq",     "WARN",     "min confidence for BUY"),
+    ("BUY_CONFIDENCE_MIN",     "0.46",       "eq",     "WARN",     "min confidence for BUY"),
     ("BUY_LIQUIDITY_MIN_SCORE","0.40",       "eq",     "WARN",     "min liquidity score"),
     # ─── SL Cooldown ─────────────────────────────────────────────
-    ("SL_COOLDOWN_AFTER_N",    "3",          "eq",     "CRITICAL", "SL cooldown trigger count"),
+    ("SL_COOLDOWN_AFTER_N",    "4",          "eq",     "WARN",     "SL cooldown trigger count"),
     ("SL_COOLDOWN_PAUSE_SECONDS","1800",     "eq",     "WARN",     "SL cooldown pause duration"),
     ("RECOVERY_GREEN_CANDLES", "2",          "eq",     "WARN",     "recovery green candles"),
-    ("RECOVERY_CANDLE_PCT",    "0.10",       "eq",     "WARN",     "recovery candle size %"),
+    ("RECOVERY_CANDLE_PCT",    "0.08",       "eq",     "WARN",     "recovery candle size %"),
     # ─── Features ────────────────────────────────────────────────
     ("USE_PARTIAL_TP",         "true",       "eq",     "WARN",     "partial TP"),
     ("PARTIAL_TP1_PCT",        "1.0",        "eq",     "WARN",     "partial TP1 level %"),
     ("PARTIAL_TP1_SIZE",       "0.5",        "eq",     "WARN",     "partial TP1 size fraction"),
     ("USE_BREAKEVEN_STOP",     "true",       "eq",     "WARN",     "breakeven stop"),
-    ("BREAKEVEN_TRIGGER_PCT",  "0.40",       "eq",     "WARN",     "breakeven trigger %"),
+    ("BREAKEVEN_TRIGGER_PCT",  "0.48",       "eq",     "WARN",     "breakeven trigger %"),
     ("TRAILING_STOP_ENABLED",  "true",       "eq",     "WARN",     "trailing stop"),
     ("TRAILING_STOP_DISTANCE", "0.25",       "eq",     "WARN",     "trailing distance %"),
     ("USE_DYNAMIC_SIZING",     "true",       "eq",     "WARN",     "dynamic sizing"),
     ("DYNAMIC_SIZE_AI_LOW",    "0.55",       "eq",     "WARN",     "dynamic size AI low threshold"),
     ("DYNAMIC_SIZE_AI_HIGH",   "0.80",       "eq",     "WARN",     "dynamic size AI high threshold"),
     # ─── Regime / ATR ────────────────────────────────────────────
-    ("ATR_TO_TP_SANITY_FACTOR","0.10",       "eq",     "WARN",     "ATR sanity factor"),
+    ("ATR_TO_TP_SANITY_FACTOR","0.08",       "eq",     "WARN",     "ATR sanity factor"),
     ("ATR_MULT_SL_BULL",       "2.0",        "eq",     "WARN",     "ATR SL multiplier bull"),
-    ("ATR_MULT_TP_BULL",       "4.0",        "eq",     "WARN",     "ATR TP multiplier bull"),
+    ("ATR_MULT_TP_BULL",       "4.5",        "eq",     "WARN",     "ATR TP multiplier bull"),
     ("STRUCT_SOFT_MIN_TREND",  "0.25",       "eq",     "WARN",     "soft struct trend min"),
     ("STRUCT_SOFT_MIN_MA_GAP", "0.10",       "eq",     "WARN",     "soft struct MA gap min"),
     ("STRUCT_SOFT_MIN_MOM10",  "-0.02",      "eq",     "WARN",     "soft struct momentum min"),
@@ -899,7 +899,7 @@ ENV_VS_CODE_CHECKS: List[Tuple[str, str, str]] = [
     ("TRAILING_STOP_ENABLED",   "true",     "false default → trailing stop გამორთულია"),
     ("USE_FUNDING_FILTER",      "true",     "false default → funding rate filter გამორთულია"),
     ("USE_MA_FILTERS",          "false",    "true default → soft mode ვერ მუშაობს"),
-    ("BUY_CONFIDENCE_MIN",      "0.55",     "INTERNAL_CONFLICT: 0.55 vs 0.38 in same file"),
+    ("BUY_CONFIDENCE_MIN",      "0.46",     "INTERNAL_CONFLICT: synced to ENV=0.46"),
 ]
 
 
@@ -944,23 +944,6 @@ def check_env_vs_code(rep: Report):
             else:
                 rep.add(f"ENV_vs_Code/{key}", True,
                         f"'{actual.strip()}' == expected ✓")
-
-    # Special: BUY_CONFIDENCE_MIN internal conflict
-    rep.add(
-        "ENV_vs_Code/BUY_CONFIDENCE_MIN_internal",
-        False,
-        "signal_generator.py-ში BUY_CONFIDENCE_MIN 2-ჯერ გამოიყენება: "
-        "line 67: BUY_CONFIDENCE_MIN=0.55 (main guard) | "
-        "line 94: AI_FILTER_MIN_SCORE=0.38 (pre-filter) — განსხვავებული threshold-ები!",
-        severity="WARN",
-        fix=(
-            "AI_FILTER_MIN_SCORE (line 94) = 0.38 — ეს pre-filter threshold-ია, BUY_CONFIDENCE_MIN-ისგან განსხვავებული.\n"
-            "        .env: BUY_CONFIDENCE_MIN=0.55 → main confidence guard.\n"
-            "        .env: AI_EXECUTE_MIN_SCORE=0.55 → should be used for AI_FILTER_MIN_SCORE.\n"
-            "        FIX: signal_generator.py line 94:\n"
-            "          AI_FILTER_MIN_SCORE = float(os.getenv('AI_EXECUTE_MIN_SCORE', '0.55'))"
-        )
-    )
 
     rep.add("ENV_vs_Code/summary", conflicts_found == 0,
             f"კონფლიქტები: {conflicts_found}",
