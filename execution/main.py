@@ -3,6 +3,17 @@ import time
 import logging
 from typing import Optional, Dict, Any
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# ENV LOADING — python-dotenv
+# override=False → Render ENV პრიორიტეტულია .env-ზე
+# ე.ი. Render-ზე დაყენებული ცვლადი ყოველთვის იმარჯვებს
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+try:
+    from dotenv import load_dotenv
+    load_dotenv("/opt/render/project/src/.env", override=False)
+except ImportError:
+    pass  # python-dotenv არ არის — Render ENV კმარა
+
 from execution.regime_engine import MarketRegimeEngine
 
 from execution.db.db import init_db
