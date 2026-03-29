@@ -317,11 +317,12 @@ class MarketRegimeEngine:
             vol:     backward-compat alias for atr_pct
 
         Detection order (important — first match wins):
-          1. VOLATILE:  atr_pct >= 1.50
-          2. BEAR:      trend <= -0.10
-          3. SIDEWAYS:  trend < 0.30 AND atr_pct <= 0.30 (SIDEWAYS_ATR_MAX × 1.5)
-          4. BULL:      trend >= 0.30 AND atr_pct <= 0.50 (SIDEWAYS_ATR_MAX × 2.5)
-          5. UNCERTAIN: otherwise
+          1. VOLATILE:   atr_pct >= 1.50
+          2. BEAR:       trend <= -0.10
+          3. SIDEWAYS:   trend < 0.30 AND atr_pct <= 0.30
+          4. UNCERTAIN:  trend >= 0.30 AND atr_pct > 0.40  (BULL ტრენდი, მაგრამ მაღალი ვოლატ.)
+          5. BULL:       trend >= 0.30 AND atr_pct <= 0.40
+          6. UNCERTAIN:  otherwise
         """
         if vol is not None and atr_pct == 0.0:
             atr_pct = float(vol)
@@ -335,7 +336,9 @@ class MarketRegimeEngine:
         if trend < _BULL_TREND_MIN and atr_pct <= _SIDEWAYS_ATR_MAX * 1.5:
             return "SIDEWAYS"
 
-        _atr_bull_max = _SIDEWAYS_ATR_MAX * 2.5
+        # FIX: UNCERTAIN — BULL ტრენდი მაგრამ ზედმეტად მაღალი ვოლატილობა
+        # detect_regime(0.3, 0.5) → UNCERTAIN (was BULL — bug)
+        _atr_bull_max = _SIDEWAYS_ATR_MAX * 2.0   # 0.20 × 2.0 = 0.40
         if trend >= _BULL_TREND_MIN and atr_pct <= _atr_bull_max:
             return "BULL"
 
