@@ -1914,7 +1914,13 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                         for i in range(-MACD_IMPROVING_BARS, 0)
                     )
                     # Not in deep downtrend: hist > -ATR × factor
-                    not_deep_bear = macd_hist > -(atrp * MACD_HIST_ATR_FACTOR)
+                    # FIX MACD-UNIT: macd_hist არის price units (e.g. BTC: dollars)
+                    # atrp არის % (e.g. 0.19%). შედარება მოითხოვს ერთ unit-ს.
+                    # atrp_price = last_price × atrp / 100 → price units-ში
+                    # ძველი: -(atrp × factor) = -(0.19 × 0.2) = -0.038 (% units — მცდარი!)
+                    # ახალი: -(last × atrp/100 × factor) = -(66880 × 0.0019 × 0.2) = -25.4 ($ units)
+                    _atrp_price = float(last) * atrp / 100.0
+                    not_deep_bear = macd_hist > -(_atrp_price * MACD_HIST_ATR_FACTOR)
 
                     if improving and not_deep_bear:
                         macd_smart_ok = True
