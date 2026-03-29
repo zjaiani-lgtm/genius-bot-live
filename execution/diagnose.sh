@@ -42,6 +42,13 @@ FILES=(
     "telegram_notifier.py"
     "diagnostics_pro.py"
     "my_adapter.py"
+    "regime_engine.py"
+    "logger.py"
+    "signal_client.py"
+    "startup_sync.py"
+    "performance_report.py"
+    "portfolio_manager.py"
+    "virtual_wallet.py"
 )
 for f in "${FILES[@]}"; do
     path="$BASE/$f"
