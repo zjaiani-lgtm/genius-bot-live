@@ -97,8 +97,7 @@ class Report:
 
         W = 72
         print(f"\n{B}{'─'*W}{RST}")
-        print(f"{B}  GENIUS BOT — სრული დიაგნოსტიკა{RST}")
-        print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{B}  {'─'*4} სრული Pro დიაგნოსტიკა {'─'*4}{RST}")
         print(f"{B}{'─'*W}{RST}\n")
 
         sections = {
