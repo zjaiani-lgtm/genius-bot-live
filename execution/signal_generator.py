@@ -155,6 +155,9 @@ ADX_PERIOD            = int(os.getenv("ADX_PERIOD", "14"))
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_VWAP_FILTER       = os.getenv("USE_VWAP_FILTER", "true").strip().lower() == "true"
 VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.006"))   # ENV=0.006 (synced)
+# VWAP_SESSION_BARS — რამდენი candle გამოიყენოს VWAP გამოთვლაში
+# 96 = 24h (15m × 96). 0 = ყველა candle (ძველი ქცევა)
+VWAP_SESSION_BARS     = int(os.getenv("VWAP_SESSION_BARS", "96"))      # ENV=96
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TIME-OF-DAY Filter — low liquidity session-ების თავიდან არიდება
@@ -250,6 +253,10 @@ _protective_sell_ts: dict  = {}   # {symbol: float} — protective sell cooldown
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # SL COOLDOWN — 2 SL-ის შემდეგ 30 წუთი პაუზა
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SELL_TREND_THRESHOLD — trend რამდენ დაბლა უნდა ჩავარდეს SELL-ის ტრიგერისთვის
+# -0.05 = სუსტი downtrend (default). -0.03 = უფრო მგრძნობიარე, -0.10 = გვიანი გასვლა
+SELL_TREND_THRESHOLD = float(os.getenv("SELL_TREND_THRESHOLD", "-0.05"))  # ENV=-0.05
+
 SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "3"))       # ENV=3
 SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
 RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
@@ -759,13 +766,19 @@ def _vwap(ohlcv: List[List[float]]) -> float:
     Returns VWAP for given candles.
     Typical price = (high + low + close) / 3
     VWAP = Σ(typical × volume) / Σ(volume)
+    VWAP_SESSION_BARS=96 → მხოლოდ ბოლო 96 candle (24h). 0 = ყველა.
     """
     if len(ohlcv) < 2:
         return 0.0
     try:
+        # session bars slicing — 96=24h, 0=ყველა candle
+        if VWAP_SESSION_BARS > 0 and len(ohlcv) > VWAP_SESSION_BARS:
+            candles = ohlcv[-VWAP_SESSION_BARS:]
+        else:
+            candles = ohlcv
         cum_tp_vol = 0.0
         cum_vol    = 0.0
-        for c in ohlcv:
+        for c in candles:
             h, l, cl, v = float(c[2]), float(c[3]), float(c[4]), float(c[5])
             typical = (h + l + cl) / 3.0
             cum_tp_vol += typical * v
@@ -1682,7 +1695,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             # 15m flat ბაზარი: trend oscillates [-0.05..+0.05] — -0.10 UNREACHABLE
             # -0.05 = სუსტი downtrend sufficient for exit protection
             # mom1 -0.002 = მცირე negative momentum — ადრე exit = better SL avoidance
-            sell_triggered = (trend < -0.05 and mom1 < -0.002) or rsi_sell_trigger
+            sell_triggered = (trend < SELL_TREND_THRESHOLD and mom1 < -0.002) or rsi_sell_trigger
 
             if sell_triggered:
                 signal_id = str(uuid.uuid4())
@@ -1736,7 +1749,7 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             if GEN_DEBUG:
                 logger.info(
                     f"[GEN] SELL_NOT_TRIGGERED | symbol={symbol} "
-                    f"trend={trend:.3f} (need<-0.05) mom1={mom1:.4f} (need<-0.002) "
+                    f"trend={trend:.3f} (need<{SELL_TREND_THRESHOLD}) mom1={mom1:.4f} (need<-0.002) "
                     f"rsi={_rsi(closes, RSI_PERIOD):.1f} (sell_min={RSI_SELL_MIN}) "
                     f"→ holding position"
                 )
