@@ -114,6 +114,14 @@ _SL_PCT_FIXED = _ef("SL_PCT", 0.80)
 _SIZE_BULL_PCT      = _ef("REGIME_SIZE_BULL_PCT",      1.00)  # 100% → $10
 _SIZE_UNCERTAIN_PCT = _ef("REGIME_SIZE_UNCERTAIN_PCT", 0.50)  # 50%  → $5 (floor→$8 after clamp)
 
+# QUOTE_SIZE_BULL / QUOTE_SIZE_UNCERTAIN — პირდაპირი USDT ზომა per regime
+# თუ დაყენებულია (>0), REGIME_SIZE_*_PCT გამოთვლას override-ავს
+# QUOTE_SIZE_BULL=10.0 → BULL-ზე ყოველთვის $10
+# QUOTE_SIZE_UNCERTAIN=7.0 → UNCERTAIN-ზე ყოველთვის $7
+# 0 = გამორთული, პროცენტული გამოთვლა გამოიყენება
+_QUOTE_SIZE_BULL      = _ef("QUOTE_SIZE_BULL",      0.0)   # ENV=10.0 (0=disabled)
+_QUOTE_SIZE_UNCERTAIN = _ef("QUOTE_SIZE_UNCERTAIN", 0.0)   # ENV=7.0  (0=disabled)
+
 # ──────────────────────────────────────────────────────────
 # ეტაპი 2: Confidence threshold ადაpტაცია
 # ──────────────────────────────────────────────────────────
@@ -375,18 +383,34 @@ class MarketRegimeEngine:
     @staticmethod
     def _get_quote_size(regime: str, max_quote: float) -> float:
         """
-        Per-regime position sizing (ENV-aligned):
-          BULL:      100% × max_quote  → $10 (REGIME_SIZE_BULL_PCT=1.00)
-          UNCERTAIN: 50%  × max_quote  → $5  (REGIME_SIZE_UNCERTAIN_PCT=0.50)
-          Clamped:   DYNAMIC_SIZE_MIN=8 .. DYNAMIC_SIZE_MAX=10
+        Per-regime position sizing:
+          პირველ რიგში QUOTE_SIZE_BULL / QUOTE_SIZE_UNCERTAIN გამოიყენება (პირდაპირი USDT).
+          თუ 0-ია — REGIME_SIZE_*_PCT × max_quote გამოიყენება (პროცენტული).
+          ყოველთვის DYNAMIC_SIZE_MIN..DYNAMIC_SIZE_MAX-ში ჩაიჭრება.
+
+          BULL:      QUOTE_SIZE_BULL=10.0    → $10
+          UNCERTAIN: QUOTE_SIZE_UNCERTAIN=7.0 → $7
         """
-        pcts = {
-            "BULL":      _SIZE_BULL_PCT,
-            "UNCERTAIN": _SIZE_UNCERTAIN_PCT,
+        # პირდაპირი USDT ზომა (QUOTE_SIZE_BULL/UNCERTAIN)
+        direct = {
+            "BULL":      _QUOTE_SIZE_BULL,
+            "UNCERTAIN": _QUOTE_SIZE_UNCERTAIN,
         }
-        pct = pcts.get(regime, _SIZE_UNCERTAIN_PCT)
-        size = round(max_quote * pct, 2)
-        # FIX-RE-12: ENV=DYNAMIC_SIZE_MIN=8, DYNAMIC_SIZE_MAX=10 (was 5/15)
+        direct_val = direct.get(regime, 0.0)
+
+        if direct_val > 0:
+            # პირდაპირი მნიშვნელობა — ENV QUOTE_SIZE_* გამოიყენება
+            size = round(direct_val, 2)
+        else:
+            # პროცენტული fallback — REGIME_SIZE_*_PCT × max_quote
+            pcts = {
+                "BULL":      _SIZE_BULL_PCT,
+                "UNCERTAIN": _SIZE_UNCERTAIN_PCT,
+            }
+            pct = pcts.get(regime, _SIZE_UNCERTAIN_PCT)
+            size = round(max_quote * pct, 2)
+
+        # ყოველთვის DYNAMIC_SIZE_MIN..DYNAMIC_SIZE_MAX-ში
         size = max(
             _ef("DYNAMIC_SIZE_MIN", 8.0),
             min(_ef("DYNAMIC_SIZE_MAX", 10.0), size)
