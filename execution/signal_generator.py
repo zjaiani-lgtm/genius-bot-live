@@ -163,8 +163,8 @@ VWAP_TOLERANCE        = float(os.getenv("VWAP_TOLERANCE", "0.006"))   # ENV=0.00
 # (22:00-07:00 UTC = Asia low liquidity + wide spreads)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_TIME_FILTER       = os.getenv("USE_TIME_FILTER", "true").strip().lower() == "true"
-TRADE_HOUR_START_UTC  = int(os.getenv("TRADE_HOUR_START_UTC", "7"))
-TRADE_HOUR_END_UTC    = int(os.getenv("TRADE_HOUR_END_UTC", "22"))
+TRADE_HOUR_START_UTC  = int(os.getenv("TRADE_HOUR_START_UTC", "8"))
+TRADE_HOUR_END_UTC    = int(os.getenv("TRADE_HOUR_END_UTC", "3"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FUNDING RATE FILTER (Binance Futures)
