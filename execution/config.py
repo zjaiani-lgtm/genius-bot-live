@@ -81,8 +81,8 @@ BOT_CANDLE_LIMIT = _env_int("BOT_CANDLE_LIMIT", 300)
 # SYNC: was 15.0 in config.py — signal_generator.py uses 10 → ENV=10 → aligned to 10
 BOT_QUOTE_PER_TRADE  = _env_float("BOT_QUOTE_PER_TRADE",  10.0)   # SYNC: 15→10
 MAX_QUOTE_PER_TRADE  = _env_float("MAX_QUOTE_PER_TRADE",  10.0)   # SYNC: 15→10
-QUOTE_SIZE_BULL      = _env_float("QUOTE_SIZE_BULL",      10.0)   # SYNC: 15→10
-QUOTE_SIZE_UNCERTAIN = _env_float("QUOTE_SIZE_UNCERTAIN",  7.0)
+QUOTE_SIZE_BULL      = _env_float("QUOTE_SIZE_BULL",      10.0)   # BULL regime-ზე პირდაპირი USDT ზომა
+QUOTE_SIZE_UNCERTAIN = _env_float("QUOTE_SIZE_UNCERTAIN",  7.0)    # UNCERTAIN regime-ზე პირდაპირი USDT ზომა
 BOT_POSITION_SIZE    = _env_float("BOT_POSITION_SIZE",     0.0)
 
 CAPITAL_USAGE_MAX      = _env_float("CAPITAL_USAGE_MAX",      0.80)
@@ -218,6 +218,7 @@ ADX_MIN_THRESHOLD = _env_float("ADX_MIN_THRESHOLD", 23.0)  # ENV=23
 ADX_PERIOD        = _env_int("ADX_PERIOD", 14)
 
 VWAP_TOLERANCE    = _env_float("VWAP_TOLERANCE", 0.006)   # ENV=0.006
+VWAP_SESSION_BARS = _env_int("VWAP_SESSION_BARS", 96)      # ENV=96 (24h window)
 
 MACD_SMART_MODE      = _env_bool("MACD_SMART_MODE",      "true")
 MACD_IMPROVING_BARS  = _env_int("MACD_IMPROVING_BARS",   4)   # ENV=4
@@ -283,6 +284,7 @@ ORDER_RETRY_DELAY_MS = _env_int("ORDER_RETRY_DELAY_MS", 400)
 ESTIMATED_ROUNDTRIP_FEE_PCT = _env_float("ESTIMATED_ROUNDTRIP_FEE_PCT", 0.14)
 ESTIMATED_SLIPPAGE_PCT      = _env_float("ESTIMATED_SLIPPAGE_PCT",      0.05)
 
+SELL_TREND_THRESHOLD = _env_float("SELL_TREND_THRESHOLD", -0.05)  # ENV=-0.05
 SELL_BUFFER       = _env_float("SELL_BUFFER",       0.999)
 SELL_RETRY_BUFFER = _env_float("SELL_RETRY_BUFFER", 0.998)
 
