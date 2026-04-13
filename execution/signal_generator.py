@@ -279,6 +279,40 @@ PAIRS_MIN_LEAD_MOVE_PCT    = float(os.getenv("PAIRS_MIN_LEAD_MOVE_PCT", "0.3"))
 _pairs_addon_last_ts: float = 0.0          # ბოლო PAIRS_ADDON emit timestamp
 _pairs_ratio_history: List[float] = []     # rolling BTC/ETH ratio window
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# #TIME_BASED_TP — სკალპ ბოტის TP დროის მიხედვით
+#
+# სუპერმარკეტის ანალოგია:
+#   ღამით (Asia) → მყიდველი ცოტაა → პური ნელა იყიდება
+#   → TP უფრო ახლოს დავდოთ → სწრაფი პატარა მოგება
+#
+#   დღისით (London/NY) → მყიდველი ბევრია → ფასი სწრაფად ززის
+#   → TP ნორმალური → მეტი მოგება ერთ trade-ზე
+#
+# UTC სესიები:
+#   ASIA_FLAT  00:00-07:59 UTC → TP_PCT × 0.75 (0.55% → 0.41%)
+#   LONDON     08:00-12:59 UTC → TP_PCT × 1.00 (ნორმა)
+#   NY_OPEN    13:00-16:59 UTC → TP_PCT × 1.10 (0.55% → 0.60%)
+#   OVERLAP    17:00-20:59 UTC → TP_PCT × 1.00 (ნორმა)
+#   EVENING    21:00-23:59 UTC → TP_PCT × 0.85 (0.55% → 0.47%)
+#
+# ENV:
+#   TIME_BASED_TP_ENABLED=true  → ჩართვა (default: false — უსაფრთხო)
+#   TIME_TP_ASIA_MULT=0.75      → Asia flat multiplier
+#   TIME_TP_LONDON_MULT=1.00    → London multiplier
+#   TIME_TP_NY_MULT=1.10        → NY Open multiplier
+#   TIME_TP_EVENING_MULT=0.85   → Evening multiplier
+#   TIME_TP_MIN_PCT=0.30        → მინიმალური TP (fee-ს ფარავს)
+#   TIME_TP_MAX_PCT=1.00        → მაქსიმალური TP (cascade-ს ვერ ეცილება)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TIME_BASED_TP_ENABLED  = os.getenv("TIME_BASED_TP_ENABLED", "false").strip().lower() == "true"
+TIME_TP_ASIA_MULT      = float(os.getenv("TIME_TP_ASIA_MULT",    "0.75"))
+TIME_TP_LONDON_MULT    = float(os.getenv("TIME_TP_LONDON_MULT",  "1.00"))
+TIME_TP_NY_MULT        = float(os.getenv("TIME_TP_NY_MULT",      "1.10"))
+TIME_TP_EVENING_MULT   = float(os.getenv("TIME_TP_EVENING_MULT", "0.85"))
+TIME_TP_MIN_PCT        = float(os.getenv("TIME_TP_MIN_PCT",      "0.30"))
+TIME_TP_MAX_PCT        = float(os.getenv("TIME_TP_MAX_PCT",      "1.00"))
+
 _last_emit_ts: float = 0.0
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1258,6 +1292,37 @@ def _mtf_trend_ok(symbol: str) -> Tuple[bool, str, str]:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #4 Dynamic position sizing
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _time_based_tp_mult() -> Tuple[float, str]:
+    """
+    UTC საათის მიხედვით TP multiplier.
+
+    სუპერმარკეტის ლოგიკა:
+      Asia flat  (00-08): მყიდველი ცოტაა → TP ახლოს → სწრაფი exit
+      London     (08-13): ნორმა
+      NY Open    (13-17): ყველაზე აქტიური → TP შორს → მეტი მოგება
+      Overlap    (17-21): ნორმა
+      Evening    (21-24): volume ეცემა → TP ახლოს
+
+    Returns:
+        (multiplier, session_name)
+    """
+    if not TIME_BASED_TP_ENABLED:
+        return 1.0, "DISABLED"
+
+    utc_hour = datetime.utcnow().hour
+
+    if 0 <= utc_hour < 8:
+        return TIME_TP_ASIA_MULT, "ASIA_FLAT"
+    elif 8 <= utc_hour < 13:
+        return TIME_TP_LONDON_MULT, "LONDON"
+    elif 13 <= utc_hour < 17:
+        return TIME_TP_NY_MULT, "NY_OPEN"
+    elif 17 <= utc_hour < 21:
+        return TIME_TP_LONDON_MULT, "OVERLAP"
+    else:
+        return TIME_TP_EVENING_MULT, "EVENING"
+
+
 def _dynamic_quote_size(ai_score: float, base: float) -> float:
     """
     ai_score → quote size:
@@ -2388,6 +2453,31 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             ml, ms, mh = _macd(closes, MACD_FAST, MACD_SLOW, MACD_SIGNAL_PERIOD)
             macd_meta = {"macd": round(ml, 6), "signal": round(ms, 6), "hist": round(mh, 6)}
 
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # #TIME_BASED_TP — UTC session-ის მიხედვით TP_PCT კორექცია.
+        # regime adaptive["TP_PCT"]-ს multiplier-ით ვამრავლებთ.
+        # მაგ: BULL regime TP=0.55%, NY_OPEN mult=1.10 → TP=0.605%
+        #      BULL regime TP=0.55%, ASIA_FLAT mult=0.75 → TP=0.41%
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        _time_mult, _session = _time_based_tp_mult()
+        _base_tp = adaptive["TP_PCT"]
+        if TIME_BASED_TP_ENABLED and _time_mult != 1.0:
+            _adjusted_tp = round(_base_tp * _time_mult, 4)
+            _adjusted_tp = max(TIME_TP_MIN_PCT, min(TIME_TP_MAX_PCT, _adjusted_tp))
+            adaptive["TP_PCT"] = _adjusted_tp
+            if GEN_DEBUG:
+                logger.info(
+                    f"[TIME_TP] {_session} | symbol={symbol} "
+                    f"base_tp={_base_tp:.3f}% × {_time_mult} "
+                    f"→ tp={_adjusted_tp:.3f}%"
+                )
+        else:
+            if GEN_DEBUG and TIME_BASED_TP_ENABLED:
+                logger.info(
+                    f"[TIME_TP] {_session} | symbol={symbol} "
+                    f"tp={_base_tp:.3f}% (no change)"
+                )
+
         sig = {
             "signal_id": signal_id,
             "ts_utc": _now_utc_iso(),
@@ -2405,8 +2495,10 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 "macd":    macd_meta,
                 "ai_score": ai_for_sizing,
                 "mtf_tf":  MTF_TIMEFRAME if USE_MTF_FILTER else None,
-                "mtf_alignment": adaptive.get("MTF_ALIGNMENT"),   # GAP-1: STRONG/WEAK/DIVERGE/N/A
-                "mtf_confirmed": adaptive.get("MTF_CONFIRMED"),   # GAP-1: bool
+                "mtf_alignment": adaptive.get("MTF_ALIGNMENT"),
+                "mtf_confirmed": adaptive.get("MTF_CONFIRMED"),
+                "session":       _session,
+                "time_tp_mult":  _time_mult,
             },
             "execution": {
                 "symbol":       symbol,
