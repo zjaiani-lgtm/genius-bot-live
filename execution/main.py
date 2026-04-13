@@ -522,6 +522,15 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
             logger.warning(f"[DCA] POSITION_LOOP_ERR | {sym} id={pos_id} err={e}")
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX #9 REAL: LAYER2 Cooldown — global timestamp (CHANGELOG-ში
+# წერია "გამოსწორება: _LAST_L2_TS", მაგრამ ცვლადი არ არსებობდა).
+# _LAST_L2_TS: ბოლო ნებისმიერი Layer2 გახსნის unix timestamp.
+# LAYER2_COOLDOWN_SECONDS=180 → 3 წუთი BTC/ETH/BNB-ს შორის.
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_LAST_L2_TS: float = 0.0
+
+
 def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
     """
     Layer 2 — Crash Detection & Parallel Trading.
@@ -542,6 +551,17 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
 
     # Layer 2 ჩართულია?
     if not os.getenv("LAYER2_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
+        return
+
+    # FIX #9 REAL: cooldown — BTC/ETH/BNB ერთდროულად trigger → $36 ერთ loop-ში
+    global _LAST_L2_TS
+    import time as _l2_time
+    _l2_cooldown = int(os.getenv("LAYER2_COOLDOWN_SECONDS", "180"))
+    _l2_elapsed  = _l2_time.time() - _LAST_L2_TS
+    if _l2_elapsed < _l2_cooldown:
+        logger.debug(
+            f"[LAYER2] GLOBAL_COOLDOWN | remaining={int(_l2_cooldown - _l2_elapsed)}s → skip"
+        )
         return
 
     from execution.db.repository import (
@@ -712,6 +732,8 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 f"[LAYER2] OPENED | {sym_l2} entry={buy_price:.4f} "
                 f"tp={tp_price:.4f} qty={buy_qty:.6f}"
             )
+            # FIX #9 REAL: cooldown timestamp განახლება — შემდეგი symbol skip-ავს
+            _LAST_L2_TS = _l2_time.time()
 
         except Exception as e:
             logger.error(f"[LAYER2] ERR | {sym} err={e}")
@@ -969,13 +991,19 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                     logger.warning(f"[CASCADE] TG_SELL_FAIL | err={_tg_sell}")
 
                 # ── C: DAILY LOSS TRACKING ────────────────────────────
-                # CASCADE pnl_quote < 0 → დღის ზარალში ვამატებთ
+                # FIX BUG#3: _daily_loss_total main()-ის scope-ში იყო →
+                # UnboundLocalError inner function-ში.
+                # გამოსწორება: DB audit_log-ში ვწერთ (restart-safe),
+                # main() loop-ი ამ event-ებს კითხულობს daily sum-ისთვის.
                 if pnl_quote < 0:
                     try:
-                        _daily_loss_total += pnl_quote
+                        log_event(
+                            "CASCADE_LOSS",
+                            f"sym={oldest_sym} pnl={pnl_quote:.4f}"
+                        )
                         logger.info(
-                            f"[DAILY_LOSS] {sym} pnl={pnl_quote:+.4f} "
-                            f"daily_total={_daily_loss_total:.4f} limit={daily_max_loss}"
+                            f"[DAILY_LOSS] CASCADE | {oldest_sym} "
+                            f"pnl={pnl_quote:+.4f} (logged to DB)"
                         )
                     except Exception:
                         pass
@@ -1384,12 +1412,35 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # C: DAILY LOSS — დღის reset შემოწმება
+            # FIX BUG#3: _daily_loss_total ახლა DB CASCADE_LOSS events-დანაც
+            # ივსება (inner function scope bug გამოსწორება).
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _today = _now_dt().date().isoformat()
             if _today != _daily_loss_date:
                 _daily_loss_date = _today
                 _daily_loss_total = 0.0
                 logger.info(f"DAILY_LOSS_RESET | date={_today} limit={daily_max_loss}")
+
+            # CASCADE_LOSS events DB-დან — inner function scope fix
+            try:
+                from execution.db.repository import _fetchall
+                _cascade_losses = _fetchall(
+                    "SELECT message FROM audit_log WHERE event_type='CASCADE_LOSS' "
+                    "AND created_at >= date('now') ORDER BY id DESC LIMIT 50"
+                )
+                _cascade_total = 0.0
+                for _row in (_cascade_losses or []):
+                    try:
+                        import re as _re_loss
+                        _m = _re_loss.search(r'pnl=([+-]?\d+\.\d+)', str(_row[0]))
+                        if _m:
+                            _cascade_total += float(_m.group(1))
+                    except Exception:
+                        pass
+                if _cascade_total < 0:
+                    _daily_loss_total += _cascade_total
+            except Exception:
+                pass
 
             # DAILY LOSS LIMIT — limit-ს გადაცდა → skip ვაჭრობა
             if daily_max_loss > 0 and _daily_loss_total <= -daily_max_loss:
@@ -1533,6 +1584,89 @@ def main():
 
                     elif verdict == "TRADE":
                         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        # PAIRS_ADDON — BTC/ETH კორელაციური ADD-ON
+                        # signal_type="PAIRS_ADDON" → ADD-ON ლოგიკა:
+                        #   ახალი position კი არა, არსებული ETH position-ის
+                        #   avg-ს ვამცირებთ $12 ADD-ON-ით.
+                        #   dca_position_manager-ი ჩვეულებრივ ამუშავებს.
+                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                        if sig.get("signal_type") == "PAIRS_ADDON":
+                            _pa_sym = str((sig.get("execution") or {}).get("symbol", ""))
+                            logger.info(
+                                f"[PAIRS_ADDON] trigger | lag={_pa_sym} "
+                                f"z={sig.get('meta', {}).get('z_score', '?')} "
+                                f"lead_move={sig.get('meta', {}).get('lead_move_pct', '?')}%"
+                            )
+                            if engine.exchange is None and _dca_enabled and _pa_sym:
+                                # DEMO: ADD-ON ვირტუალური შესრულება
+                                try:
+                                    from execution.db.repository import (
+                                        get_open_dca_position_for_symbol,
+                                        update_dca_position_after_addon,
+                                        add_dca_order,
+                                    )
+                                    from execution.dca_position_manager import recalculate_average
+                                    _pa_pos = get_open_dca_position_for_symbol(_pa_sym)
+                                    if _pa_pos:
+                                        _pa_price = _price_cache.get(_pa_sym, 0.0)
+                                        if _pa_price <= 0:
+                                            _pa_t = engine.price_feed.fetch_ticker(_pa_sym)
+                                            _pa_price = float(_pa_t.get("last") or 0.0)
+                                        if _pa_price > 0:
+                                            _pa_quote  = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
+                                            _pa_qty    = _pa_quote / _pa_price
+                                            _pa_avg_old = float(_pa_pos["avg_entry_price"] or 0)
+                                            _pa_tot_qty = float(_pa_pos["total_qty"] or 0)
+                                            _pa_tot_q   = float(_pa_pos["total_quote_spent"] or 0)
+                                            _pa_addons  = int(_pa_pos["add_on_count"] or 0)
+
+                                            _pa_avg_res = recalculate_average(
+                                                _pa_tot_qty, _pa_avg_old, _pa_qty, _pa_price
+                                            )
+                                            _pa_new_avg = _pa_avg_res["avg_entry_price"]
+                                            _pa_new_qty = _pa_avg_res["total_qty"]
+                                            _pa_tp_pct  = float(os.getenv("DCA_TP_PCT", "0.55"))
+                                            _pa_new_tp  = round(_pa_new_avg * (1.0 + _pa_tp_pct / 100.0), 6)
+
+                                            update_dca_position_after_addon(
+                                                _pa_pos["id"],
+                                                new_avg_entry=_pa_new_avg,
+                                                new_total_qty=_pa_new_qty,
+                                                new_total_quote=_pa_tot_q + _pa_quote,
+                                                new_add_on_count=_pa_addons + 1,
+                                                new_tp_price=_pa_new_tp,
+                                                new_sl_price=0.0,
+                                                last_add_on_ts=time.time(),
+                                            )
+                                            add_dca_order(
+                                                position_id=_pa_pos["id"],
+                                                symbol=_pa_sym,
+                                                order_type="PAIRS_ADDON",
+                                                entry_price=_pa_price,
+                                                qty=_pa_qty,
+                                                quote_spent=_pa_quote,
+                                                avg_entry_after=_pa_new_avg,
+                                                tp_after=_pa_new_tp,
+                                                sl_after=0.0,
+                                                trigger_drawdown_pct=0.0,
+                                                exchange_order_id="",
+                                            )
+                                            logger.info(
+                                                f"[PAIRS_ADDON] DEMO_EXECUTED | {_pa_sym} "
+                                                f"price={_pa_price:.4f} new_avg={_pa_new_avg:.4f} "
+                                                f"new_tp={_pa_new_tp:.4f} addon#{_pa_addons+1}"
+                                            )
+                                    else:
+                                        logger.info(
+                                            f"[PAIRS_ADDON] NO_OPEN_POS | {_pa_sym} → skip"
+                                        )
+                                except Exception as _pa_err:
+                                    logger.warning(f"[PAIRS_ADDON] EXEC_FAIL | err={_pa_err}")
+                            # PAIRS_ADDON → signal handled, არ გავგრძელდეთ ჩვეულებრივ TRADE path-ზე
+                            pass
+
+                        else:
+                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                         # GAP-2 FIX: main.py-ი აღარ ახდენს TP/SL-ის recalc-ს.
                         # signal_generator-მა უკვე გაითვლა adaptive (TP/SL + MTF bonus)
                         # და sig["adaptive"]-ში ჩაწერა.
@@ -1540,73 +1674,73 @@ def main():
                         # თუ სიგნალის emit-სა და execution-ს შორის (20 წამი)
                         # ბაზარი BEAR/VOLATILE/SIDEWAYS-ად გადაბრუნდა → ბლოკავს.
                         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        trend   = float(sig.get("trend",     0) or 0)
-                        atr_pct = float(sig.get("atr_pct",   0) or 0)
-                        symbol  = str((sig.get("execution") or {}).get("symbol", ""))
+                          trend   = float(sig.get("trend",     0) or 0)
+                          atr_pct = float(sig.get("atr_pct",   0) or 0)
+                          symbol  = str((sig.get("execution") or {}).get("symbol", ""))
 
-                        regime  = regime_engine.detect_regime(trend=trend, atr_pct=atr_pct)
+                          regime  = regime_engine.detect_regime(trend=trend, atr_pct=atr_pct)
 
-                        # DCA MODE: regime block გათიშულია — ვაჭრობა ყველა რეჟიმში
-                        # if regime in ("BEAR", "VOLATILE", "SIDEWAYS"): → disabled
-                        logger.info(f"[AUTO] regime={regime} trend={trend:.3f} atr={atr_pct:.3f} → DCA mode, no block")
+                          # DCA MODE: regime block გათიშულია — ვაჭრობა ყველა რეჟიმში
+                          # if regime in ("BEAR", "VOLATILE", "SIDEWAYS"): → disabled
+                          logger.info(f"[AUTO] regime={regime} trend={trend:.3f} atr={atr_pct:.3f} → DCA mode, no block")
 
-                        logger.info(
-                            f"[AUTO] Regime={regime} trend={trend:.3f} "
-                            f"atr_pct={atr_pct:.3f} symbol={symbol} "
-                            f"TP={sig.get('adaptive', {}).get('TP_PCT', 'n/a')}% "
-                            f"SL={sig.get('adaptive', {}).get('SL_PCT', 'n/a')}% "
-                            f"mtf={sig.get('meta', {}).get('mtf_alignment', 'N/A')} "
-                            f"| id={signal_id}"
-                        )
+                          logger.info(
+                              f"[AUTO] Regime={regime} trend={trend:.3f} "
+                              f"atr_pct={atr_pct:.3f} symbol={symbol} "
+                              f"TP={sig.get('adaptive', {}).get('TP_PCT', 'n/a')}% "
+                              f"SL={sig.get('adaptive', {}).get('SL_PCT', 'n/a')}% "
+                              f"mtf={sig.get('meta', {}).get('mtf_alignment', 'N/A')} "
+                              f"| id={signal_id}"
+                          )
 
-                        engine.execute_signal(sig)
+                          engine.execute_signal(sig)
 
-                        # ── DEMO: DCA position გახსნა ──────────────────
-                        if engine.exchange is None and _dca_enabled:
-                            try:
-                                from execution.db.repository import (
-                                    open_dca_position, add_dca_order, open_trade,
-                                    get_open_dca_position_for_symbol
-                                )
-                                _sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
-                                _existing = get_open_dca_position_for_symbol(_sym)
-                                if not _existing:
-                                    _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
-                                    _price = _price_cache.get(_sym, 0.0)
-                                    if _price <= 0:
-                                        _t = engine.price_feed.fetch_ticker(_sym)
-                                        _price = float(_t.get("last") or 0.0)
-                                    if _price > 0:
-                                        _qty = _quote / _price
-                                        _tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
-                                        _tp = round(_price * (1.0 + _tp_pct / 100.0), 6)
-                                        _pos_id = open_dca_position(
-                                            symbol=_sym,
-                                            initial_entry_price=_price,
-                                            initial_qty=_qty,
-                                            initial_quote_spent=_quote,
-                                            tp_price=_tp,
-                                            sl_price=0.0,
-                                            tp_pct=_tp_pct,
-                                            sl_pct=999.0,
-                                            max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "1")),
-                                            max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),
-                                            max_drawdown_pct=999.0,
-                                        )
-                                        open_trade(
-                                            signal_id=signal_id,
-                                            symbol=_sym,
-                                            qty=_qty,
-                                            quote_in=_quote,
-                                            entry_price=_price,
-                                        )
-                                        logger.info(
-                                            f"[DEMO] DCA_OPENED | {_sym} "
-                                            f"price={_price:.4f} qty={_qty:.6f} "
-                                            f"tp={_tp:.4f} quote={_quote}"
-                                        )
-                            except Exception as _de:
-                                logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
+                          # ── DEMO: DCA position გახსნა ──────────────────
+                          if engine.exchange is None and _dca_enabled:
+                              try:
+                                  from execution.db.repository import (
+                                      open_dca_position, add_dca_order, open_trade,
+                                      get_open_dca_position_for_symbol
+                                  )
+                                  _sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
+                                  _existing = get_open_dca_position_for_symbol(_sym)
+                                  if not _existing:
+                                      _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
+                                      _price = _price_cache.get(_sym, 0.0)
+                                      if _price <= 0:
+                                          _t = engine.price_feed.fetch_ticker(_sym)
+                                          _price = float(_t.get("last") or 0.0)
+                                      if _price > 0:
+                                          _qty = _quote / _price
+                                          _tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
+                                          _tp = round(_price * (1.0 + _tp_pct / 100.0), 6)
+                                          _pos_id = open_dca_position(
+                                              symbol=_sym,
+                                              initial_entry_price=_price,
+                                              initial_qty=_qty,
+                                              initial_quote_spent=_quote,
+                                              tp_price=_tp,
+                                              sl_price=0.0,
+                                              tp_pct=_tp_pct,
+                                              sl_pct=999.0,
+                                              max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "1")),
+                                              max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),
+                                              max_drawdown_pct=999.0,
+                                          )
+                                          open_trade(
+                                              signal_id=signal_id,
+                                              symbol=_sym,
+                                              qty=_qty,
+                                              quote_in=_quote,
+                                              entry_price=_price,
+                                          )
+                                          logger.info(
+                                              f"[DEMO] DCA_OPENED | {_sym} "
+                                              f"price={_price:.4f} qty={_qty:.6f} "
+                                              f"tp={_tp:.4f} quote={_quote}"
+                                          )
+                              except Exception as _de:
+                                  logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
 
                     else:
                         # HOLD ან სხვა — უბრალოდ log
