@@ -219,9 +219,14 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
         is_layer2 = sym != exchange_sym  # True თუ რაიმე suffix აქვს
 
         try:
-            # current price
+            # current price — DEMO: price_feed, LIVE: exchange
             try:
-                current_price = engine.exchange.fetch_last_price(exchange_sym)
+                if engine.exchange is not None:
+                    current_price = engine.exchange.fetch_last_price(exchange_sym)
+                else:
+                    # DEMO mode — public API, key არ სჭირდება
+                    _ticker = engine.price_feed.fetch_ticker(exchange_sym)
+                    current_price = float(_ticker.get("last") or 0.0)
                 current_price = float(current_price) if current_price else 0.0
             except Exception as _pe:
                 logger.warning(f"[DCA] PRICE_FETCH_ERR | {sym} err={_pe}")
@@ -248,10 +253,17 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
             if tp_price > 0 and current_price >= tp_price:
                 logger.info(f"[DCA] TP_HIT | {sym} price={current_price:.4f} >= tp={tp_price:.4f}")
                 try:
-                    sell = engine.exchange.place_market_sell(exchange_sym, total_qty)
-                    exit_price = float(sell.get("average") or sell.get("price") or current_price)
-                    pnl_quote = (exit_price - avg_entry) * total_qty
-                    pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
+                    # DEMO: ვირტუალური გაყიდვა
+                    if engine.exchange is None:
+                        exit_price = current_price
+                        pnl_quote = (exit_price - avg_entry) * total_qty
+                        pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
+                        sell = {"average": exit_price, "price": exit_price}
+                    else:
+                        sell = engine.exchange.place_market_sell(exchange_sym, total_qty)
+                        exit_price = float(sell.get("average") or sell.get("price") or current_price)
+                        pnl_quote = (exit_price - avg_entry) * total_qty
+                        pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
 
                     # ── dca_positions დახურვა ──────────────────────────
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "TP")
@@ -295,8 +307,12 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
             if force_close:
                 logger.warning(f"[DCA] FORCE_CLOSE | {sym} reason={fc_reason}")
                 try:
-                    sell = engine.exchange.place_market_sell(exchange_sym, total_qty)
-                    exit_price = float(sell.get("average") or sell.get("price") or current_price)
+                    if engine.exchange is None:
+                        exit_price = current_price
+                        sell = {"average": exit_price, "price": exit_price}
+                    else:
+                        sell = engine.exchange.place_market_sell(exchange_sym, total_qty)
+                        exit_price = float(sell.get("average") or sell.get("price") or current_price)
                     pnl_quote = (exit_price - avg_entry) * total_qty
                     pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
 
@@ -345,8 +361,12 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
                 if sl_confirmed:
                     logger.info(f"[DCA] SL_CONFIRMED | {sym} reason={sl_reason}")
                     try:
-                        sell = engine.exchange.place_market_sell(exchange_sym, total_qty)
-                        exit_price = float(sell.get("average") or sell.get("price") or current_price)
+                        if engine.exchange is None:
+                            exit_price = current_price
+                            sell = {"average": exit_price, "price": exit_price}
+                        else:
+                            sell = engine.exchange.place_market_sell(exchange_sym, total_qty)
+                            exit_price = float(sell.get("average") or sell.get("price") or current_price)
                         pnl_quote = (exit_price - avg_entry) * total_qty
                         pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
 
@@ -424,10 +444,16 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
 
             try:
                 # FIX #4: exchange_sym გამოიყენება (არა sym) — Binance "BTC/USDT_L2"-ს არ იცნობს
-                buy = engine.exchange.place_market_buy_by_quote(exchange_sym, addon_size)
-                buy_price = float(buy.get("average") or buy.get("price") or current_price)
-                # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
-                buy_qty   = float(buy.get("filled") or buy.get("amount") or (addon_size / buy_price))
+                # DEMO: ვირტუალური ყიდვა
+                if engine.exchange is None:
+                    buy_price = current_price
+                    buy_qty   = addon_size / buy_price
+                    buy = {"average": buy_price, "price": buy_price, "filled": buy_qty}
+                else:
+                    buy = engine.exchange.place_market_buy_by_quote(exchange_sym, addon_size)
+                    buy_price = float(buy.get("average") or buy.get("price") or current_price)
+                    # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
+                    buy_qty   = float(buy.get("filled") or buy.get("amount") or (addon_size / buy_price))
 
                 avg_result = recalculate_average(total_qty, avg_entry, buy_qty, buy_price)
                 new_avg    = avg_result["avg_entry_price"]
@@ -533,18 +559,25 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
     tp_pct      = float(os.getenv("DCA_TP_PCT", "0.55"))
     buffer      = float(os.getenv("SMART_ADDON_BUFFER", "5.0"))
 
-    # USDT ბალანსი
+    # USDT ბალანსი — DEMO: ვირტუალური $120
     try:
-        free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
+        if engine.exchange is not None:
+            free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
+        else:
+            free_usdt = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
     except Exception as _e:
         logger.warning(f"[LAYER2] balance_fetch_fail | err={_e}")
-        return
+        free_usdt = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
 
     for sym in symbols:
         exchange_sym = sym  # Layer2: symbols სუფთაა (_L2 suffix არ აქვს)
         try:
-            # current price
-            current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
+            # current price — DEMO: price_feed
+            if engine.exchange is not None:
+                current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
+            else:
+                _t = engine.price_feed.fetch_ticker(exchange_sym)
+                current_price = float(_t.get("last") or 0.0)
             if current_price <= 0:
                 continue
 
@@ -595,11 +628,16 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 f"drop={drop_from_high:.2f}% >= {drop_pct:.1f}% → opening Layer 2"
             )
 
-            # ყიდვა
-            buy = engine.exchange.place_market_buy_by_quote(sym, quote)
-            buy_price = float(buy.get("average") or buy.get("price") or current_price)
-            # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
-            buy_qty   = float(buy.get("filled") or buy.get("amount") or (quote / buy_price))
+            # ყიდვა — DEMO: ვირტუალური
+            if engine.exchange is None:
+                buy_price = current_price
+                buy_qty   = quote / buy_price
+                buy = {"average": buy_price, "price": buy_price, "filled": buy_qty}
+            else:
+                buy = engine.exchange.place_market_buy_by_quote(sym, quote)
+                buy_price = float(buy.get("average") or buy.get("price") or current_price)
+                # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
+                buy_qty   = float(buy.get("filled") or buy.get("amount") or (quote / buy_price))
 
             tp_price = round(buy_price * (1.0 + tp_pct / 100.0), 6)
 
@@ -759,8 +797,12 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
         try:
             exchange_sym = sym
 
-            # current price
-            current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
+            # current price — DEMO: price_feed
+            if engine.exchange is not None:
+                current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
+            else:
+                _t = engine.price_feed.fetch_ticker(exchange_sym)
+                current_price = float(_t.get("last") or 0.0)
             if current_price <= 0:
                 continue
 
@@ -833,8 +875,11 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                 logger.debug(f"[CASCADE] {sym} | drop={drop_from_newest:.2f}% < {drop_pct:.1f}% → wait")
                 continue
 
-            # ბალანსი შემოწმება (buffer საჭიროა)
-            free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
+            # ბალანსი შემოწმება — DEMO: ვირტუალური $120
+            if engine.exchange is not None:
+                free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
+            else:
+                free_usdt = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
             if free_usdt < buffer:
                 logger.warning(f"[CASCADE] {sym} | low_balance={free_usdt:.2f} < buffer={buffer:.1f}")
                 continue
@@ -846,8 +891,13 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
             )
 
             try:
-                sell = engine.exchange.place_market_sell(exchange_sym, oldest_qty)
-                sell_price = float(sell.get("average") or sell.get("price") or current_price)
+                # DEMO: ვირტუალური გაყიდვა
+                if engine.exchange is None:
+                    sell_price = current_price
+                    sell = {"average": sell_price, "price": sell_price}
+                else:
+                    sell = engine.exchange.place_market_sell(exchange_sym, oldest_qty)
+                    sell_price = float(sell.get("average") or sell.get("price") or current_price)
                 proceeds = sell_price * oldest_qty
                 fee = proceeds * 0.001  # 0.1% fee
                 net_proceeds = round(proceeds - fee, 4)
@@ -948,12 +998,17 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
 
             try:
                 # FIX #13: fixed quote ENV-დან (BOT_QUOTE_PER_TRADE=12)
-                # net_proceeds → balance-ში ბრუნდება, შემდეგ fixed quote-ით ვყიდულობთ
                 buy_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
-                buy = engine.exchange.place_market_buy_by_quote(exchange_sym, buy_quote)
-                buy_price = float(buy.get("average") or buy.get("price") or current_price)
-                # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
-                buy_qty   = float(buy.get("filled") or buy.get("amount") or (buy_quote / buy_price))
+                # DEMO: ვირტუალური ყიდვა
+                if engine.exchange is None:
+                    buy_price = current_price
+                    buy_qty   = buy_quote / buy_price
+                    buy = {"average": buy_price, "price": buy_price, "filled": buy_qty}
+                else:
+                    buy = engine.exchange.place_market_buy_by_quote(exchange_sym, buy_quote)
+                    buy_price = float(buy.get("average") or buy.get("price") or current_price)
+                    # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty
+                    buy_qty   = float(buy.get("filled") or buy.get("amount") or (buy_quote / buy_price))
                 tp_price  = round(buy_price * (1.0 + tp_pct / 100.0), 6)
 
                 # dca_positions გახსნა
@@ -1310,18 +1365,22 @@ def main():
             # 9 API call → 3 API call (rate limit risk ↓, სიჩქარე ↑)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _price_cache: dict = {}
-            if engine.exchange is not None:
-                _symbols_to_cache = [s.strip() for s in os.getenv(
-                    "BOT_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT"
-                ).split(",") if s.strip()]
-                for _sym in _symbols_to_cache:
-                    try:
+            _symbols_to_cache = [s.strip() for s in os.getenv(
+                "BOT_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT"
+            ).split(",") if s.strip()]
+            for _sym in _symbols_to_cache:
+                try:
+                    if engine.exchange is not None:
                         _price_cache[_sym] = float(
                             engine.exchange.fetch_last_price(_sym) or 0.0
                         )
-                    except Exception as _pe:
-                        logger.warning(f"PRICE_CACHE_FAIL | {_sym} err={_pe}")
-                        _price_cache[_sym] = 0.0
+                    else:
+                        # DEMO: public API
+                        _t = engine.price_feed.fetch_ticker(_sym)
+                        _price_cache[_sym] = float(_t.get("last") or 0.0)
+                except Exception as _pe:
+                    logger.warning(f"PRICE_CACHE_FAIL | {_sym} err={_pe}")
+                    _price_cache[_sym] = 0.0
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # C: DAILY LOSS — დღის reset შემოწმება
