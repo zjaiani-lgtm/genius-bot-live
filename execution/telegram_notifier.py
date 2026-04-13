@@ -333,7 +333,7 @@ def notify_trade_closed(
 
 def notify_performance_snapshot(stats: Dict[str, Any]) -> None:
     msg = (
-        f"📊 <b>GENIUS-DCA-BOT PERFORMANCE</b>\n\n"
+        f"📊 <b>GENIUS-ALGO-BOT-DEMO PERFORMANCE</b>\n\n"
         f"✅ <b>Closed trades:</b> <code>{int(stats.get('closed_trades', 0))}</code>\n"
         f"🏆 <b>Wins:</b> <code>{int(stats.get('wins', 0))}</code>\n"
         f"❌ <b>Losses:</b> <code>{int(stats.get('losses', 0))}</code>\n"
@@ -539,7 +539,7 @@ def notify_heartbeat(
     mem_str = f" | 💾 <code>{memory_mb:.0f}MB</code>" if memory_mb > 0 else ""
 
     msg = (
-        f"💚 <b>GENIUS BOT ALIVE</b>\n\n"
+        f"💚 <b>GENIUS ALGO BOT DEMO</b>\n\n"
         f"📂 <b>Open:</b> <code>{open_count}</code> | 💰 <code>{_fmt_plain(open_capital, 2)} USDT</code>\n"
         f"₿ BTC <code>{_fmt_price(btc, 0)}</code> | "
         f"Ξ ETH <code>{_fmt_price(eth, 0)}</code> | "
