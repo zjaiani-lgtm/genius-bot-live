@@ -41,32 +41,10 @@ def _ei(name: str, default: int) -> int:
 
 def _get_binance_usdt_balance() -> float:
     """
-    USDT ბალანსის წამოღება.
-
-    LIVE: Binance API-დან რეალური balance.
-    DEMO: DEMO_INITIAL_BALANCE - ღია პოზიციების ჯამი.
-          (API key არ არის → 0.0 → SMART_ADDON ყოველთვის blocked იყო!)
-
+    Binance-დან თავისუფალი USDT ბალანსის წამოღება.
+    exchange_client-ის გამოყენებით — production-safe.
     შეცდომაზე 0.0 დაბრუნება (fail-safe: add-on ბლოკდება).
     """
-    mode = os.getenv("MODE", "DEMO").upper()
-
-    # ── DEMO MODE ────────────────────────────────────────────
-    if mode == "DEMO":
-        try:
-            initial = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
-            # ღია პოზიციების ჯამი DB-დან
-            from execution.db.repository import get_all_open_dca_positions
-            open_pos = get_all_open_dca_positions() or []
-            invested = sum(float(p.get("total_quote_spent", 0.0)) for p in open_pos)
-            free = round(initial - invested, 2)
-            logger.debug(f"[SMART_ADDON] DEMO balance | initial={initial} invested={invested:.2f} free={free:.2f}")
-            return max(free, 0.0)
-        except Exception as e:
-            logger.warning(f"[SMART_ADDON] DEMO balance_calc_fail | err={e} → initial fallback")
-            return float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
-
-    # ── LIVE MODE ────────────────────────────────────────────
     try:
         from execution.exchange_client import BinanceSpotClient
         client = BinanceSpotClient()
