@@ -1437,9 +1437,9 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # LAYER 2 — Crash detection & parallel trading
-            # HIGH-დან -5% ვარდნაზე ახალი 3 პოზიცია გაიხსნება
+            # DEMO: price_feed გამოიყენება (engine.exchange = None OK)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            if _dca_enabled and engine.exchange is not None:
+            if _dca_enabled:
                 try:
                     _check_and_open_layer2(engine, tp_sl_mgr)
                 except Exception as e:
@@ -1447,9 +1447,9 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # CASCADE DCA — Rolling Exchange სტრატეგია
-            # მე-7 Layer-დან: ძველი → Exchange → ახალი Layer დაბლა
+            # DEMO: ვირტუალური buy/sell (engine.exchange = None OK)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            if _dca_enabled and engine.exchange is not None:
+            if _dca_enabled:
                 try:
                     _check_cascade_exchange(engine, tp_sl_mgr)
                 except Exception as e:
@@ -1560,6 +1560,53 @@ def main():
                         )
 
                         engine.execute_signal(sig)
+
+                        # ── DEMO: DCA position გახსნა ──────────────────
+                        if engine.exchange is None and _dca_enabled:
+                            try:
+                                from execution.db.repository import (
+                                    open_dca_position, add_dca_order, open_trade,
+                                    get_open_dca_position_for_symbol
+                                )
+                                _sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
+                                _existing = get_open_dca_position_for_symbol(_sym)
+                                if not _existing:
+                                    _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
+                                    _price = _price_cache.get(_sym, 0.0)
+                                    if _price <= 0:
+                                        _t = engine.price_feed.fetch_ticker(_sym)
+                                        _price = float(_t.get("last") or 0.0)
+                                    if _price > 0:
+                                        _qty = _quote / _price
+                                        _tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
+                                        _tp = round(_price * (1.0 + _tp_pct / 100.0), 6)
+                                        _pos_id = open_dca_position(
+                                            symbol=_sym,
+                                            initial_entry_price=_price,
+                                            initial_qty=_qty,
+                                            initial_quote_spent=_quote,
+                                            tp_price=_tp,
+                                            sl_price=0.0,
+                                            tp_pct=_tp_pct,
+                                            sl_pct=999.0,
+                                            max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "1")),
+                                            max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),
+                                            max_drawdown_pct=999.0,
+                                        )
+                                        open_trade(
+                                            signal_id=signal_id,
+                                            symbol=_sym,
+                                            qty=_qty,
+                                            quote_in=_quote,
+                                            entry_price=_price,
+                                        )
+                                        logger.info(
+                                            f"[DEMO] DCA_OPENED | {_sym} "
+                                            f"price={_price:.4f} qty={_qty:.6f} "
+                                            f"tp={_tp:.4f} quote={_quote}"
+                                        )
+                            except Exception as _de:
+                                logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
 
                     else:
                         # HOLD ან სხვა — უბრალოდ log
