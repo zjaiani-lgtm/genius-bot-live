@@ -239,6 +239,46 @@ STRUCT_SOFT_MIN_TREND = float(os.getenv("STRUCT_SOFT_MIN_TREND", "0.25"))       
 STRUCT_SOFT_MIN_MA_GAP = float(os.getenv("STRUCT_SOFT_MIN_MA_GAP", "0.10"))      # ENV=0.10
 STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "1")) # ENV=1
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PAIRS TRADING — BTC/ETH კორელაციური ADD-ON ლოგიკა
+#
+# პრინციპი:
+#   BTC და ETH ძლიერ კორელირებულია (ρ ≈ 0.90+).
+#   BTC +X% აიწევს → ETH ჯერ არ გამოეხმაურა →
+#   ETH "იაფია" BTC-თან შედარებით (z-score divergence) →
+#   ETH-ზე ADD-ON signal ემიტდება (signal_type="PAIRS_ADDON").
+#
+# ლოგიკა:
+#   1. BTC_close / ETH_close = ratio (ბოლო PAIRS_RATIO_WINDOW სანთლის მიხედვით)
+#   2. ratio-ს z-score = (ratio_now - ratio_mean) / ratio_std
+#   3. z-score > +THRESHOLD → BTC ძვირდება ETH-თან → ETH ADD-ON
+#   4. z-score < -THRESHOLD → ETH ძვირდება BTC-თან → (საპირისპირო, ამჟამად გათიშული)
+#
+# ADD-ON: ახალი position კი არა, EXISTS პოზიციაზე ADD-ON.
+#   → main.py / dca_tp_sl_manager.py ჩვეულებრივ ახორციელებს.
+#   → signal_type="PAIRS_ADDON" გამოყოფს ჩვეულებრივი BUY-სგან.
+#
+# ENV:
+#   PAIRS_TRADING_ENABLED=true     → ჩართვა (default: false — უსაფრთხო)
+#   PAIRS_RATIO_WINDOW=20          → რამდენი სანთელი ratio history-ში (z-score გამოსათვლელად)
+#   PAIRS_DIVERGENCE_THRESHOLD=1.5 → z-score threshold BTC/ETH divergence-ისთვის
+#   PAIRS_ADDON_COOLDOWN=300       → წამები ADD-ON-ებს შორის (anti-spam)
+#   PAIRS_LEAD_SYMBOL=BTC/USDT    → "ლიდერი" pair (ის რომელიც პირველი זזის)
+#   PAIRS_LAG_SYMBOL=ETH/USDT     → "ლაგი" pair (ის რომელზეც ADD-ON ემიტდება)
+#   PAIRS_MIN_LEAD_MOVE_PCT=0.3   → ლიდერის მინ. გადაადგილება trigger-ისთვის
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PAIRS_TRADING_ENABLED      = os.getenv("PAIRS_TRADING_ENABLED", "false").strip().lower() == "true"
+PAIRS_RATIO_WINDOW         = int(os.getenv("PAIRS_RATIO_WINDOW", "20"))
+PAIRS_DIVERGENCE_THRESHOLD = float(os.getenv("PAIRS_DIVERGENCE_THRESHOLD", "1.5"))
+PAIRS_ADDON_COOLDOWN       = int(os.getenv("PAIRS_ADDON_COOLDOWN", "300"))
+PAIRS_LEAD_SYMBOL          = os.getenv("PAIRS_LEAD_SYMBOL", "BTC/USDT").strip().upper()
+PAIRS_LAG_SYMBOL           = os.getenv("PAIRS_LAG_SYMBOL", "ETH/USDT").strip().upper()
+PAIRS_MIN_LEAD_MOVE_PCT    = float(os.getenv("PAIRS_MIN_LEAD_MOVE_PCT", "0.3"))
+
+# in-memory state — pairs trading
+_pairs_addon_last_ts: float = 0.0          # ბოლო PAIRS_ADDON emit timestamp
+_pairs_ratio_history: List[float] = []     # rolling BTC/ETH ratio window
+
 _last_emit_ts: float = 0.0
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1237,6 +1277,259 @@ def _dynamic_quote_size(ai_score: float, base: float) -> float:
     return round(size, 2)
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# PAIRS TRADING ENGINE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _pairs_fetch_close(symbol: str, timeframe: str, limit: int) -> Optional[float]:
+    """
+    სიმბოლოს ბოლო დახურული სანთლის ფასი.
+    Returns None თუ fetch ვერ ხდება ან არარის საკმარისი სანთელი.
+    """
+    try:
+        ohlcv = _fetch_ohlcv_direct(symbol, timeframe, limit + 2)
+        if not ohlcv or len(ohlcv) < 2:
+            return None
+        ohlcv, _ = _drop_unclosed_candle(ohlcv, timeframe)
+        if not ohlcv:
+            return None
+        return float(ohlcv[-1][4])  # last closed candle close price
+    except Exception as e:
+        logger.debug(f"[PAIRS] fetch_close_fail | symbol={symbol} err={e}")
+        return None
+
+
+def _pairs_fetch_closes_series(symbol: str, timeframe: str, limit: int) -> List[float]:
+    """
+    სიმბოლოს ბოლო N სანთლის close ფასების სია (z-score history-ისთვის).
+    Returns [] თუ fetch ვერ ხდება.
+    """
+    try:
+        ohlcv = _fetch_ohlcv_direct(symbol, timeframe, limit + 2)
+        if not ohlcv or len(ohlcv) < 2:
+            return []
+        ohlcv, _ = _drop_unclosed_candle(ohlcv, timeframe)
+        if len(ohlcv) < 2:
+            return []
+        return [float(c[4]) for c in ohlcv[-limit:]]
+    except Exception as e:
+        logger.debug(f"[PAIRS] fetch_closes_fail | symbol={symbol} err={e}")
+        return []
+
+
+def _pairs_zscore(series: List[float]) -> Optional[float]:
+    """
+    ბოლო ელემენტის z-score წინა ელემენტების სტატისტიკის მიხედვით.
+    series[-1] = current value, series[:-1] = history for mean/std.
+    Returns None თუ ვარიაცია ნულია (flat ratio).
+    """
+    if len(series) < 3:
+        return None
+    history = series[:-1]
+    current = series[-1]
+    mean = sum(history) / len(history)
+    variance = sum((x - mean) ** 2 for x in history) / len(history)
+    if variance < 1e-12:
+        return None  # ratio flat — z-score უაზროა
+    std = variance ** 0.5
+    return (current - mean) / std
+
+
+def _pairs_lead_move_pct(lead_closes: List[float], lookback: int = 3) -> float:
+    """
+    ლიდერის ბოლო lookback სანთლის ფასის ცვლილება %.
+    დადებითი = ავიდა, უარყოფითი = ჩავიდა.
+    """
+    if len(lead_closes) < lookback + 1:
+        return 0.0
+    base = lead_closes[-(lookback + 1)]
+    if base <= 0:
+        return 0.0
+    return (lead_closes[-1] - base) / base * 100.0
+
+
+def _pairs_trading_check(outbox_path: str) -> Optional[Dict[str, Any]]:
+    """
+    Pairs Trading — BTC/ETH კორელაციური ADD-ON ლოგიკა.
+
+    Flow:
+      1. PAIRS_TRADING_ENABLED=false → None (fast exit)
+      2. PAIRS_ADDON_COOLDOWN → spam protection
+      3. lag_symbol-ზე ღია trade შემოწმება (ADD-ON მოითხოვს ღია position)
+      4. BTC + ETH series fetch (PAIRS_RATIO_WINDOW სანთელი)
+      5. ratio series → z-score
+      6. z-score > THRESHOLD AND BTC-ის ბოლო N სანთელი +PAIRS_MIN_LEAD_MOVE_PCT%
+         → ETH ADD-ON signal emit
+      7. signal_type="PAIRS_ADDON" (main.py/execution_engine-ი ამუშავებს ADD-ON-ად)
+
+    Returns:
+      signal dict თუ ADD-ON emit მოხდა, None სხვა შემთხვევაში.
+    """
+    global _pairs_addon_last_ts, _pairs_ratio_history
+
+    if not PAIRS_TRADING_ENABLED:
+        return None
+
+    # ── cooldown ────────────────────────────────────────────────
+    elapsed = time.time() - _pairs_addon_last_ts
+    if elapsed < PAIRS_ADDON_COOLDOWN:
+        if GEN_DEBUG:
+            logger.debug(
+                f"[PAIRS] COOLDOWN | remaining={int(PAIRS_ADDON_COOLDOWN - elapsed)}s"
+            )
+        return None
+
+    # ── lag symbol-ზე ღია trade საჭიროა ────────────────────────
+    # ADD-ON ლოგიკა: ახალი position კი არ იხსნება, არსებულ position-ს ემატება $12.
+    # თუ ღია trade არ არის → ADD-ON უაზროა.
+    try:
+        lag_open = has_open_trade_for_symbol(PAIRS_LAG_SYMBOL)
+    except Exception as e:
+        logger.warning(f"[PAIRS] open_trade_check_fail | err={e} → skip")
+        return None
+
+    if not lag_open:
+        if GEN_DEBUG:
+            logger.debug(
+                f"[PAIRS] NO_OPEN_TRADE | lag={PAIRS_LAG_SYMBOL} → ADD-ON requires open position"
+            )
+        return None
+
+    # ── MAX_OPEN_TRADES guard ────────────────────────────────────
+    # ADD-ON ახალ row-ს ამატებს DB-ში — იგივე slot limit მოქმედებს
+    if MAX_OPEN_TRADES > 0:
+        try:
+            _total = len(get_all_open_trades() or [])
+            if _total >= MAX_OPEN_TRADES:
+                if GEN_DEBUG:
+                    logger.debug(
+                        f"[PAIRS] BLOCKED_MAX_OPEN | total={_total} >= {MAX_OPEN_TRADES}"
+                    )
+                return None
+        except Exception:
+            pass  # fail-open — სჯობს skip-ი spam-ს
+
+    # ── BTC + ETH closes fetch ───────────────────────────────────
+    window = max(PAIRS_RATIO_WINDOW + 2, 10)
+    lead_closes = _pairs_fetch_closes_series(PAIRS_LEAD_SYMBOL, TIMEFRAME, window)
+    lag_closes  = _pairs_fetch_closes_series(PAIRS_LAG_SYMBOL,  TIMEFRAME, window)
+
+    if len(lead_closes) < 3 or len(lag_closes) < 3:
+        logger.debug(f"[PAIRS] INSUFFICIENT_DATA | lead={len(lead_closes)} lag={len(lag_closes)}")
+        return None
+
+    # series-ები ერთი სიგრძის უნდა იყოს
+    min_len = min(len(lead_closes), len(lag_closes))
+    lead_closes = lead_closes[-min_len:]
+    lag_closes  = lag_closes[-min_len:]
+
+    # ── ratio series ─────────────────────────────────────────────
+    ratio_series: List[float] = []
+    for lc, ec in zip(lead_closes, lag_closes):
+        if ec <= 0:
+            continue
+        ratio_series.append(lc / ec)
+
+    if len(ratio_series) < 3:
+        return None
+
+    # ── z-score ──────────────────────────────────────────────────
+    z = _pairs_zscore(ratio_series)
+    if z is None:
+        if GEN_DEBUG:
+            logger.debug(f"[PAIRS] FLAT_RATIO | z=None → skip")
+        return None
+
+    ratio_now = ratio_series[-1]
+    ratio_mean = sum(ratio_series[:-1]) / len(ratio_series[:-1])
+
+    # ── ლიდერის ბოლო სანთლების მოძრაობა ─────────────────────────
+    lead_move_pct = _pairs_lead_move_pct(lead_closes, lookback=3)
+
+    if GEN_DEBUG:
+        logger.info(
+            f"[PAIRS] STATUS | z={z:.3f} threshold={PAIRS_DIVERGENCE_THRESHOLD} "
+            f"ratio_now={ratio_now:.4f} ratio_mean={ratio_mean:.4f} "
+            f"lead_move={lead_move_pct:+.3f}% min_move={PAIRS_MIN_LEAD_MOVE_PCT}% "
+            f"lead={PAIRS_LEAD_SYMBOL} lag={PAIRS_LAG_SYMBOL}"
+        )
+
+    # ── trigger condition ─────────────────────────────────────────
+    # z > +threshold → BTC ძვირდება ETH-თან → ETH "ჩამორჩა" → ADD-ON
+    # AND ლიდერი (BTC) ნამდვილად ავიდა (არა noise)
+    if z < PAIRS_DIVERGENCE_THRESHOLD:
+        return None
+
+    if lead_move_pct < PAIRS_MIN_LEAD_MOVE_PCT:
+        if GEN_DEBUG:
+            logger.info(
+                f"[PAIRS] LEAD_MOVE_INSUFFICIENT | lead_move={lead_move_pct:+.3f}% "
+                f"< min={PAIRS_MIN_LEAD_MOVE_PCT}% → skip"
+            )
+        return None
+
+    # ── ADD-ON signal emit ────────────────────────────────────────
+    lag_price = lag_closes[-1]
+    signal_id = str(uuid.uuid4())
+
+    sig = {
+        "signal_id":        signal_id,
+        "ts_utc":           _now_utc_iso(),
+        "certified_signal": True,
+        "final_verdict":    "TRADE",
+        "signal_type":      "PAIRS_ADDON",   # execution_engine-ი ამ field-ით განასხვავებს
+        "trend":            round(lead_move_pct / 100.0, 4),
+        "atr_pct":          0.0,
+        "meta": {
+            "source":          "PAIRS_TRADING",
+            "symbol":          PAIRS_LAG_SYMBOL,
+            "lead_symbol":     PAIRS_LEAD_SYMBOL,
+            "lag_symbol":      PAIRS_LAG_SYMBOL,
+            "z_score":         round(z, 4),
+            "ratio_now":       round(ratio_now, 6),
+            "ratio_mean":      round(ratio_mean, 6),
+            "lead_move_pct":   round(lead_move_pct, 4),
+            "divergence_thr":  PAIRS_DIVERGENCE_THRESHOLD,
+            "lag_price":       lag_price,
+            "reason":          (
+                f"BTC+{lead_move_pct:.2f}% ETH_lagging "
+                f"z={z:.2f}>{PAIRS_DIVERGENCE_THRESHOLD} "
+                f"ratio={ratio_now:.4f} mean={ratio_mean:.4f}"
+            ),
+        },
+        "execution": {
+            "symbol":       PAIRS_LAG_SYMBOL,
+            "direction":    "LONG",
+            "entry":        {"type": "MARKET"},
+            "quote_amount": BOT_QUOTE_PER_TRADE,  # სტანდარტული $12
+        },
+        "adaptive": {
+            "TP_PCT":     float(os.getenv("DCA_TP_PCT", "0.55")),
+            "SL_PCT":     float(os.getenv("DCA_SL_PCT", "999.0")),
+            "REGIME":     "PAIRS_DIVERGENCE",
+            "ATR_PCT":    0.0,
+            "QUOTE_SIZE": BOT_QUOTE_PER_TRADE,
+            "TRAILING_STOP_ENABLED":  False,
+            "TRAILING_STOP_DISTANCE": 0.0,
+            "USE_PARTIAL_TP":         False,
+            "PARTIAL_TP1_PCT":        0.0,
+            "PARTIAL_TP1_SIZE":       0.0,
+            "USE_BREAKEVEN_STOP":     False,
+            "BREAKEVEN_TRIGGER_PCT":  0.0,
+        },
+    }
+
+    _pairs_addon_last_ts = time.time()
+
+    logger.info(
+        f"[PAIRS] ADD-ON_SIGNAL | lag={PAIRS_LAG_SYMBOL} "
+        f"z={z:.3f} lead_move={lead_move_pct:+.2f}% "
+        f"ratio={ratio_now:.4f} → emitting ADD-ON ${BOT_QUOTE_PER_TRADE}"
+    )
+    append_signal(sig, outbox_path)
+    return sig
+
+
 def generate_signal() -> Optional[Dict[str, Any]]:
     # BUGFIX: global _rsi_sell_fired ფუნქციის სათავეში — Python requirement
     global _rsi_sell_fired
@@ -1365,6 +1658,16 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if not _cooldown_ok():
         return None
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # PAIRS TRADING CHECK — cooldown-ის შემდეგ, BUY loop-ის წინ.
+    # PAIRS_ADDON_COOLDOWN საკუთარი cooldown-ი აქვს (COOLDOWN-ისგან დამოუკიდებელი).
+    # თუ ADD-ON emit მოხდა → return (BUY loop skip — ADD-ON საკმარისია ამ cycle-ში)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if PAIRS_TRADING_ENABLED:
+        pairs_sig = _pairs_trading_check(outbox_path)
+        if pairs_sig is not None:
+            return pairs_sig
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # TRADE FREQUENCY LIMITS — MAX_TRADES_PER_DAY / HOUR
