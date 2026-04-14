@@ -80,6 +80,11 @@ BOT_POSITION_SIZE    = _env_float("BOT_POSITION_SIZE",     0.0)
 CAPITAL_USAGE_MAX      = _env_float("CAPITAL_USAGE_MAX",      0.80)
 CAPITAL_USAGE_MIN      = _env_float("CAPITAL_USAGE_MIN",      0.30)
 
+# MAX_ACCOUNT_DRAWDOWN — execution_engine.py __init__ line 180
+# % balance drop from session start → KILL all trading (0/999 = disabled)
+# FIX CRIT: AttributeError: module 'execution.config' has no attribute 'MAX_ACCOUNT_DRAWDOWN'
+MAX_ACCOUNT_DRAWDOWN   = _env_float("MAX_ACCOUNT_DRAWDOWN",   999.0)  # DCA: disabled
+
 USE_DYNAMIC_SIZING     = _env_bool("USE_DYNAMIC_SIZING",     "true")
 ALLOW_POSITION_SCALING = _env_bool("ALLOW_POSITION_SCALING", "false")
 # SYNC: was 5.0/15.0 in config.py — signal_generator.py uses 8.0/10.0 → align
@@ -99,7 +104,6 @@ MAX_TRADES_PER_DAY       = _env_int("MAX_TRADES_PER_DAY",      10)   # SYNC: 25�
 MAX_TRADES_PER_HOUR      = _env_int("MAX_TRADES_PER_HOUR",      3)   # SYNC: 8→3
 MAX_CONSECUTIVE_LOSSES   = _env_int("MAX_CONSECUTIVE_LOSSES",   5)   # SYNC: 3→5
 MAX_DAILY_LOSS           = _env_float("MAX_DAILY_LOSS",         3.0)  # SYNC: 2.0→3.0
-MAX_ACCOUNT_DRAWDOWN     = _env_float("MAX_ACCOUNT_DRAWDOWN",   0.0)  # FIX: 0=disabled (DCA mode)
 
 # ─────────────────────────────────────────────
 # TP / SL / ATR
