@@ -332,11 +332,23 @@ def notify_trade_closed(
 
 
 def notify_performance_snapshot(stats: Dict[str, Any]) -> None:
+    cascade_count = int(stats.get("cascade_count", 0))
+    cascade_pnl   = float(stats.get("cascade_pnl", 0.0))
+    cascade_sign  = "+" if cascade_pnl >= 0 else ""
+    cascade_icon  = "🟢" if cascade_pnl >= 0 else "🔄"
+
+    # CASCADE ხაზი — მხოლოდ თუ cascade trades არსებობს
+    cascade_line = ""
+    if cascade_count > 0:
+        cascade_line = (
+            f"{cascade_icon} <b>CASCADE:</b> "
+            f"<code>{cascade_count}x ({cascade_sign}{cascade_pnl:.4f} USDT)</code>\n"
+        )
+
     msg = (
         f"📊 <b>GENIUS-ALGO-BOT-DEMO PERFORMANCE</b>\n\n"
-        f"✅ <b>Closed trades:</b> <code>{int(stats.get('closed_trades', 0))}</code>\n"
-        f"🏆 <b>Wins:</b> <code>{int(stats.get('wins', 0))}</code>\n"
-        f"❌ <b>Losses:</b> <code>{int(stats.get('losses', 0))}</code>\n"
+        f"✅ <b>Wins:</b> <code>{int(stats.get('wins', 0))}</code>\n"
+        f"{cascade_line}"
         f"🔥 <b>Winrate:</b> <code>{float(stats.get('winrate_pct', 0.0)):.2f}%</code>\n"
         f"💵 <b>Total PnL:</b> <code>{float(stats.get('pnl_quote_sum', 0.0)):.4f} USDT</code>\n"
         f"💹 <b>ROI:</b> <code>{float(stats.get('roi_pct', 0.0)):.2f}%</code>\n"
