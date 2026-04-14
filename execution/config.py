@@ -99,6 +99,7 @@ MAX_TRADES_PER_DAY       = _env_int("MAX_TRADES_PER_DAY",      10)   # SYNC: 25�
 MAX_TRADES_PER_HOUR      = _env_int("MAX_TRADES_PER_HOUR",      3)   # SYNC: 8→3
 MAX_CONSECUTIVE_LOSSES   = _env_int("MAX_CONSECUTIVE_LOSSES",   5)   # SYNC: 3→5
 MAX_DAILY_LOSS           = _env_float("MAX_DAILY_LOSS",         3.0)  # SYNC: 2.0→3.0
+MAX_ACCOUNT_DRAWDOWN     = _env_float("MAX_ACCOUNT_DRAWDOWN",   0.0)  # FIX: 0=disabled (DCA mode)
 
 # ─────────────────────────────────────────────
 # TP / SL / ATR
