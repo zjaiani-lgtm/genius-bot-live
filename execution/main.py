@@ -1765,22 +1765,22 @@ def main():
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # E: HEARTBEAT — Smart Schedule (Asia/Tbilisi):
-            # 08:00-00:00 → ყოველ 30 წუთს
-            # 00:00-00:30 → ერთხელ ღამით (Daily Summary-ის შემდეგ)
-            # 00:30-08:00 → გაჩუმება 😴
+            # 08:00-02:00 → ყოველ 30 წუთს
+            # 02:00-02:30 → ერთხელ ღამით (Daily Summary-ის შემდეგ)
+            # 02:30-08:00 → გაჩუმება 😴
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 _hb_now    = _now_dt()
                 _hb_hour   = _hb_now.hour
                 _hb_minute = _hb_now.minute
 
-                # 00:30-08:00 → გაჩუმება
-                _hb_silent = (0 < _hb_hour < 8) or (_hb_hour == 0 and _hb_minute >= 30)
+                # 02:30-08:00 → გაჩუმება
+                _hb_silent = (2 < _hb_hour < 8) or (_hb_hour == 2 and _hb_minute >= 30)
 
-                # 00:00-00:30 → ერთხელ ღამით
-                _hb_night_ok = (_hb_hour == 0 and 29 <= _hb_minute <= 31)
+                # 02:00-02:30 → ერთხელ ღამით
+                _hb_night_ok = (_hb_hour == 2 and 0 <= _hb_minute <= 30)
 
-                # 08:00-00:00 → ყოველ 30 წუთს
+                # 08:00-02:00 → ყოველ 30 წუთს
                 _hb_day_ok = not _hb_silent and (now - last_heartbeat_ts) >= 1800
 
                 if not _hb_silent and (_hb_night_ok or _hb_day_ok):
