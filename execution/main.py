@@ -1422,6 +1422,9 @@ def main():
                 logger.info(f"DAILY_LOSS_RESET | date={_today} limit={daily_max_loss}")
 
             # CASCADE_LOSS events DB-დან — inner function scope fix
+            # FIX CRIT#1: _daily_loss_total = _cascade_total (არა +=!)
+            # += იყო: ყოველ 2 წუთში -$0.88 ემატებოდა → -$40 double-counting!
+            # = არის: DB-დან ყოველ loop-ზე სრულ ჯამს კითხულობს → ერთხელ ითვლება
             try:
                 from execution.db.repository import _fetchall
                 _cascade_losses = _fetchall(
@@ -1438,7 +1441,7 @@ def main():
                     except Exception:
                         pass
                 if _cascade_total < 0:
-                    _daily_loss_total += _cascade_total
+                    _daily_loss_total = _cascade_total  # ← FIX: = არა +=
             except Exception:
                 pass
 
