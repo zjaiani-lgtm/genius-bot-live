@@ -177,7 +177,7 @@ class ExecutionEngine:
 
         # MAX_ACCOUNT_DRAWDOWN — % balance drop from session start → KILL (0=off)
         # e.g. 7 = if balance drops 7% from start → stop all trading
-        self.max_account_drawdown_pct = 999.0  # DCA: disabled
+        self.max_account_drawdown_pct = _cfg.MAX_ACCOUNT_DRAWDOWN
         self._session_start_balance: Optional[float] = None  # set on first live BUY
 
         # MAX_RISK_PER_TRADE_PCT — max % of balance per single trade (0=off)
@@ -1503,8 +1503,8 @@ class ExecutionEngine:
             except Exception as e:
                 logger.warning(f"CONSECUTIVE_LOSS_CHECK_FAIL | err={e} → skipped")
 
-        # 2. MAX_DAILY_LOSS — DCA MODE: გათიშულია (0=off)
-        if False and self.max_daily_loss_pct > 0:  # DCA: disabled
+        # 2. MAX_DAILY_LOSS — დღიური წაკალი დაცვა
+        if self.max_daily_loss_pct > 0:
             try:
                 from execution.db.repository import get_closed_trades
                 from datetime import datetime, timezone
@@ -1556,7 +1556,7 @@ class ExecutionEngine:
         #   open=5     → ყიდის (< MAX, but hit MIN threshold)
         #   open=4,3.. → ყიდის სანამ MAX-ს არ მიაღწევს
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        _max_open = int(os.getenv("MAX_OPEN_TRADES", "6"))
+        _max_open = int(os.getenv("MAX_OPEN_TRADES", "2"))
         _min_open = int(os.getenv("MIN_OPEN_TRADES", "5"))
         if _max_open > 0:
             try:
