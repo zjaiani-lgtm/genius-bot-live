@@ -666,6 +666,18 @@ def get_trade_stats() -> Dict[str, Any]:
         """
     ) or (0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
+    # CASCADE_EXCHANGE ცალკე — wins/losses-ში არ ითვლება
+    row_cascade = _fetchone(
+        """
+        SELECT
+            COUNT(*) AS cascade_count,
+            COALESCE(SUM(pnl_quote), 0) AS cascade_pnl
+        FROM trades
+        WHERE closed_at IS NOT NULL
+          AND outcome = 'CASCADE_EXCHANGE'
+        """
+    ) or (0, 0.0)
+
     closed_trades    = int(row[0] or 0)
     wins             = int(row[1] or 0)
     losses           = int(row[2] or 0)
@@ -676,6 +688,8 @@ def get_trade_stats() -> Dict[str, Any]:
     avg_win          = float(row[7] or 0.0)
     avg_loss         = float(row[8] or 0.0)
     expectancy_quote = float(row[9] or 0.0)
+    cascade_count    = int(row_cascade[0] or 0)
+    cascade_pnl      = float(row_cascade[1] or 0.0)
 
     winrate_pct   = (wins / closed_trades * 100.0) if closed_trades else 0.0
     roi_pct       = (pnl_quote_sum / quote_in_sum * 100.0) if quote_in_sum else 0.0
@@ -710,6 +724,8 @@ def get_trade_stats() -> Dict[str, Any]:
         "expectancy_quote":  expectancy_quote,
         "open_trades":       int(row2[0] or 0),
         "open_quote_in_sum": float(row2[1] or 0.0),
+        "cascade_count":     cascade_count,
+        "cascade_pnl":       cascade_pnl,
     }
 
 
