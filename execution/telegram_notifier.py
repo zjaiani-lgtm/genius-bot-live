@@ -347,7 +347,9 @@ def notify_performance_snapshot(stats: Dict[str, Any]) -> None:
 
     msg = (
         f"📊 <b>GENIUS-ALGO-BOT-DEMO PERFORMANCE</b>\n\n"
-        f"✅ <b>Wins:</b> <code>{int(stats.get('wins', 0))}</code>\n"
+        f"✅ <b>Closed trades:</b> <code>{int(stats.get('closed_trades', 0))}</code>\n"
+        f"🏆 <b>Wins:</b> <code>{int(stats.get('wins', 0))}</code>\n"
+        f"❌ <b>Losses:</b> <code>{int(stats.get('losses', 0))}</code>\n"
         f"{cascade_line}"
         f"🔥 <b>Winrate:</b> <code>{float(stats.get('winrate_pct', 0.0)):.2f}%</code>\n"
         f"💵 <b>Total PnL:</b> <code>{float(stats.get('pnl_quote_sum', 0.0)):.4f} USDT</code>\n"
