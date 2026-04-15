@@ -657,3 +657,110 @@ def notify_cascade_depth(
         f"🕒 <code>{_now_str()}</code>"
     )
     send_telegram_message(msg)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SMART LONG + SHORT — FUTURES NOTIFICATIONS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def notify_short_opened(
+    symbol: str,
+    entry_price: float,
+    tp_price: float,
+    sl_price: float,
+    quote: float,
+    leverage: int,
+    mode: str = "DEMO",
+) -> None:
+    """🔴 SHORT position გახსნილია."""
+    tp_dist_pct = (entry_price - tp_price) / entry_price * 100.0 if entry_price else 0.0
+    sl_dist_pct = (sl_price - entry_price) / entry_price * 100.0 if entry_price else 0.0
+    potential_profit = round(quote * (tp_dist_pct / 100.0) * leverage, 4)
+
+    mode_icon = "🧪" if mode == "DEMO" else "🔴"
+
+    msg = (
+        f"{mode_icon} <b>SHORT OPENED</b> [{mode}]\n\n"
+        f"🪙 <b>Symbol:</b> <code>{_escape_html(symbol)}</code>\n"
+        f"📥 <b>Entry:</b> <code>{_fmt_price(entry_price)}</code>\n"
+        f"⬇️ <b>TP:</b> <code>{_fmt_price(tp_price)}</code> "
+        f"(<code>-{tp_dist_pct:.2f}%</code>)\n"
+        f"⬆️ <b>SL:</b> <code>{_fmt_price(sl_price)}</code> "
+        f"(<code>+{sl_dist_pct:.2f}%</code>)\n"
+        f"💼 <b>Margin:</b> <code>{_fmt_plain(quote, 2)}</code> USDT\n"
+        f"⚡ <b>Leverage:</b> <code>x{leverage}</code>\n"
+        f"💰 <b>Potential profit:</b> <code>+{_fmt_plain(potential_profit, 4)}</code> USDT\n"
+        f"🕒 <code>{_now_str()}</code>"
+    )
+    send_telegram_message(msg)
+
+
+def notify_short_closed(
+    symbol: str,
+    entry_price: float,
+    exit_price: float,
+    pnl_quote: float,
+    pnl_pct: float,
+    reason: str = "TP",
+) -> None:
+    """SHORT position დახურულია."""
+    if reason == "TP":
+        title = "✅ <b>SHORT CLOSED — TP HIT</b>"
+        icon = "✅"
+    elif reason == "SL":
+        title = "🛑 <b>SHORT CLOSED — SL HIT</b>"
+        icon = "🛑"
+    elif reason == "BULL_MARKET":
+        title = "🟢 <b>SHORT CLOSED — BULL MARKET</b>"
+        icon = "🟢"
+    else:
+        title = f"📦 <b>SHORT CLOSED — {_escape_html(reason)}</b>"
+        icon = "📦"
+
+    pnl_icon = "💰" if pnl_quote >= 0 else "📉"
+
+    msg = (
+        f"{title}\n\n"
+        f"🪙 <b>Symbol:</b> <code>{_escape_html(symbol)}</code>\n"
+        f"📥 <b>Entry:</b> <code>{_fmt_price(entry_price)}</code>\n"
+        f"📤 <b>Exit:</b> <code>{_fmt_price(exit_price)}</code>\n"
+        f"{pnl_icon} <b>PnL:</b> <code>{_fmt_usdt(pnl_quote)}</code>\n"
+        f"📈 <b>PnL %:</b> <code>{_fmt_pct(pnl_pct)}</code>\n"
+        f"🎯 <b>Reason:</b> <code>{_escape_html(reason)}</code>\n"
+        f"🕒 <code>{_now_str()}</code>"
+    )
+    send_telegram_message(msg)
+
+
+def notify_market_regime_change(
+    old_regime: str,
+    new_regime: str,
+    btc_change_pct: float,
+) -> None:
+    """ბაზრის რეჟიმი შეიცვალა — BEAR/BULL/NEUTRAL."""
+    icons = {
+        "BEAR":    "🔴",
+        "BULL":    "🟢",
+        "NEUTRAL": "⚪",
+    }
+    old_icon = icons.get(old_regime, "❓")
+    new_icon = icons.get(new_regime, "❓")
+
+    # BEAR → SHORT hedge ჩაირთო
+    # BULL → SHORT-ები დაიხურება
+    if new_regime == "BEAR":
+        action = "⚠️ ახალი L1 BLOCKED | SHORT hedge ჩაირთო"
+    elif new_regime == "BULL":
+        action = "✅ L1 positions ALLOWED | SHORT-ები დაიხურება"
+    else:
+        action = "➡️ DCA ჩვეულებრივ გრძელდება"
+
+    msg = (
+        f"📊 <b>MARKET REGIME CHANGE</b>\n\n"
+        f"{old_icon} <b>Old:</b> <code>{_escape_html(old_regime)}</code> → "
+        f"{new_icon} <b>New:</b> <code>{_escape_html(new_regime)}</code>\n\n"
+        f"₿ <b>BTC 24h:</b> <code>{_fmt_pct(btc_change_pct)}</code>\n"
+        f"🤖 {action}\n"
+        f"🕒 <code>{_now_str()}</code>"
+    )
+    send_telegram_message(msg)
