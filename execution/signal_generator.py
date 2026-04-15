@@ -492,6 +492,121 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
     return True, "OK"
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SMART LONG + SHORT — MARKET REGIME DETECTOR
+# BTC 24h price change-ის მიხედვით ბაზრის რეჟიმი.
+#
+# ENV:
+#   MARKET_BEAR_THRESHOLD=-3.0    ← Bear trigger %
+#   MARKET_BULL_THRESHOLD=2.0     ← Bull trigger %
+#   MARKET_REGIME_SYMBOL=BTC/USDT ← რომელი coin-ი
+#   MARKET_REGIME_COOLDOWN=300    ← 5 წუთი regime cache
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_LAST_REGIME_TS: float = 0.0
+_LAST_REGIME_VAL: str = "NEUTRAL"
+
+
+def _detect_market_regime_24h() -> str:
+    """
+    BTC 24h price change-ის მიხედვით ბაზრის რეჟიმი.
+
+    Returns: "BEAR" | "BULL" | "NEUTRAL"
+
+    BEAR:    BTC_24h_change < MARKET_BEAR_THRESHOLD (default -3.0%)
+    BULL:    BTC_24h_change > MARKET_BULL_THRESHOLD (default +2.0%)
+    NEUTRAL: სხვა
+
+    Cache: MARKET_REGIME_COOLDOWN წამი (default 300s = 5 წუთი)
+    """
+    global _LAST_REGIME_TS, _LAST_REGIME_VAL
+
+    # Cache — ყოველ 5 წუთს ახლა, არა ყოველ tick-ზე
+    _regime_cooldown = int(os.getenv("MARKET_REGIME_COOLDOWN", "300"))
+    if (time.time() - _LAST_REGIME_TS) < _regime_cooldown:
+        logger.debug(f"[REGIME_24H] CACHED | regime={_LAST_REGIME_VAL}")
+        return _LAST_REGIME_VAL
+
+    bear_threshold = float(os.getenv("MARKET_BEAR_THRESHOLD", "-3.0"))
+    bull_threshold = float(os.getenv("MARKET_BULL_THRESHOLD",  "2.0"))
+    regime_symbol  = os.getenv("MARKET_REGIME_SYMBOL", "BTC/USDT")
+
+    try:
+        exchange = _build_exchange()
+        ticker = exchange.fetch_ticker(regime_symbol)
+        last    = float(ticker.get("last") or 0.0)
+        # previousClose = ბინანსის API-ში გუშინდელი close
+        prev    = float(
+            ticker.get("previousClose")
+            or ticker.get("open")
+            or 0.0
+        )
+
+        if prev <= 0 or last <= 0:
+            logger.warning(f"[REGIME_24H] NO_PRICE | {regime_symbol} → NEUTRAL")
+            return "NEUTRAL"
+
+        change_pct = (last - prev) / prev * 100.0
+
+        if change_pct < bear_threshold:
+            regime = "BEAR"
+        elif change_pct > bull_threshold:
+            regime = "BULL"
+        else:
+            regime = "NEUTRAL"
+
+        logger.info(
+            f"[REGIME_24H] DETECTED | {regime_symbol} "
+            f"last={last:.2f} prev={prev:.2f} "
+            f"change={change_pct:+.2f}% → {regime}"
+        )
+
+        # cache განახლება
+        if regime != _LAST_REGIME_VAL:
+            logger.warning(
+                f"[REGIME_24H] CHANGE | {_LAST_REGIME_VAL} → {regime} "
+                f"(change={change_pct:+.2f}%)"
+            )
+            # Telegram — regime change შეტყობინება
+            try:
+                from execution.telegram_notifier import notify_market_regime_change
+                notify_market_regime_change(
+                    old_regime=_LAST_REGIME_VAL,
+                    new_regime=regime,
+                    btc_change_pct=change_pct,
+                )
+            except Exception as _tg:
+                logger.warning(f"[REGIME_24H] TG_FAIL | err={_tg}")
+
+        _LAST_REGIME_VAL = regime
+        _LAST_REGIME_TS  = time.time()
+        return regime
+
+    except Exception as e:
+        logger.warning(f"[REGIME_24H] DETECT_FAIL | err={e} → NEUTRAL (safe)")
+        return "NEUTRAL"
+
+
+def _allow_new_l1() -> bool:
+    """
+    BEAR market-ში ახალი L1 position-ის გახსნა დაბლოკილია.
+
+    BEAR:    False → ახალი L1 BLOCKED (ფული ნუ ჩაიკეტება!)
+    BULL:    True  → ნორმალური DCA
+    NEUTRAL: True  → ნორმალური DCA
+
+    ENV:
+      BEAR_BLOCK_NEW_L1=true   ← (default: true) BEAR-ზე L1 ბლოკი
+    """
+    if not os.getenv("BEAR_BLOCK_NEW_L1", "true").strip().lower() in ("1", "true", "yes"):
+        return True  # ბლოკი გათიშულია ENV-ით
+
+    regime = _detect_market_regime_24h()
+    if regime == "BEAR":
+        logger.info("[REGIME_24H] BEAR_BLOCK_L1 | new L1 positions BLOCKED (Bear market)")
+        return False
+    return True
+
+
 def _cooldown_ok() -> bool:
     global _last_emit_ts
     return (time.time() - _last_emit_ts) >= COOLDOWN_SECONDS
@@ -1770,6 +1885,18 @@ def generate_signal() -> Optional[Dict[str, Any]]:
                 return None
         except Exception as _e:
             logger.warning(f"[GEN] MAX_OPEN_TRADES_CHECK_FAIL | err={_e} → skipped (fail-open)")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SMART LONG + SHORT — BEAR MARKET L1 BLOCK
+    # BEAR market-ში ახალი L1 positions BLOCKED:
+    #   → კაპიტალი ნუ ჩაიკეტება ვარდნაში
+    #   → CASCADE გრძელდება (unrealized-ს TP-ს ელოდება)
+    #   → Futures SHORT hedge-ი მუშაობს
+    # BEAR_BLOCK_NEW_L1=false ENV-ით გათიშვა შეიძლება
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if not _allow_new_l1():
+        logger.info("[GEN] BEAR_REGIME_BLOCK | new L1 position blocked (Bear market) → skip signal")
+        return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FIX GLOBAL-2 v2: CROSS-SYMBOL CORRELATION FILTER (FULL).
