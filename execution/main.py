@@ -74,6 +74,7 @@ from execution.kill_switch import is_kill_switch_active
 from execution.dca_position_manager import get_dca_manager
 from execution.dca_tp_sl_manager import get_tp_sl_manager, DCATpSlManager
 from execution.dca_risk_manager import get_risk_manager
+from execution.futures_engine import get_futures_engine
 from execution.telegram_notifier import (
     notify_performance_snapshot,
     build_daily_stats_from_closed_trades,
@@ -1371,6 +1372,16 @@ def main():
     if _dca_enabled:
         logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '3')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', '40')}")
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SMART LONG + SHORT — Futures Engine init
+    # FUTURES_ENABLED=false → safe default (DEMO ვირტუალური)
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    futures_engine = get_futures_engine()
+    logger.info(
+        f"FUTURES_ENGINE | enabled={futures_engine.enabled} "
+        f"mode={futures_engine.mode} lev={futures_engine.leverage}x"
+    )
+
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
@@ -1479,6 +1490,39 @@ def main():
                         )
                 except Exception as _tfe:
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
+            #
+            # ყოველ loop-ზე:
+            #   1. BTC 24h change → BEAR / BULL / NEUTRAL (5 წუთ cache)
+            #   2. BEAR  → Futures SHORT გახსნა (hedge) + Futures TP/SL check
+            #   3. BULL  → ყველა SHORT დახურვა
+            #   4. NEUTRAL → Futures TP/SL check (ღია SHORT-ები ისევ მიდის)
+            #
+            # signal_generator.py-ც ამ regime-ს იყენებს:
+            #   BEAR → _allow_new_l1()=False → ახალი L1 BLOCKED
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            try:
+                from execution.signal_generator import _detect_market_regime_24h
+                _market_regime = _detect_market_regime_24h()
+
+                if _market_regime == "BEAR":
+                    # SHORT გახსნა (cooldown + max_open შეამოწმებს FuturesEngine)
+                    futures_engine.check_and_open_short(_market_regime)
+                    # TP/SL check — ღია SHORT-ები
+                    futures_engine.check_tp_sl()
+
+                elif _market_regime == "BULL":
+                    # ყველა SHORT-ი დახურვა — ბაზარი შებრუნდა
+                    futures_engine.close_all_shorts(reason="BULL_MARKET")
+
+                else:  # NEUTRAL
+                    # TP/SL check — ღია SHORT-ები ისევ მუშაობს
+                    futures_engine.check_tp_sl()
+
+            except Exception as _fe:
+                logger.warning(f"FUTURES_LOOP_WARN | err={_fe}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # DCA LOOP — add-on check + TP/SL + breakeven + force close
