@@ -1,11 +1,17 @@
 # execution/dca_tp_sl_manager.py
 # ============================================================
 # DCA TP/SL Manager — TP გამოთვლა avg_entry-დან.
-# SL=999% (გათიშული), Breakeven=გათიშული, ForceClose=გათიშული.
+# SL=999% (გათიშული), Breakeven=გათიშული.
+#
+# FORCE CLOSE — 2 პირობა:
+#   1. MAX_OPEN_DAYS=7  → პოზიცია > 7 დღე ღიაა → დახურვა
+#   2. MAX_DRAWDOWN_PCT=15.0 → avg-დან -15% → დახურვა
 #
 # ENV პარამეტრები:
-#   DCA_TP_PCT=0.55   ← L1-L2 TP პროცენტი
-#   DCA_SL_PCT=999.0  ← გათიშული (DCA ფილოსოფია)
+#   DCA_TP_PCT=0.55         ← L1-L2 TP პროცენტი
+#   DCA_SL_PCT=999.0        ← გათიშული (DCA ფილოსოფია)
+#   FORCE_CLOSE_MAX_DAYS=7  ← მაქს დღე ღია (0=გათიშული)
+#   FORCE_CLOSE_DRAWDOWN_PCT=15.0 ← მაქს drawdown % (0=გათიშული)
 # ============================================================
 from __future__ import annotations
 
@@ -35,8 +41,14 @@ class DCATpSlManager:
         self.tp_pct = _ef("DCA_TP_PCT", 0.55)
         self.sl_pct = _ef("DCA_SL_PCT", 999.0)
 
+        # FORCE CLOSE პარამეტრები
+        self.force_close_max_days     = _ef("FORCE_CLOSE_MAX_DAYS", 7.0)
+        self.force_close_drawdown_pct = _ef("FORCE_CLOSE_DRAWDOWN_PCT", 15.0)
+
         logger.info(
-            f"[DCA] DCATpSlManager init | TP={self.tp_pct}% SL={self.sl_pct}%"
+            f"[DCA] DCATpSlManager init | TP={self.tp_pct}% SL={self.sl_pct}% "
+            f"force_close_days={self.force_close_max_days} "
+            f"force_close_drawdown={self.force_close_drawdown_pct}%"
         )
 
     def calculate(self, avg_entry_price: float) -> Dict[str, float]:
@@ -85,11 +97,55 @@ class DCATpSlManager:
         current_price: float,
     ) -> Tuple[bool, str]:
         """
-        DCA სტრატეგია: Force close სრულად გათიშულია.
-        ბოტი ინახავს პოზიციას სანამ TP-ს არ მიაღწევს.
-        არავითარი იძულებითი გაყიდვა არ არის.
+        FORCE CLOSE — 2 პირობა:
+
+        1. MAX DAYS: პოზიცია > FORCE_CLOSE_MAX_DAYS დღე ღიაა
+           → კაპიტალი ჩაკეტილია → პატარა ზარალით დახურვა ჯობია
+           → FORCE_CLOSE_MAX_DAYS=0 → გათიშული
+
+        2. MAX DRAWDOWN: avg-დან -FORCE_CLOSE_DRAWDOWN_PCT%
+           → ბაზარიძლიერ ეცემა → SHORT hedge-ს ვეღარ ანაზღაურებს
+           → FORCE_CLOSE_DRAWDOWN_PCT=0 → გათიშული
         """
-        # DCA: force close disabled — hold until TP
+        # ── 1. MAX DAYS check ────────────────────────────────────────
+        if self.force_close_max_days > 0:
+            try:
+                from datetime import datetime, timezone
+                opened_raw = position.get("opened_at") or position.get("created_at") or ""
+                if opened_raw:
+                    opened_str = str(opened_raw).replace("Z", "+00:00")
+                    opened_dt  = datetime.fromisoformat(opened_str)
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    now_dt   = datetime.now(timezone.utc)
+                    days_open = (now_dt - opened_dt).total_seconds() / 86400.0
+
+                    if days_open >= self.force_close_max_days:
+                        reason = (
+                            f"MAX_DAYS_OPEN | "
+                            f"open={days_open:.1f}d >= limit={self.force_close_max_days:.0f}d"
+                        )
+                        logger.warning(f"[FORCE_CLOSE] {position.get('symbol')} | {reason}")
+                        return True, reason
+            except Exception as _e:
+                logger.warning(f"[FORCE_CLOSE] days_check_fail | err={_e}")
+
+        # ── 2. MAX DRAWDOWN check ────────────────────────────────────
+        if self.force_close_drawdown_pct > 0:
+            try:
+                avg_entry = float(position.get("avg_entry_price") or 0.0)
+                if avg_entry > 0 and current_price > 0:
+                    drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0
+                    if drawdown_pct >= self.force_close_drawdown_pct:
+                        reason = (
+                            f"MAX_DRAWDOWN | "
+                            f"drawdown={drawdown_pct:.2f}% >= limit={self.force_close_drawdown_pct:.1f}%"
+                        )
+                        logger.warning(f"[FORCE_CLOSE] {position.get('symbol')} | {reason}")
+                        return True, reason
+            except Exception as _e:
+                logger.warning(f"[FORCE_CLOSE] drawdown_check_fail | err={_e}")
+
         return False, "OK"
 
 
