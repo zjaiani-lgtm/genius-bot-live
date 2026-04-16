@@ -1399,6 +1399,9 @@ def main():
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # B: PRICE CACHE — ყოველ loop-ზე ერთხელ fetch, cache-დან კითხვა
             # 9 API call → 3 API call (rate limit risk ↓, სიჩქარე ↑)
+            # _market_regime — default NEUTRAL (FUTURES block-ის წინ)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            _market_regime: str = "NEUTRAL"  # ← safe default, FUTURES loop-ში განახლდება
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _price_cache: dict = {}
             _symbols_to_cache = [s.strip() for s in os.getenv(
@@ -1487,6 +1490,27 @@ def main():
                         )
                 except Exception as _tfe:
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
+            # BEAR  → SHORT გახსნა + ADD-ON/CASCADE/LAYER2 BLOCKED
+            # BULL  → SHORT-ები დახურვა + ყველაფერი ნორმალური
+            # NEUTRAL → TP/SL check + ყველაფერი ნორმალური
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            try:
+                from execution.signal_generator import _detect_market_regime_24h
+                _market_regime = _detect_market_regime_24h()
+
+                if _market_regime == "BEAR":
+                    futures_engine.check_and_open_short(_market_regime)
+                    futures_engine.check_tp_sl()
+                elif _market_regime == "BULL":
+                    futures_engine.close_all_shorts(reason="BULL_MARKET")
+                else:
+                    futures_engine.check_tp_sl()
+
+            except Exception as _fe:
+                logger.warning(f"FUTURES_LOOP_WARN | err={_fe}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # DCA LOOP — add-on check + TP/SL + breakeven + force close
