@@ -74,7 +74,6 @@ from execution.kill_switch import is_kill_switch_active
 from execution.dca_position_manager import get_dca_manager
 from execution.dca_tp_sl_manager import get_tp_sl_manager, DCATpSlManager
 from execution.dca_risk_manager import get_risk_manager
-from execution.futures_engine import get_futures_engine
 from execution.telegram_notifier import (
     notify_performance_snapshot,
     build_daily_stats_from_closed_trades,
@@ -183,7 +182,8 @@ def _run_performance_report_safe(send_telegram: bool = False) -> None:
 
 
 
-def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
+def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
+                  market_regime: str = "NEUTRAL") -> None:
     """
     DCA monitoring loop — ყოველ main loop iteration-ზე გამოიძახება.
 
@@ -193,6 +193,7 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
       3. Force close → max drawdown ან max add-ons + SL
       4. SL confirmed → close position
       5. Add-on → drawdown trigger + recovery signals
+         BEAR MODE: ADD-ON BLOCKED (SHORT-ს ეწინააღმდეგება!)
     """
     from execution.db.repository import (
         get_all_open_dca_positions,
@@ -420,6 +421,12 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr) -> None:
             # DCA ADD-ON მხოლოდ L1 (base) პოზიციებზე!
             if is_layer2:
                 logger.debug(f"[DCA] SKIP_ADDON | {sym} is Layer position → CASCADE manages")
+                continue
+
+            # BEAR MODE: ADD-ON BLOCKED
+            # SHORT-ი ბაზრის ვარდნაზე ფსონობს — ADD-ON საპირისპიროა!
+            if market_regime == "BEAR":
+                logger.info(f"[DCA] ADDON_BEAR_BLOCK | {sym} BEAR market → ADD-ON blocked")
                 continue
             all_positions = get_all_open_dca_positions()
             addon_ok, addon_reason = dca_mgr.should_add_on(pos, current_price, ohlcv)
@@ -1372,16 +1379,6 @@ def main():
     if _dca_enabled:
         logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '3')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', '40')}")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # SMART LONG + SHORT — Futures Engine init
-    # FUTURES_ENABLED=false → safe default (DEMO ვირტუალური)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    futures_engine = get_futures_engine()
-    logger.info(
-        f"FUTURES_ENGINE | enabled={futures_engine.enabled} "
-        f"mode={futures_engine.mode} lev={futures_engine.leverage}x"
-    )
-
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
     logger.info(f"LOOP_SLEEP_SECONDS={sleep_s}")
@@ -1492,66 +1489,42 @@ def main():
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
-            #
-            # ყოველ loop-ზე:
-            #   1. BTC 24h change → BEAR / BULL / NEUTRAL (5 წუთ cache)
-            #   2. BEAR  → Futures SHORT გახსნა (hedge) + Futures TP/SL check
-            #   3. BULL  → ყველა SHORT დახურვა
-            #   4. NEUTRAL → Futures TP/SL check (ღია SHORT-ები ისევ მიდის)
-            #
-            # signal_generator.py-ც ამ regime-ს იყენებს:
-            #   BEAR → _allow_new_l1()=False → ახალი L1 BLOCKED
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            try:
-                from execution.signal_generator import _detect_market_regime_24h
-                _market_regime = _detect_market_regime_24h()
-
-                if _market_regime == "BEAR":
-                    # SHORT გახსნა (cooldown + max_open შეამოწმებს FuturesEngine)
-                    futures_engine.check_and_open_short(_market_regime)
-                    # TP/SL check — ღია SHORT-ები
-                    futures_engine.check_tp_sl()
-
-                elif _market_regime == "BULL":
-                    # ყველა SHORT-ი დახურვა — ბაზარი შებრუნდა
-                    futures_engine.close_all_shorts(reason="BULL_MARKET")
-
-                else:  # NEUTRAL
-                    # TP/SL check — ღია SHORT-ები ისევ მუშაობს
-                    futures_engine.check_tp_sl()
-
-            except Exception as _fe:
-                logger.warning(f"FUTURES_LOOP_WARN | err={_fe}")
-
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # DCA LOOP — add-on check + TP/SL + breakeven + force close
+            # BEAR MODE: ADD-ON ბლოკილია (_market_regime გადაეცემა)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
                 try:
-                    _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr)
+                    _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
+                                  market_regime=_market_regime)
                 except Exception as e:
                     logger.warning(f"DCA_LOOP_WARN | err={e}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # LAYER 2 — Crash detection & parallel trading
-            # DEMO: price_feed გამოიყენება (engine.exchange = None OK)
+            # BEAR MODE: BLOCKED — ახალი layer არ გაიხსნოს!
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
-                try:
-                    _check_and_open_layer2(engine, tp_sl_mgr)
-                except Exception as e:
-                    logger.warning(f"LAYER2_CHECK_WARN | err={e}")
+                if _market_regime == "BEAR":
+                    logger.info("[LAYER2] BEAR_BLOCK | BEAR market → Layer2 open BLOCKED")
+                else:
+                    try:
+                        _check_and_open_layer2(engine, tp_sl_mgr)
+                    except Exception as e:
+                        logger.warning(f"LAYER2_CHECK_WARN | err={e}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # CASCADE DCA — Rolling Exchange სტრატეგია
-            # DEMO: ვირტუალური buy/sell (engine.exchange = None OK)
+            # BEAR MODE: BLOCKED — ახალი layer ყიდვა შეაჩერებს SHORT-ს!
+            # არსებული CASCADE TP-ს ელოდება (TP hit = cascade დახურვა ✅)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
-                try:
-                    _check_cascade_exchange(engine, tp_sl_mgr)
-                except Exception as e:
-                    logger.warning(f"CASCADE_CHECK_WARN | err={e}")
+                if _market_regime == "BEAR":
+                    logger.info("[CASCADE] BEAR_BLOCK | BEAR market → new CASCADE layer BLOCKED")
+                else:
+                    try:
+                        _check_cascade_exchange(engine, tp_sl_mgr)
+                    except Exception as e:
+                        logger.warning(f"CASCADE_CHECK_WARN | err={e}")
 
             if generate_once is not None:
                 try:
