@@ -74,6 +74,7 @@ from execution.kill_switch import is_kill_switch_active
 from execution.dca_position_manager import get_dca_manager
 from execution.dca_tp_sl_manager import get_tp_sl_manager, DCATpSlManager
 from execution.dca_risk_manager import get_risk_manager
+from execution.futures_engine import get_futures_engine
 from execution.telegram_notifier import (
     notify_performance_snapshot,
     build_daily_stats_from_closed_trades,
@@ -1378,6 +1379,16 @@ def main():
     risk_mgr  = get_risk_manager()  if _dca_enabled else None
     if _dca_enabled:
         logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '3')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', '40')}")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SMART LONG + SHORT — Futures Engine init
+    # FUTURES_ENABLED=true + FUTURES_MODE=DEMO → ვირტუალური SHORT
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    futures_engine = get_futures_engine()
+    logger.info(
+        f"FUTURES_ENGINE | enabled={futures_engine.enabled} "
+        f"mode={futures_engine.mode} lev={futures_engine.leverage}x"
+    )
 
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
     logger.info(f"OUTBOX_PATH={outbox_path}")
