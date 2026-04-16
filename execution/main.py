@@ -338,9 +338,11 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                         pass
 
                     from execution.telegram_notifier import notify_dca_closed
+                    from execution.db.repository import get_trade_stats
+                    stats = get_trade_stats()
                     notify_dca_closed(
                         sym, avg_entry, exit_price, total_qty, total_quote,
-                        pnl_quote, pnl_pct, "FORCE_CLOSE", add_on_count
+                        pnl_quote, pnl_pct, "FORCE_CLOSE", add_on_count, stats
                     )
                 except Exception as e:
                     logger.error(f"[DCA] FORCE_CLOSE_FAIL | {sym} err={e}")
@@ -1517,6 +1519,7 @@ def main():
                     futures_engine.check_tp_sl()
                 elif _market_regime == "BULL":
                     futures_engine.close_all_shorts(reason="BULL_MARKET")
+                    futures_engine.check_tp_sl()
                 else:
                     futures_engine.check_tp_sl()
 
