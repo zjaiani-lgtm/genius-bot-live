@@ -47,8 +47,10 @@ FILES=(
     "signal_client.py"
     "startup_sync.py"
     "performance_report.py"
-    "portfolio_manager.py"
-    "virtual_wallet.py"
+    "futures_engine.py"
+    "dca_position_manager.py"
+    "dca_tp_sl_manager.py"
+    "dca_risk_manager.py"
 )
 for f in "${FILES[@]}"; do
     path="$BASE/$f"
@@ -488,33 +490,33 @@ else:
 try:
     fee_rt = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))
     slip   = float(os.getenv("ESTIMATED_SLIPPAGE_PCT",      "0.05"))
-    tp_pct = float(os.getenv("TP_PCT",  "1.5"))
-    sl_pct = float(os.getenv("SL_PCT",  "0.80"))
-    quote  = float(os.getenv("BOT_QUOTE_PER_TRADE", "10.0"))
+    # DCA ბოტი: TP_PCT გამოიყენება DCA_TP_PCT-დან, SL_PCT=999 (გათიშული!)
+    dca_tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))  # DCA რეალური TP
+    dca_sl_pct_raw = float(os.getenv("DCA_SL_PCT", "999.0"))
+    dca_sl_disabled = dca_sl_pct_raw >= 999.0  # Anti-Loss ფილოსოფია
+    quote  = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
     cost   = (fee_rt + slip) / 100.0
 
-    tp_net = quote * (tp_pct / 100.0) - quote * cost
-    sl_net = -(quote * (sl_pct / 100.0) + quote * cost)
-    rr     = abs(tp_net) / abs(sl_net) if sl_net != 0 else 0
-    be_wr  = abs(sl_net) / (tp_net + abs(sl_net)) * 100 if (tp_net + abs(sl_net)) > 0 else 100
-
-    info(f"TP({tp_pct}%) net=+{tp_net:.4f} USDT | SL({sl_pct}%) net={sl_net:.4f} USDT | R:R=1:{rr:.2f}")
+    tp_net = quote * (dca_tp_pct / 100.0) - quote * cost
+    info(f"DCA TP({dca_tp_pct}%) net=+{tp_net:.4f} USDT | SL={'გათიშულია (999%) ✅' if dca_sl_disabled else str(dca_sl_pct_raw)+'%'}")
 
     if tp_net > 0:
-        ok(f"TP net profit: +{tp_net:.4f} USDT (fees={fee_rt+slip:.2f}% დაფარულია) ✓")
+        ok(f"DCA TP net profit: +{tp_net:.4f} USDT (fees={fee_rt+slip:.2f}% დაფარულია) ✓")
     else:
-        fail(f"TP net: {tp_net:.4f} USDT — TP_PCT={tp_pct}% ძალიან დაბალია fees-ის გასაფარებლად!")
+        fail(f"DCA TP net: {tp_net:.4f} USDT — DCA_TP_PCT={dca_tp_pct}% ძალიან დაბალია!")
 
-    if sl_net < 0:
-        ok(f"SL net loss: {sl_net:.4f} USDT ✓")
-
-    info(f"Breakeven winrate = {be_wr:.1f}% (ამაზე მეტი საჭიროა):")
-    if be_wr <= 35:
-        ok(f"Breakeven WR {be_wr:.1f}% — მარტივად მისაღწევია ✓")
-    elif be_wr <= 45:
-        warn(f"Breakeven WR {be_wr:.1f}% — winrate {be_wr:.0f}%+ საჭიროა — TP/SL-ის გადახედვა სასარგებლო იქნება")
+    # SL=999 → Anti-Loss ფილოსოფია — Breakeven WR არ ითვლება!
+    if dca_sl_disabled:
+        ok("DCA SL_PCT=999 — Anti-Loss ფილოსოფია ✅ (Breakeven WR არ გამოითვლება)")
+        info("DCA ბოტი არასდროს ხურავს ზარალზე — CASCADE/ADD-ON იცავს!")
     else:
-        fail(f"Breakeven WR {be_wr:.1f}% — ძალიან მაღალი! TP_PCT ან SL_PCT გადასახედია")
+        sl_net = -(quote * (dca_sl_pct_raw / 100.0) + quote * cost)
+        be_wr  = abs(sl_net) / (tp_net + abs(sl_net)) * 100 if (tp_net + abs(sl_net)) > 0 else 100
+        info(f"Breakeven winrate = {be_wr:.1f}%")
+        if be_wr <= 45:
+            ok(f"Breakeven WR {be_wr:.1f}% ✓")
+        else:
+            warn(f"Breakeven WR {be_wr:.1f}% — მაღალია")
 
 except Exception as e:
     fail(f"PnL კალკულაცია: {e}")
@@ -573,7 +575,7 @@ section "12. DCA პოზიციები (LONG)"
 python3 - "$DB_PATH" << 'PYEOF'
 import sqlite3, sys
 db = sys.argv[1]
-G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; C='\033[0;36m'; NC='\033[0m'
+G='[0;32m'; R='[0;31m'; C='[0;36m'; NC='[0m'
 try:
     conn = sqlite3.connect(db)
     rows = conn.execute("""
@@ -592,10 +594,10 @@ try:
             if tp > avg:
                 print(f'{G}[OK]{NC}   {sym:<18} avg={avg:.2f} tp={tp:.2f} ({pct:+.2f}%) {quote:.0f}$ addons={addons}')
             else:
-                print(f'{R}[FAIL]{NC} {sym:<18} TP<=avg — გასასწორებელია!')
+                print(f'{R}[FAIL]{NC} {sym:<18} TP={tp:.2f} <= avg={avg:.2f} — გასასწორებელია!')
     conn.close()
 except Exception as e:
-    print(f'{R}[FAIL]{NC} dca_positions: {e}')
+    print(f'[0;31m[FAIL][0m dca_positions: {e}')
 PYEOF
 
 # ─────────────────────────────────────────
@@ -604,7 +606,7 @@ section "13. SHORT პოზიციები (Futures)"
 python3 - "$DB_PATH" << 'PYEOF'
 import sqlite3, sys
 db = sys.argv[1]
-G='\033[0;32m'; R='\033[0;31m'; Y='\033[1;33m'; C='\033[0;36m'; NC='\033[0m'
+G='[0;32m'; R='[0;31m'; Y='[1;33m'; C='[0;36m'; NC='[0m'
 try:
     conn = sqlite3.connect(db)
     open_s = conn.execute("""
@@ -622,7 +624,7 @@ try:
         print(f'{Y}[WARN]{NC} ღია SHORT-ები: {len(open_s)}')
         for r in open_s:
             sym, direction, entry, tp, sl, quote, lev, mode, opened = r
-            print(f'{C}[INFO]{NC}   └─ {sym} entry={float(entry):.2f} tp={float(tp):.2f} {quote}$×{lev} {mode}')
+            print(f'{C}[INFO]{NC}   └─ {sym} entry={float(entry):.2f} tp={float(tp):.2f} {quote}$×{lev} {mode} {opened[:16]}')
     if not closed_s:
         print(f'{C}[INFO]{NC} დახურული SHORT ჯერ არ არის')
     else:
@@ -634,7 +636,7 @@ try:
             print(f'{col}[{"OK" if pnl>=0 else "FAIL"}]{NC}   {sym} {outcome} pnl={pnl:+.4f}$ {closed[:16]}')
     conn.close()
 except Exception as e:
-    print(f'{R}[FAIL]{NC} futures_positions: {e}')
+    print(f'[0;31m[FAIL][0m futures_positions: {e}')
 PYEOF
 
 # ─────────────────────────────────────────
@@ -651,7 +653,7 @@ else
 fi
 python3 - << 'PYEOF'
 import os
-G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; NC='\033[0m'
+G='[0;32m'; Y='[1;33m'; C='[0;36m'; NC='[0m'
 for k, exp in [('FUTURES_ENABLED','true'),('FUTURES_MODE','DEMO'),('FUTURES_QUOTE',None),('FUTURES_TP_PCT',None),('FUTURES_SL_PCT',None)]:
     v = os.getenv(k, 'NOT SET')
     if k == 'FUTURES_ENABLED':
