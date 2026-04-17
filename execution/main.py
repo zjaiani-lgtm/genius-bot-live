@@ -1877,6 +1877,7 @@ def main():
                     )
                     notify_daily_close_summary(daily_stats)
                     last_daily_summary_date = today_str
+                    last_heartbeat_ts = 0.0  # Daily Summary-ის შემდეგ Heartbeat დაუყოვნებლივ გაიგზავნოს
 
                     logger.info(
                         "DAILY_SUMMARY_SENT | date=%s closed=%s pnl=%.4f",
