@@ -821,10 +821,10 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     if total_layers >= max_layers:
         # resume_layer-ზე მიაღწია? — გახსენი
         if total_layers < resume_layer:
-            logger.info(f"[CASCADE] PAUSED | {total_layers} >= {max_layers}, waiting for {resume_layer}")
+            logger.debug(f"[CASCADE] PAUSED | {total_layers} >= {max_layers}, waiting for {resume_layer}")
             return
         else:
-            logger.warning(f"[CASCADE] RESUMING | total_layers={total_layers} >= {resume_layer}")
+            logger.debug(f"[CASCADE] RESUMING | total_layers={total_layers} >= {resume_layer}")
 
     for sym in symbols:
         try:
