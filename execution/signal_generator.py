@@ -562,7 +562,7 @@ def _detect_market_regime_24h() -> str:
 
         # cache განახლება
         if regime != _LAST_REGIME_VAL:
-            logger.warning(
+            logger.info(
                 f"[REGIME_24H] CHANGE | {_LAST_REGIME_VAL} → {regime} "
                 f"(change={change_pct:+.2f}%)"
             )
