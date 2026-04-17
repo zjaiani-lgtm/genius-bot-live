@@ -1520,10 +1520,34 @@ def main():
                 _market_regime = _detect_market_regime_24h()
 
                 # L3 trigger შემოწმება
+                # ვამოწმებთ: გვაქვს თუ არა L3 (ან მეტი) suffix-იანი პოზიცია
+                import re as _re_l3
                 _all_open = _get_pos()
                 _layer_count = len(_all_open)
                 _short_trigger_layer = int(os.getenv("SHORT_TRIGGER_LAYER", "3"))
-                _l3_triggered = _layer_count >= _short_trigger_layer
+
+                # L3+ suffix-ის მქონე პოზიციების შემოწმება
+                # BTC/USDT_L3, ETH/USDT_L3... → trigger!
+                _max_layer_num = 0
+                for _p in _all_open:
+                    _sym = str(_p.get("symbol", ""))
+                    _m = _re_l3.search(r'_L(\d+)$', _sym)
+                    if _m:
+                        _max_layer_num = max(_max_layer_num, int(_m.group(1)))
+
+                # L3+ არსებობს → trigger
+                # ან სულ layer count >= trigger (ADD-ON-ების ჩათვლით)
+                _l3_triggered = (
+                    _max_layer_num >= _short_trigger_layer
+                    or _layer_count >= (_short_trigger_layer + 2)
+                )
+
+                logger.info(
+                    f"[L3_CHECK] total_positions={_layer_count} "
+                    f"max_layer={_max_layer_num} "
+                    f"trigger_at={_short_trigger_layer} "
+                    f"l3_triggered={_l3_triggered}"
+                )
 
                 if _market_regime == "BULL":
                     # BULL → ყველა SHORT დაიხუროს
