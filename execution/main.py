@@ -1505,22 +1505,45 @@ def main():
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
-            # BEAR  → SHORT გახსნა + ADD-ON/CASCADE/LAYER2 BLOCKED
-            # BULL  → SHORT-ები დახურვა + ყველაფერი ნორმალური
-            # NEUTRAL → TP/SL check + ყველაფერი ნორმალური
+            # SMART LONG + SHORT — L3 TRIGGER სტრატეგია
+            #
+            # L1-L2: ჩვეულებრივი DCA, CASCADE მუშაობს
+            # L3+:   SHORT ჩაირთვება + CASCADE BLOCKED
+            #        MAX_LONG = 2 (მხოლოდ L3 trades ღია)
+            # BULL:  SHORT-ები დახურვა
+            #
+            # SHORT ADD-ON + EXCHANGE + SL მუშაობს BEAR და NEUTRAL-ში
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 from execution.signal_generator import _detect_market_regime_24h
+                from execution.db.repository import get_all_open_dca_positions as _get_pos
                 _market_regime = _detect_market_regime_24h()
 
-                if _market_regime == "BEAR":
-                    futures_engine.check_and_open_short(_market_regime)
-                    futures_engine.check_tp_sl()
-                elif _market_regime == "BULL":
+                # L3 trigger შემოწმება
+                _all_open = _get_pos()
+                _layer_count = len(_all_open)
+                _short_trigger_layer = int(os.getenv("SHORT_TRIGGER_LAYER", "3"))
+                _l3_triggered = _layer_count >= _short_trigger_layer
+
+                if _market_regime == "BULL":
+                    # BULL → ყველა SHORT დაიხუროს
                     futures_engine.close_all_shorts(reason="BULL_MARKET")
                     futures_engine.check_tp_sl()
+
+                elif _l3_triggered:
+                    # L3+ → SHORT ჩაირთვება (BEAR ან NEUTRAL-ში)
+                    logger.info(
+                        f"[L3_TRIGGER] layers={_layer_count} >= {_short_trigger_layer} "
+                        f"→ SHORT activated | regime={_market_regime}"
+                    )
+                    futures_engine.check_and_open_short("BEAR")
+                    futures_engine.check_tp_sl()
+                    futures_engine.check_and_addon_short()
+                    futures_engine.check_and_exchange_short()
+                    futures_engine.check_addon_sl()
+
                 else:
+                    # L1-L2: ჩვეულებრივი TP/SL შემოწმება
                     futures_engine.check_tp_sl()
 
             except Exception as _fe:
@@ -1539,11 +1562,14 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # LAYER 2 — Crash detection & parallel trading
-            # BEAR MODE: BLOCKED — ახალი layer არ გაიხსნოს!
+            # L3+ ან BEAR MODE: BLOCKED
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
-                if _market_regime == "BEAR":
-                    logger.info("[LAYER2] BEAR_BLOCK | BEAR market → Layer2 open BLOCKED")
+                if _market_regime == "BEAR" or _l3_triggered:
+                    logger.info(
+                        f"[LAYER2] BLOCKED | regime={_market_regime} "
+                        f"l3_triggered={_l3_triggered} → Layer2 open BLOCKED"
+                    )
                 else:
                     try:
                         _check_and_open_layer2(engine, tp_sl_mgr)
@@ -1552,12 +1578,15 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # CASCADE DCA — Rolling Exchange სტრატეგია
-            # BEAR MODE: BLOCKED — ახალი layer ყიდვა შეაჩერებს SHORT-ს!
-            # არსებული CASCADE TP-ს ელოდება (TP hit = cascade დახურვა ✅)
+            # L3+ ან BEAR MODE: BLOCKED
+            # L3+ -ზე SHORT-ი მუშაობს — CASCADE საჭირო არ არის
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
-                if _market_regime == "BEAR":
-                    logger.info("[CASCADE] BEAR_BLOCK | BEAR market → new CASCADE layer BLOCKED")
+                if _market_regime == "BEAR" or _l3_triggered:
+                    logger.info(
+                        f"[CASCADE] BLOCKED | regime={_market_regime} "
+                        f"l3_triggered={_l3_triggered} → CASCADE BLOCKED"
+                    )
                 else:
                     try:
                         _check_cascade_exchange(engine, tp_sl_mgr)
