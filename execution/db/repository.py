@@ -691,6 +691,41 @@ def get_trade_stats() -> Dict[str, Any]:
     cascade_count    = int(row_cascade[0] or 0)
     cascade_pnl      = float(row_cascade[1] or 0.0)
 
+    # ── futures_positions PnL დამატება ──────────────────────
+    # SHORT-ების მოგება/ზარალი სტატისტიკაში უნდა ჩანდეს!
+    try:
+        row_futures = _fetchone(
+            """
+            SELECT
+                COUNT(*) AS futures_count,
+                COALESCE(SUM(CASE WHEN pnl_quote > 0 THEN 1 ELSE 0 END), 0) AS futures_wins,
+                COALESCE(SUM(CASE WHEN pnl_quote < 0 THEN 1 ELSE 0 END), 0) AS futures_losses,
+                COALESCE(SUM(pnl_quote), 0) AS futures_pnl,
+                COALESCE(SUM(CASE WHEN pnl_quote > 0 THEN pnl_quote ELSE 0 END), 0) AS futures_gross_profit,
+                COALESCE(ABS(SUM(CASE WHEN pnl_quote < 0 THEN pnl_quote ELSE 0 END)), 0) AS futures_gross_loss
+            FROM futures_positions
+            WHERE status = 'CLOSED'
+            """
+        ) or (0, 0, 0, 0.0, 0.0, 0.0)
+
+        futures_count        = int(row_futures[0] or 0)
+        futures_wins         = int(row_futures[1] or 0)
+        futures_losses       = int(row_futures[2] or 0)
+        futures_pnl          = float(row_futures[3] or 0.0)
+        futures_gross_profit = float(row_futures[4] or 0.0)
+        futures_gross_loss   = float(row_futures[5] or 0.0)
+    except Exception:
+        futures_count = futures_wins = futures_losses = 0
+        futures_pnl = futures_gross_profit = futures_gross_loss = 0.0
+
+    # სტატისტიკაში futures შეკრება
+    closed_trades += futures_count
+    wins          += futures_wins
+    losses        += futures_losses
+    pnl_quote_sum += futures_pnl
+    gross_profit  += futures_gross_profit
+    gross_loss    += futures_gross_loss
+
     winrate_pct   = (wins / closed_trades * 100.0) if closed_trades else 0.0
     roi_pct       = (pnl_quote_sum / quote_in_sum * 100.0) if quote_in_sum else 0.0
     profit_factor = (
