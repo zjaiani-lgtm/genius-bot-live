@@ -752,22 +752,17 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     """
     Cascade DCA — "Rolling Exchange" სტრატეგია.
 
-    Layer-ის მიხედვით drop_pct და tp_pct იცვლება:
-      L2-L3:  drop=1.5%  tp=0.55%
-      L4-L7:  drop=2.0%  tp=0.65%
-      L8-L10: drop=5.0%  tp=1.00%  ← განახლებული!
-      L10+:   CASCADE_MAX_LAYERS=10 → გაჩერება
+    მხოლოდ L2→L3 ორი layer:
+      L2 open → price drops -1.5% from L2 avg → sells L2, opens L3
+      L3 open → SHORT trigger (FIX #15)
+      CASCADE_MAX_LAYERS=3 → L3-ზე ჩერდება
 
     ENV:
       CASCADE_ENABLED=true
-      CASCADE_START_LAYER=2       ← L2-დან იწყება
-      CASCADE_DROP_PCT=1.5        ← L2-L3 trigger
-      CASCADE_DROP_L4_PCT=2.0     ← L4-L7 trigger
-      CASCADE_DROP_L8_PCT=5.0     ← L8-L10 trigger (იყო 3.0%)
-      CASCADE_TP_L3_PCT=0.65      ← L3-L7 TP პროცენტი
-      CASCADE_TP_L8_PCT=1.00      ← L8-L10 TP პროცენტი (ახალი!)
-      CASCADE_MAX_LAYERS=10       ← მე-10-ზე გაჩერება
-      CASCADE_RESUME_LAYER=10     ← dead zone გაუქმება
+      CASCADE_START_LAYER=2   ← L2-დან იწყება
+      CASCADE_DROP_PCT=1.5    ← ერთიანი trigger L3-სთვის
+      CASCADE_TP_L3_PCT=0.65  ← L3 TP პროცენტი
+      CASCADE_MAX_LAYERS=3    ← L3-ზე გაჩერება
       CASCADE_SYMBOLS=BTC/USDT,BNB/USDT,ETH/USDT
     """
     import os
@@ -787,14 +782,10 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     )
 
     cascade_start  = int(os.getenv("CASCADE_START_LAYER",  "2"))
-    drop_pct_base  = float(os.getenv("CASCADE_DROP_PCT",    "1.5"))  # L2-L3
-    drop_pct_l4    = float(os.getenv("CASCADE_DROP_L4_PCT", "2.0"))  # L4-L7
-    drop_pct_l8    = float(os.getenv("CASCADE_DROP_L8_PCT", "5.0"))  # L8-L10 (იყო 3.0%)
+    drop_pct_base  = float(os.getenv("CASCADE_DROP_PCT",    "1.5"))  # L2→L3 trigger
     tp_pct_base    = float(os.getenv("DCA_TP_PCT",          "0.55")) # L1-L2
-    tp_pct_l3      = float(os.getenv("CASCADE_TP_L3_PCT",   "0.65")) # L3-L7
-    tp_pct_l8      = float(os.getenv("CASCADE_TP_L8_PCT",   "1.00")) # L8-L10 (ახალი!)
-    max_layers     = int(os.getenv("CASCADE_MAX_LAYERS",    "10"))
-    resume_layer   = int(os.getenv("CASCADE_RESUME_LAYER",  "10"))   # dead zone გაუქმება
+    tp_pct_l3      = float(os.getenv("CASCADE_TP_L3_PCT",   "0.65")) # L3
+    max_layers     = int(os.getenv("CASCADE_MAX_LAYERS",     "3"))   # L3-ზე გაჩერება
     symbols_raw    = os.getenv("CASCADE_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT")
     symbols        = [s.strip() for s in symbols_raw.split(",") if s.strip()]
     buffer         = float(os.getenv("SMART_ADDON_BUFFER", "5.0"))
@@ -807,7 +798,7 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
 
     logger.info(
         f"[CASCADE] CHECK | total_layers={total_layers} "
-        f"start_at={cascade_start} max={max_layers} resume_at={resume_layer}"
+        f"start_at={cascade_start} max={max_layers}"
     )
 
     # Cascade ჯერ არ დაწყებულა?
@@ -815,14 +806,10 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
         logger.debug(f"[CASCADE] NOT_YET | {total_layers} < {cascade_start}")
         return
 
-    # მე-10-ზე გაჩერება — resume_layer-ს ვეცდინოთ
+    # L3-ზე გაჩერება
     if total_layers >= max_layers:
-        # resume_layer-ზე მიაღწია? — გახსენი
-        if total_layers < resume_layer:
-            logger.info(f"[CASCADE] PAUSED | {total_layers} >= {max_layers}, waiting for {resume_layer}")
-            return
-        else:
-            logger.warning(f"[CASCADE] RESUMING | total_layers={total_layers} >= {resume_layer}")
+        logger.info(f"[CASCADE] MAX_REACHED | {total_layers} >= {max_layers} → stop")
+        return
 
     for sym in symbols:
         try:
@@ -857,26 +844,12 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
             oldest_id    = oldest["id"]
             oldest_sym   = oldest["symbol"]
 
-            # Layer ნომერი განვსაზღვროთ (sym_positions.len = ახლანდელი layer count)
-            layer_num = len(sym_positions)  # მაგ: 2 = L2, 4 = L4...
+            # Layer ნომერი — მხოლოდ L2→L3
+            layer_num = len(sym_positions)  # 2 = L2 open → triggers L3
 
-            # ── Layer-ის მიხედვით drop_pct ─────────────────────────
-            # L2-L3: 1.5%  |  L4-L7: 2.0%  |  L8-L10: 5.0%
-            if layer_num >= 8:
-                drop_pct = drop_pct_l8
-            elif layer_num >= 4:
-                drop_pct = drop_pct_l4
-            else:
-                drop_pct = drop_pct_base
-
-            # ── Layer-ის მიხედვით tp_pct ───────────────────────────
-            # L1-L2: 0.55%  |  L3-L7: 0.65%  |  L8-L10: 1.00%
-            if layer_num >= 8:
-                tp_pct = tp_pct_l8
-            elif layer_num >= 3:
-                tp_pct = tp_pct_l3
-            else:
-                tp_pct = tp_pct_base
+            # ── drop_pct და tp_pct — ყველა layer ერთნაირი ──────────
+            drop_pct = drop_pct_base   # 1.5%
+            tp_pct   = tp_pct_l3       # 0.65%
 
             logger.info(
                 f"[CASCADE] {sym} | layer={layer_num} "
@@ -1116,46 +1089,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                     f"[CASCADE] NEW_LAYER | {new_sym} entry={buy_price:.4f} "
                     f"tp={tp_price:.4f} quote={buy_quote:.4f}"  # FIX #13
                 )
-
-                # ── F: CASCADE DEPTH WARNING — L7+ გაფრთხილება ──────────
-                new_layer_num = layer_num + 1
-                _warn_from = int(os.getenv("CASCADE_WARN_FROM_LAYER", "7"))
-                if new_layer_num >= _warn_from:
-                    try:
-                        from execution.telegram_notifier import notify_cascade_depth
-                        # ბაზრის მიმართულება ბოლო 3 layer-ის avg-დან
-                        if len(sym_positions) >= 2:
-                            _sorted = sorted(sym_positions, key=lambda p: str(p.get("opened_at", "")))
-                            _first_avg = float(_sorted[0].get("avg_entry_price", 0))
-                            _last_avg = float(_sorted[-1].get("avg_entry_price", 0))
-                            if _last_avg < _first_avg * 0.998:
-                                _trend = "down"
-                            elif _last_avg > _first_avg * 1.002:
-                                _trend = "up"
-                            else:
-                                _trend = "sideways"
-                        else:
-                            _trend = "unknown"
-
-                        # HIGH-დან ვარდნა
-                        try:
-                            _ticker = engine.price_feed.fetch_ticker(sym)
-                            _high24 = float(_ticker.get("high") or 0.0)
-                            _drop_h = ((_high24 - buy_price) / _high24 * 100.0) if _high24 > 0 else 0.0
-                        except Exception:
-                            _drop_h = drop_from_newest
-
-                        notify_cascade_depth(
-                            symbol=sym,
-                            layer_num=new_layer_num,
-                            max_layers=max_layers,
-                            drop_from_high_pct=_drop_h,
-                            current_price=buy_price,
-                            avg_entry=buy_price,
-                            price_trend=_trend,
-                        )
-                    except Exception as _cwe:
-                        logger.warning(f"[CASCADE] DEPTH_WARN_FAIL | err={_cwe}")
 
             except Exception as _be:
                 logger.error(f"[CASCADE] BUY_FAIL | {new_sym} err={_be}")
