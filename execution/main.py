@@ -338,11 +338,9 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                         pass
 
                     from execution.telegram_notifier import notify_dca_closed
-                    from execution.db.repository import get_trade_stats
-                    stats = get_trade_stats()
                     notify_dca_closed(
                         sym, avg_entry, exit_price, total_qty, total_quote,
-                        pnl_quote, pnl_pct, "FORCE_CLOSE", add_on_count, stats
+                        pnl_quote, pnl_pct, "FORCE_CLOSE", add_on_count
                     )
                 except Exception as e:
                     logger.error(f"[DCA] FORCE_CLOSE_FAIL | {sym} err={e}")
@@ -821,10 +819,10 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     if total_layers >= max_layers:
         # resume_layer-ზე მიაღწია? — გახსენი
         if total_layers < resume_layer:
-            logger.debug(f"[CASCADE] PAUSED | {total_layers} >= {max_layers}, waiting for {resume_layer}")
+            logger.info(f"[CASCADE] PAUSED | {total_layers} >= {max_layers}, waiting for {resume_layer}")
             return
         else:
-            logger.debug(f"[CASCADE] RESUMING | total_layers={total_layers} >= {resume_layer}")
+            logger.warning(f"[CASCADE] RESUMING | total_layers={total_layers} >= {resume_layer}")
 
     for sym in symbols:
         try:
@@ -952,7 +950,7 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                 if not open_tr:
                     # fallback2: base symbol-ის ყველა ვარიანტი (_L2 … _L10)
                     base = exchange_sym.replace("/USDT", "")
-                    for suffix in ["", "_L2", "_L3", "_L4", "_L5", "_L6", "_L7", "_L8", "_L9", "_L10"]:
+                    for suffix in ["", "_L2", "_L3"]:
                         _tr = get_open_trade_for_symbol(f"{base}/USDT{suffix}")
                         if _tr:
                             open_tr = _tr
@@ -1505,69 +1503,21 @@ def main():
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # SMART LONG + SHORT — L3 TRIGGER სტრატეგია
-            #
-            # L1-L2: ჩვეულებრივი DCA, CASCADE მუშაობს
-            # L3+:   SHORT ჩაირთვება + CASCADE BLOCKED
-            #        MAX_LONG = 2 (მხოლოდ L3 trades ღია)
-            # BULL:  SHORT-ები დახურვა
-            #
-            # SHORT ADD-ON + EXCHANGE + SL მუშაობს BEAR და NEUTRAL-ში
+            # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
+            # BEAR  → SHORT გახსნა + ADD-ON/CASCADE/LAYER2 BLOCKED
+            # BULL  → SHORT-ები დახურვა + ყველაფერი ნორმალური
+            # NEUTRAL → TP/SL check + ყველაფერი ნორმალური
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 from execution.signal_generator import _detect_market_regime_24h
-                from execution.db.repository import get_all_open_dca_positions as _get_pos
                 _market_regime = _detect_market_regime_24h()
 
-                # L3 trigger შემოწმება
-                # ვამოწმებთ: გვაქვს თუ არა L3 (ან მეტი) suffix-იანი პოზიცია
-                import re as _re_l3
-                _all_open = _get_pos()
-                _layer_count = len(_all_open)
-                _short_trigger_layer = int(os.getenv("SHORT_TRIGGER_LAYER", "3"))
-
-                # L3+ suffix-ის მქონე პოზიციების შემოწმება
-                # BTC/USDT_L3, ETH/USDT_L3... → trigger!
-                _max_layer_num = 0
-                for _p in _all_open:
-                    _sym = str(_p.get("symbol", ""))
-                    _m = _re_l3.search(r'_L(\d+)$', _sym)
-                    if _m:
-                        _max_layer_num = max(_max_layer_num, int(_m.group(1)))
-
-                # L3+ არსებობს → trigger
-                # ან სულ layer count >= trigger (ADD-ON-ების ჩათვლით)
-                _l3_triggered = (
-                    _max_layer_num >= _short_trigger_layer
-                    or _layer_count >= (_short_trigger_layer + 2)
-                )
-
-                logger.info(
-                    f"[L3_CHECK] total_positions={_layer_count} "
-                    f"max_layer={_max_layer_num} "
-                    f"trigger_at={_short_trigger_layer} "
-                    f"l3_triggered={_l3_triggered}"
-                )
-
-                if _market_regime == "BULL":
-                    # BULL → ყველა SHORT დაიხუროს
+                if _market_regime == "BEAR":
+                    futures_engine.check_and_open_short(_market_regime)
+                    futures_engine.check_tp_sl()
+                elif _market_regime == "BULL":
                     futures_engine.close_all_shorts(reason="BULL_MARKET")
-                    futures_engine.check_tp_sl()
-
-                elif _l3_triggered:
-                    # L3+ → SHORT ჩაირთვება (BEAR ან NEUTRAL-ში)
-                    logger.info(
-                        f"[L3_TRIGGER] layers={_layer_count} >= {_short_trigger_layer} "
-                        f"→ SHORT activated | regime={_market_regime}"
-                    )
-                    futures_engine.check_and_open_short("BEAR")
-                    futures_engine.check_tp_sl()
-                    futures_engine.check_and_addon_short()
-                    futures_engine.check_and_exchange_short()
-                    futures_engine.check_addon_sl()
-
                 else:
-                    # L1-L2: ჩვეულებრივი TP/SL შემოწმება
                     futures_engine.check_tp_sl()
 
             except Exception as _fe:
@@ -1586,14 +1536,11 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # LAYER 2 — Crash detection & parallel trading
-            # L3+ ან BEAR MODE: BLOCKED
+            # BEAR MODE: BLOCKED — ახალი layer არ გაიხსნოს!
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
-                if _market_regime == "BEAR" or _l3_triggered:
-                    logger.info(
-                        f"[LAYER2] BLOCKED | regime={_market_regime} "
-                        f"l3_triggered={_l3_triggered} → Layer2 open BLOCKED"
-                    )
+                if _market_regime == "BEAR":
+                    logger.info("[LAYER2] BEAR_BLOCK | BEAR market → Layer2 open BLOCKED")
                 else:
                     try:
                         _check_and_open_layer2(engine, tp_sl_mgr)
@@ -1602,15 +1549,12 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # CASCADE DCA — Rolling Exchange სტრატეგია
-            # L3+ ან BEAR MODE: BLOCKED
-            # L3+ -ზე SHORT-ი მუშაობს — CASCADE საჭირო არ არის
+            # BEAR MODE: BLOCKED — ახალი layer ყიდვა შეაჩერებს SHORT-ს!
+            # არსებული CASCADE TP-ს ელოდება (TP hit = cascade დახურვა ✅)
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
-                if _market_regime == "BEAR" or _l3_triggered:
-                    logger.info(
-                        f"[CASCADE] BLOCKED | regime={_market_regime} "
-                        f"l3_triggered={_l3_triggered} → CASCADE BLOCKED"
-                    )
+                if _market_regime == "BEAR":
+                    logger.info("[CASCADE] BEAR_BLOCK | BEAR market → new CASCADE layer BLOCKED")
                 else:
                     try:
                         _check_cascade_exchange(engine, tp_sl_mgr)
@@ -1930,7 +1874,6 @@ def main():
                     )
                     notify_daily_close_summary(daily_stats)
                     last_daily_summary_date = today_str
-                    last_heartbeat_ts = 0.0  # Daily Summary-ის შემდეგ Heartbeat დაუყოვნებლივ გაიგზავნოს
 
                     logger.info(
                         "DAILY_SUMMARY_SENT | date=%s closed=%s pnl=%.4f",
