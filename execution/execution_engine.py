@@ -1746,6 +1746,20 @@ class ExecutionEngine:
             log_event("TRADE_EXECUTED", f"{signal_id} DEMO {symbol}")
             logger.info(f"EXEC_DEMO_OK | id={signal_id}")
 
+            try:
+                _dca_tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
+                notify_signal_created(
+                    symbol=str(symbol),
+                    entry_price=float(last_price),
+                    quote_amount=float(quote_in),
+                    tp_price=float(last_price) * (1.0 + _dca_tp_pct / 100.0),
+                    sl_price=0.0,
+                    verdict="BUY",
+                    mode=self.mode,
+                )
+            except Exception as _tg_e:
+                logger.warning(f"DEMO_TG_NOTIFY_FAIL | {_tg_e}")
+
             mark_signal_id_executed(signal_id, signal_hash=signal_hash, action="TRADE_DEMO", symbol=str(symbol))
             return
 
