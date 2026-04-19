@@ -28,8 +28,34 @@ from execution.db.repository import (
 )
 from execution.kill_switch import is_kill_switch_active
 # virtual_wallet.py ამოღებულია — DEMO mode stub
-def simulate_market_entry(*args, **kwargs) -> None:
-    pass
+def simulate_market_entry(symbol, side, size, price) -> None:
+    """DEMO mode: writes a simulated trade into the DB without hitting the exchange."""
+    import sqlite3, os, uuid
+    from datetime import datetime, timezone
+    db_path = os.getenv("DB_PATH", "/var/data/genius_bot_v2.db")
+    now = datetime.now(timezone.utc).isoformat()
+    signal_id = str(uuid.uuid4())
+    quote_in = round(size * price, 6)
+    conn = sqlite3.connect(db_path)
+    try:
+        # Insert into trades
+        conn.execute(
+            "INSERT INTO trades (signal_id, symbol, qty, quote_in, entry_price, opened_at) VALUES (?,?,?,?,?,?)",
+            (signal_id, symbol, size, quote_in, price, now)
+        )
+        # Insert into positions
+        conn.execute(
+            "INSERT INTO positions (symbol, side, size, entry_price, status, opened_at) VALUES (?,?,?,?,?,?)",
+            (symbol, side, size, price, "open", now)
+        )
+        conn.commit()
+        import logging
+        logging.getLogger("gbm").info(f"DEMO_TRADE_SAVED | symbol={symbol} side={side} size={size} price={price} quote_in={quote_in}")
+    except Exception as e:
+        import logging
+        logging.getLogger("gbm").error(f"DEMO_TRADE_SAVE_ERR | {e}")
+    finally:
+        conn.close()
 from execution.telegram_notifier import (
     notify_signal_created,
     notify_trade_closed,
@@ -1700,6 +1726,20 @@ class ExecutionEngine:
         if self.mode == "DEMO":
             last_price = float(self.price_feed.fetch_ticker(symbol)["last"])
             base_size = float(position_size) if position_size is not None else float(quote_amount) / float(last_price)
+            quote_in = round(base_size * last_price, 6)
+
+            # DEMO: DB-ში ჩაწერა რათა get_all_open_trades() სწორ მდგომარეობას აბრუნებდეს
+            try:
+                open_trade(
+                    signal_id=signal_id,
+                    symbol=str(symbol),
+                    qty=base_size,
+                    quote_in=quote_in,
+                    entry_price=last_price,
+                )
+                logger.info(f"DEMO_TRADE_SAVED | id={signal_id} symbol={symbol} qty={base_size} price={last_price}")
+            except Exception as _demo_err:
+                logger.warning(f"DEMO_TRADE_SAVE_ERR | {_demo_err}")
 
             simulate_market_entry(symbol=symbol, side=direction, size=base_size, price=last_price)
 
