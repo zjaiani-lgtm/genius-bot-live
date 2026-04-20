@@ -418,22 +418,57 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
 
             # ── 6. Add-on check ──────────────────────────────────────────
             # FIX #11: Layer პოზიციებზე ADD-ON არ უნდა მოხდეს!
-            # BTC/USDT_L2, ETH/USDT_L2, _L3... → CASCADE მართავს
-            # DCA ADD-ON მხოლოდ L1 (base) პოზიციებზე!
             if is_layer2:
                 logger.debug(f"[DCA] SKIP_ADDON | {sym} is Layer position → CASCADE manages")
                 continue
 
             # BEAR MODE: ADD-ON BLOCKED
-            # SHORT-ი ბაზრის ვარდნაზე ფსონობს — ADD-ON საპირისპიროა!
             if market_regime == "BEAR":
                 logger.info(f"[DCA] ADDON_BEAR_BLOCK | {sym} BEAR market → ADD-ON blocked")
                 continue
+
             all_positions = get_all_open_dca_positions()
             addon_ok, addon_reason = dca_mgr.should_add_on(pos, current_price, ohlcv)
 
             if not addon_ok:
                 logger.debug(f"[DCA] NO_ADDON | {sym} reason={addon_reason}")
+
+                # ── L3 ZONE ──────────────────────────────────────────────
+                # ADD-ON ამოიწურა → L3 zone-ში ვართ
+                n     = int(pos.get("add_on_count", 0))
+                max_n = dca_mgr.max_add_ons
+
+                if n >= max_n:
+                    l3_done = int(pos.get("l3_addon_done", 0) or 0)
+
+                    if not l3_done:
+                        # ① L3 ADD-ON: ჯერ ერთხელ ყიდვა L2 resource-ით
+                        # trigger: last_addon_price-დან drop >= rotation_trigger_pct
+                        last_ap = float(pos.get("last_addon_price") or avg_entry)
+                        if last_ap > 0:
+                            drop_from_last = (last_ap - current_price) / last_ap * 100.0
+                            rot_trigger    = dca_mgr.rotation_trigger_pct  # 1.5%
+                            if drop_from_last >= rot_trigger:
+                                logger.warning(
+                                    f"[DCA] L3_ADDON_TRIGGER | {sym} "
+                                    f"drop={drop_from_last:.2f}% >= {rot_trigger:.1f}% → L3 ADD-ON"
+                                )
+                                _execute_l3_addon(engine, pos, current_price, tp_sl_mgr)
+                            else:
+                                logger.debug(
+                                    f"[DCA] L3_ADDON_WAIT | {sym} "
+                                    f"drop={drop_from_last:.2f}% < {rot_trigger:.1f}%"
+                                )
+                    else:
+                        # ② L3 ADD-ON გახსნილია → LIFO rotation
+                        # trigger: last_addon_price (L3 ADD-ON price) -დან drop >= 1.5%
+                        rotate_ok, rotate_reason = dca_mgr.should_rotate(pos, current_price)
+                        if rotate_ok:
+                            logger.warning(f"[DCA] L3_ROTATION_TRIGGER | {sym} → LIFO")
+                            _execute_l3_rotation(engine, pos, current_price, tp_sl_mgr, dca_mgr)
+                        else:
+                            logger.debug(f"[DCA] NO_ROTATION | {sym} reason={rotate_reason}")
+
                 continue
 
             risk_ok, risk_reason = risk_mgr.can_add_on(pos, dca_mgr.get_addon_size(add_on_count), all_positions)
@@ -483,6 +518,7 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     new_tp_price=new_tp,
                     new_sl_price=new_sl,
                     last_add_on_ts=time.time(),
+                    last_addon_price=buy_price,  # L3 rotation trigger reference
                 )
 
                 rsi_val = score_details.get("rsi", 0.0)
@@ -529,6 +565,284 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
 
         except Exception as e:
             logger.warning(f"[DCA] POSITION_LOOP_ERR | {sym} id={pos_id} err={e}")
+
+
+def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> None:
+    """
+    L3 ADD-ON — L2 resource ($10) გადადის L3-ზე.
+
+    სრული flow:
+      ADD-ONs exhausted + drop >= rotation_trigger_pct (1.5%) → L3 ADD-ON
+      buy $10 @ current_price
+      avg recalculate → TP = avg × 1.0035 (L3 zone 0.35%)
+      l3_addon_done = 1 → შემდეგ iteration-ზე LIFO rotation იწყება
+
+    მათემატიკა BTC @ $69,190 (ADD-ON #5) → drop -1.5% → $68,153:
+      სულ invested: $80, avg=$71,742, qty=0.001170
+      L3 ADD-ON: $10 @ $68,153 → qty=0.000147
+      new_qty = 0.001317
+      new_avg = ($80×$71,742 + $10×$68,153) / ($80+$10) per qty
+             ≈ $71,365
+      new_tp  = $71,365 × 1.0035 = $71,615 (0.35%)
+    """
+    from execution.db.repository import (
+        add_dca_order,
+        update_dca_position_after_l3_addon,
+        log_event,
+    )
+    from execution.dca_position_manager import recalculate_average
+
+    sym         = pos["symbol"]
+    pos_id      = pos["id"]
+    avg_entry   = float(pos["avg_entry_price"] or 0)
+    total_qty   = float(pos["total_qty"] or 0)
+    total_quote = float(pos["total_quote_spent"] or 0)
+
+    import re as _re_l3
+    exchange_sym = _re_l3.sub(r'_L\d+$', '', sym)
+
+    try:
+        l3_addon_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "10.0"))
+
+        if engine.exchange is None:
+            buy_price = current_price
+            buy_qty   = l3_addon_quote / buy_price
+            buy = {"average": buy_price, "filled": buy_qty}
+        else:
+            buy = engine.exchange.place_market_buy_by_quote(exchange_sym, l3_addon_quote)
+            buy_price = float(buy.get("average") or buy.get("price") or current_price)
+            buy_qty   = float(buy.get("filled") or buy.get("amount") or (l3_addon_quote / buy_price))
+
+        avg_result = recalculate_average(total_qty, avg_entry, buy_qty, buy_price)
+        new_avg    = avg_result["avg_entry_price"]
+        new_qty    = avg_result["total_qty"]
+        new_quote  = total_quote + l3_addon_quote
+
+        # L3 zone TP (0.35%)
+        new_tp = tp_sl_mgr.calculate_rotation_tp(new_avg)
+
+        drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0 if avg_entry > 0 else 0.0
+
+        logger.warning(
+            f"[L3_ADDON] OPENED | {sym} @ {buy_price:.4f} "
+            f"qty={buy_qty:.6f} quote={l3_addon_quote} | "
+            f"old_avg={avg_entry:.4f} → new_avg={new_avg:.4f} "
+            f"new_tp={new_tp:.4f} drawdown={drawdown_pct:.2f}%"
+        )
+
+        # DB: l3_addon_done=1, last_addon_price=buy_price (LIFO trigger reference)
+        update_dca_position_after_l3_addon(
+            position_id=pos_id,
+            new_avg_entry=new_avg,
+            new_total_qty=new_qty,
+            new_total_quote=new_quote,
+            new_tp_price=new_tp,
+            last_addon_price=buy_price,
+        )
+
+        add_dca_order(
+            position_id=pos_id,
+            symbol=sym,
+            order_type="L3_ADDON",
+            entry_price=buy_price,
+            qty=buy_qty,
+            quote_spent=l3_addon_quote,
+            avg_entry_after=new_avg,
+            tp_after=new_tp,
+            sl_after=0.0,
+            trigger_drawdown_pct=drawdown_pct,
+            exchange_order_id=str(buy.get("id", "")),
+        )
+
+        try:
+            log_event(
+                "L3_ADDON_OPENED",
+                f"sym={sym} price={buy_price:.4f} quote={l3_addon_quote} "
+                f"old_avg={avg_entry:.4f} new_avg={new_avg:.4f} "
+                f"new_tp={new_tp:.4f} drawdown={drawdown_pct:.2f}%"
+            )
+        except Exception:
+            pass
+
+        try:
+            from execution.telegram_notifier import send_telegram_message
+            send_telegram_message(
+                f"📥 <b>L3 ADD-ON გახსნა</b>\n\n"
+                f"🪙 <b>Symbol:</b> <code>{sym}</code>\n"
+                f"💰 <b>Entry:</b> <code>{buy_price:.2f}</code> "
+                f"(<code>-{drawdown_pct:.2f}%</code>)\n"
+                f"📊 <b>avg:</b> <code>{avg_entry:.2f} → {new_avg:.2f}</code> ↓\n"
+                f"🎯 <b>TP:</b> <code>{new_tp:.2f}</code> (L3: 0.35%)\n"
+                f"⚠️ <b>შემდეგი:</b> LIFO rotation კიდევ -1.5%-ზე\n"
+                f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+        except Exception as _tg:
+            logger.warning(f"[L3_ADDON] TG_FAIL | err={_tg}")
+
+    except Exception as e:
+        logger.error(f"[L3_ADDON] FAIL | {sym} err={e}")
+
+
+def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca_mgr) -> None:
+    """
+    LIFO Rotation — L3 zone: ADD-ONs exhausted + price კვლავ ეცემა.
+
+    მათემატიკა:
+      LIFO unit (ყველაზე ძვირი) @ entry_price=P_high, qty=Q_high
+      sell @ current_price → proceeds = current_price × Q_high
+      realized_loss = (current_price - P_high) × Q_high  (< 0)
+      reinvest proceeds @ current_price → new_qty = Q_high (იგივე)
+      new_avg = (total_value - P_high×Q_high + current×Q_high) / total_qty
+             = old_avg - (P_high - current) × Q_high / total_qty
+      → avg ეცემა, TP ახლოვდება
+
+    vs FIFO: avg ამაღლდება (TP შორდება!) — LIFO სჯობია.
+    """
+    from execution.db.repository import (
+        get_dca_orders,
+        add_dca_order,
+        update_dca_position_after_rotation,
+        log_event,
+    )
+    from execution.dca_position_manager import recalculate_average
+
+    sym      = pos["symbol"]
+    pos_id   = pos["id"]
+    avg_entry = float(pos["avg_entry_price"] or 0)
+    total_qty = float(pos["total_qty"] or 0)
+    total_quote = float(pos["total_quote_spent"] or 0)
+
+    import re as _re_rot
+    exchange_sym = _re_rot.sub(r'_L\d+$', '', sym)
+
+    try:
+        # 1. ყველა order-ი → LIFO unit
+        dca_orders = get_dca_orders(pos_id)
+        if not dca_orders:
+            logger.warning(f"[L3_ROT] NO_ORDERS | {sym} → skip rotation")
+            return
+
+        lifo_unit = dca_mgr.get_lifo_unit(dca_orders)
+        if not lifo_unit:
+            logger.warning(f"[L3_ROT] NO_LIFO_UNIT | {sym} → skip rotation")
+            return
+
+        lifo_price = float(lifo_unit.get("entry_price", 0.0))
+        lifo_qty   = float(lifo_unit.get("qty", 0.0))
+        lifo_quote = float(lifo_unit.get("quote_spent", 0.0))
+
+        if lifo_price <= 0 or lifo_qty <= 0:
+            logger.warning(f"[L3_ROT] INVALID_LIFO | {sym} price={lifo_price} qty={lifo_qty} → skip")
+            return
+
+        # 2. ვირტუალური გაყიდვა — DEMO
+        if engine.exchange is None:
+            sell_price = current_price
+        else:
+            sell_result = engine.exchange.place_market_sell(exchange_sym, lifo_qty)
+            sell_price  = float(sell_result.get("average") or sell_result.get("price") or current_price)
+
+        proceeds     = sell_price * lifo_qty
+        fee          = proceeds * 0.001   # 0.1% Binance fee
+        net_proceeds = proceeds - fee
+
+        realized_pnl = (sell_price - lifo_price) * lifo_qty - fee
+
+        logger.warning(
+            f"[L3_ROT] LIFO_SELL | {sym} "
+            f"lifo_price={lifo_price:.4f} sell={sell_price:.4f} "
+            f"qty={lifo_qty:.6f} pnl={realized_pnl:+.4f}"
+        )
+
+        # 3. reinvest @ current_price
+        if engine.exchange is None:
+            reinvest_price = current_price
+            reinvest_qty   = net_proceeds / reinvest_price
+        else:
+            reinvest_result = engine.exchange.place_market_buy_by_quote(exchange_sym, net_proceeds)
+            reinvest_price  = float(reinvest_result.get("average") or reinvest_result.get("price") or current_price)
+            reinvest_qty    = float(reinvest_result.get("filled") or reinvest_result.get("amount") or (net_proceeds / reinvest_price))
+
+        # 4. new_avg გამოთვლა
+        # ძველი unit ამოვიღოთ, ახალი დავამატოთ
+        remaining_qty   = total_qty - lifo_qty
+        remaining_value = remaining_qty * avg_entry  # approximate (LIFO unit-ი avg-ის ნაწილია)
+
+        # სწორი გამოთვლა: weighted average-ის recalculation
+        # remaining: total_qty - lifo_qty @ avg_entry (approximate)
+        # new unit: reinvest_qty @ reinvest_price
+        new_qty   = remaining_qty + reinvest_qty
+        new_value = remaining_value + reinvest_qty * reinvest_price
+        new_avg   = round(new_value / new_qty, 8) if new_qty > 0 else avg_entry
+
+        # TP — L3 zone (0.35%)
+        new_tp = tp_sl_mgr.calculate_rotation_tp(new_avg)
+
+        # total_quote update: LIFO unit-ის quote ამოვიღოთ, reinvest დავამატოთ
+        new_total_quote = total_quote - lifo_quote + net_proceeds
+
+        logger.warning(
+            f"[L3_ROT] REINVEST | {sym} "
+            f"@ {reinvest_price:.4f} qty={reinvest_qty:.6f} | "
+            f"old_avg={avg_entry:.4f} → new_avg={new_avg:.4f} "
+            f"new_tp={new_tp:.4f} (L3 zone 0.35%)"
+        )
+
+        # 5. DB განახლება
+        update_dca_position_after_rotation(
+            position_id=pos_id,
+            new_avg_entry=new_avg,
+            new_total_qty=new_qty,
+            new_total_quote=new_total_quote,
+            new_tp_price=new_tp,
+            last_rotation_ts=time.time(),
+            rotation_pnl=realized_pnl,
+        )
+
+        # rotation order-ი DB-ში
+        add_dca_order(
+            position_id=pos_id,
+            symbol=sym,
+            order_type="ROTATION_REINVEST",
+            entry_price=reinvest_price,
+            qty=reinvest_qty,
+            quote_spent=net_proceeds,
+            avg_entry_after=new_avg,
+            tp_after=new_tp,
+            sl_after=0.0,
+            trigger_drawdown_pct=(avg_entry - current_price) / avg_entry * 100.0 if avg_entry > 0 else 0.0,
+            exchange_order_id="",
+        )
+
+        try:
+            log_event(
+                "L3_ROTATION",
+                f"sym={sym} lifo_price={lifo_price:.4f} sell={sell_price:.4f} "
+                f"reinvest={reinvest_price:.4f} old_avg={avg_entry:.4f} "
+                f"new_avg={new_avg:.4f} new_tp={new_tp:.4f} "
+                f"pnl={realized_pnl:+.4f}"
+            )
+        except Exception:
+            pass
+
+        # Telegram
+        try:
+            from execution.telegram_notifier import send_telegram_message
+            send_telegram_message(
+                f"🔄 <b>L3 LIFO ROTATION</b>\n\n"
+                f"🪙 <b>Symbol:</b> <code>{sym}</code>\n"
+                f"💸 <b>LIFO sell:</b> <code>{lifo_price:.2f} → {sell_price:.2f}</code>\n"
+                f"♻️ <b>Reinvest:</b> <code>{reinvest_price:.2f}</code>\n"
+                f"📊 <b>avg:</b> <code>{avg_entry:.2f} → {new_avg:.2f}</code> ↓\n"
+                f"🎯 <b>TP:</b> <code>{new_tp:.2f}</code> (L3: 0.35%)\n"
+                f"💰 <b>Rotation PnL:</b> <code>{realized_pnl:+.4f} USDT</code>\n"
+                f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+        except Exception as _tg:
+            logger.warning(f"[L3_ROT] TG_FAIL | err={_tg}")
+
+    except Exception as e:
+        logger.error(f"[L3_ROT] ROTATION_FAIL | {sym} err={e}")
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
