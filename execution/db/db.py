@@ -207,6 +207,9 @@ def init_db() -> None:
         add_on_count         INTEGER NOT NULL DEFAULT 0,
         max_add_ons          INTEGER NOT NULL DEFAULT 3,
         last_add_on_ts       REAL    DEFAULT NULL,
+        last_addon_price     REAL    DEFAULT NULL,  -- ბოლო ADD-ON entry price (L3 rotation trigger-ისთვის)
+        last_rotation_ts     REAL    DEFAULT NULL,  -- ბოლო LIFO rotation timestamp (cooldown)
+        l3_addon_done        INTEGER DEFAULT 0,     -- 0=L3 ADD-ON ჯერ არ გახსნილა, 1=გახსნილა
 
         -- current TP/SL (avg_entry-ით გამოთვლილი)
         current_tp_price     REAL,
@@ -272,6 +275,49 @@ def init_db() -> None:
 
     conn.commit()
     # კავშირი აღარ იხურება — thread-local-ში რჩება
+
+    # ADDON CASCADE SYSTEM migration — არსებული DB-სთვის
+    _migrate_dca_rotation_columns(cur)
+    conn.commit()
+
+
+def _migrate_dca_rotation_columns(cur) -> None:
+    """
+    dca_positions ცხრილში LIFO rotation columns-ების დამატება.
+    იდემპოტენტურია — CREATE TABLE IF NOT EXISTS-ს გვერდი:
+    არსებული DB-ები schema ცვლილებას ALTER TABLE-ით იღებენ.
+
+    ახალი columns:
+      last_addon_price  REAL — ბოლო ADD-ON entry price (L3 trigger reference)
+      last_rotation_ts  REAL — ბოლო LIFO rotation unix timestamp (cooldown)
+    """
+    try:
+        cur.execute("PRAGMA table_info(dca_positions)")
+        existing = {row[1] for row in cur.fetchall()}
+
+        if "last_addon_price" not in existing:
+            cur.execute(
+                "ALTER TABLE dca_positions ADD COLUMN "
+                "last_addon_price REAL DEFAULT NULL"
+            )
+            logger.info("[DB_MIGRATE] dca_positions.last_addon_price column added")
+
+        if "last_rotation_ts" not in existing:
+            cur.execute(
+                "ALTER TABLE dca_positions ADD COLUMN "
+                "last_rotation_ts REAL DEFAULT NULL"
+            )
+            logger.info("[DB_MIGRATE] dca_positions.last_rotation_ts column added")
+
+        if "l3_addon_done" not in existing:
+            cur.execute(
+                "ALTER TABLE dca_positions ADD COLUMN "
+                "l3_addon_done INTEGER DEFAULT 0"
+            )
+            logger.info("[DB_MIGRATE] dca_positions.l3_addon_done column added")
+
+    except Exception as e:
+        logger.warning(f"[DB_MIGRATE] dca_rotation_columns fail | err={e}")
 
 
 def _migrate_sl_cooldown_columns(cur) -> None:
