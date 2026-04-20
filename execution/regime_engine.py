@@ -143,9 +143,9 @@ _MTF_TP_PENALTY    = _ef("MTF_TP_PENALTY", 0.20)
 # UNCERTAIN+1h_BEAR → always SKIP (unconditional — რჩება)
 _MTF_BLOCK_DIVERGE = _eb("MTF_BLOCK_ON_BEAR_DIVERGE", False)
 
-# SL Cooldown
-# FIX-RE-1: ENV=SL_COOLDOWN_AFTER_N=3 (was default 2)
-_SL_COOLDOWN_N    = _ei("SL_COOLDOWN_AFTER_N",       3)
+# SL Cooldown — გათიშულია (DCA mode, SL=999%)
+# _SL_COOLDOWN_N = 999 → notify_outcome("SL") პაუზას ვეღარ ააქტიურებს
+_SL_COOLDOWN_N    = 999   # DCA: disabled
 _SL_PAUSE_SECONDS = _ei("SL_COOLDOWN_PAUSE_SECONDS", 1800)
 
 # Regime history depth
@@ -566,20 +566,8 @@ class MarketRegimeEngine:
         now = buy_time or datetime.utcnow()
 
         if outcome == "SL":
-            self._consecutive_sl[sym] = self._consecutive_sl.get(sym, 0) + 1
-            count = self._consecutive_sl[sym]
-            logger.info(
-                f"[REGIME] SL_TRACK | sym={sym} "
-                f"consecutive={count} limit={_SL_COOLDOWN_N}"
-            )
-            if count >= _SL_COOLDOWN_N:
-                pause = now + timedelta(seconds=_SL_PAUSE_SECONDS)
-                self._sl_pause_until[sym] = pause
-                logger.warning(
-                    f"[REGIME] SL_COOLDOWN | sym={sym} {count} consecutive SL → "
-                    f"PAUSE {_SL_PAUSE_SECONDS // 60}min "
-                    f"until {pause.strftime('%H:%M:%S')} UTC"
-                )
+            # DCA mode: SL=999% — SL არასოდეს ვარდება → no-op
+            pass
 
         elif outcome in ("TP", "MANUAL_SELL"):
             prev = self._consecutive_sl.get(sym, 0)
