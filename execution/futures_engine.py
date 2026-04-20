@@ -11,7 +11,7 @@
 #   FUTURES_LEVERAGE=2            ← x2 (უსაფრთხო)
 #   FUTURES_QUOTE=50              ← $50 per SHORT position
 #   FUTURES_TP_PCT=2.0            ← 2% TP (BTC -2% → SHORT მოიგო)
-#   FUTURES_SL_PCT=1.0            ← 1% SL (BTC +1% → close SHORT)
+#   FUTURES_SL_PCT — გათიშულია (DCA mode, sl_price=0.0 hardcoded)
 #   FUTURES_SYMBOLS=BTC/USDT,ETH/USDT,BNB/USDT
 #   FUTURES_MODE=DEMO             ← DEMO/LIVE
 #   FUTURES_MAX_OPEN=3            ← max ღია SHORT-ების რაოდენობა
@@ -237,7 +237,7 @@ class FuturesEngine:
         self.leverage      = _ei("FUTURES_LEVERAGE", 2)
         self.quote         = _ef("FUTURES_QUOTE", 50.0)
         self.tp_pct        = _ef("FUTURES_TP_PCT", 2.0)
-        self.sl_pct        = _ef("FUTURES_SL_PCT", 1.0)
+        self.sl_pct        = 0.0   # DCA: SL გათიშულია
         self.max_open      = _ei("FUTURES_MAX_OPEN", 3)
         self.cooldown_s    = _ei("FUTURES_COOLDOWN_SECONDS", 300)
         self.mode          = os.getenv("FUTURES_MODE", "DEMO").upper()
@@ -251,7 +251,7 @@ class FuturesEngine:
         self.addon_enabled      = _eb("FUTURES_ADDON_ENABLED", True)
         self.addon_trigger_pct  = _ef("FUTURES_ADDON_TRIGGER_PCT", 1.0)   # +1% ზევით → ADD-ON
         self.addon_quote        = _ef("FUTURES_ADDON_QUOTE", 12.0)         # $12 ADD-ON
-        self.addon_sl_pct       = _ef("FUTURES_ADDON_SL_PCT", 1.5)         # ADD-ON შემდეგ SL
+        self.addon_sl_pct       = 0.0   # DCA: SL გათიშულია
         self.max_addons         = _ei("FUTURES_MAX_ADDONS", 1)             # მაქს 1 ADD-ON
 
         # EXCHANGE პარამეტრები
@@ -354,9 +354,9 @@ class FuturesEngine:
                 logger.warning(f"[FUTURES] OPEN_SHORT_NO_PRICE | {symbol}")
                 return
 
-            # SHORT: TP = ქვევით, SL = ზევით
+            # SHORT: TP = ქვევით, SL = გათიშულია (0.0)
             tp_price = round(current_price * (1.0 - self.tp_pct / 100.0), 6)
-            sl_price = round(current_price * (1.0 + self.sl_pct / 100.0), 6)
+            sl_price = 0.0   # DCA: SL გათიშულია
             qty      = round((self.quote * self.leverage) / current_price, 6)
             sig_id   = f"FUT-{symbol.replace('/', '')}-{uuid.uuid4().hex[:8]}"
 
@@ -498,8 +498,8 @@ class FuturesEngine:
     def check_tp_sl(self) -> None:
         """
         main loop-ში ყოველ iteration-ზე გამოიძახება.
-        TP hit:  current_price <= tp_price → SHORT win → close
-        SL hit:  current_price >= sl_price → SHORT loss → close
+        TP hit: current_price <= tp_price → SHORT win → close
+        SL: გათიშულია — SHORT TP-ს ელოდება ან manual close.
         """
         if not self.enabled:
             return
@@ -511,7 +511,6 @@ class FuturesEngine:
         for pos in open_shorts:
             symbol    = str(pos.get("symbol", ""))
             tp_price  = float(pos.get("tp_price", 0.0))
-            sl_price  = float(pos.get("sl_price", 0.0))
 
             current_price = self._fetch_price(symbol)
             if current_price <= 0:
@@ -520,7 +519,7 @@ class FuturesEngine:
             entry_price = float(pos.get("entry_price", 0.0))
             logger.debug(
                 f"[FUTURES] TP_SL_CHECK | {symbol} "
-                f"current={current_price:.4f} tp={tp_price:.4f} sl={sl_price:.4f}"
+                f"current={current_price:.4f} tp={tp_price:.4f} sl=OFF"
             )
 
             # TP hit: ბაზარი ეცა → SHORT მოიგო!
@@ -530,15 +529,6 @@ class FuturesEngine:
                     f"current={current_price:.4f} <= tp={tp_price:.4f}"
                 )
                 self._close_short(pos, reason="TP")
-                continue
-
-            # SL hit: ბაზარი ავიდა → SHORT დაკარგა
-            if sl_price > 0 and current_price >= sl_price:
-                logger.warning(
-                    f"[FUTURES] SL_HIT | {symbol} "
-                    f"current={current_price:.4f} >= sl={sl_price:.4f}"
-                )
-                self._close_short(pos, reason="SL")
                 continue
 
     # ────────────────────────────────────────────────────────
@@ -562,7 +552,7 @@ class FuturesEngine:
              - add_on_count >= max_addons → skip
              - current_price >= entry × (1 + addon_trigger_pct%) → ADD-ON!
              - avg_entry გაახლება
-             - SL = avg × (1 + addon_sl_pct%) დაყენება
+             - SL: გათიშულია (DCA mode)
              - TP = avg × (1 - tp_pct%) გაახლება
         """
         if not self.enabled:
@@ -605,13 +595,13 @@ class FuturesEngine:
                 total_quote  = quote_in + self.addon_quote
                 new_avg      = (entry_price * quote_in + current_price * self.addon_quote) / total_quote
                 new_tp       = round(new_avg * (1.0 - self.tp_pct / 100.0), 6)
-                new_sl       = round(new_avg * (1.0 + self.addon_sl_pct / 100.0), 6)
+                new_sl       = 0.0   # DCA: SL გათიშულია
                 new_qty      = round((total_quote * self.leverage) / new_avg, 6)
 
                 logger.warning(
                     f"[FUTURES] SHORT_ADDON | {symbol} "
                     f"entry={entry_price:.2f} addon_price={current_price:.2f} "
-                    f"new_avg={new_avg:.2f} new_tp={new_tp:.2f} new_sl={new_sl:.2f}"
+                    f"new_avg={new_avg:.2f} new_tp={new_tp:.2f} sl=OFF"
                 )
 
                 # DB განახლება
@@ -633,7 +623,7 @@ class FuturesEngine:
                             self.addon_quote,
                             round(new_avg, 6),
                             new_tp,
-                            new_sl,
+                            0.0,   # sl_price_addon = 0 (გათიშულია)
                             new_qty,
                             total_quote,
                             pos_id,
@@ -653,7 +643,7 @@ class FuturesEngine:
                         f"💰 <b>ADD-ON ფასი:</b> <code>{current_price:.2f}</code>\n"
                         f"📊 <b>ახალი avg:</b> <code>{new_avg:.2f}</code>\n"
                         f"🎯 <b>ახალი TP:</b> <code>{new_tp:.2f}</code>\n"
-                        f"🛡 <b>SL:</b> <code>{new_sl:.2f} (+{self.addon_sl_pct:.1f}%)</code>\n"
+                        f"🛡 <b>SL:</b> <code>გათიშულია</code>\n"
                         f"💼 <b>სულ:</b> <code>${total_quote:.2f}</code>\n"
                         f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
                     )
@@ -768,66 +758,11 @@ class FuturesEngine:
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: check_addon_sl
-    # ADD-ON შემდეგ SL შემოწმება
+    # ADD-ON შემდეგ SL — გათიშულია (DCA: SL=0)
     # ────────────────────────────────────────────────────────
     def check_addon_sl(self) -> None:
-        """
-        ADD-ON-ის შემდეგ SL შემოწმება.
-        sl_price_addon = avg × (1 + addon_sl_pct%)
-        თუ current_price >= sl_price_addon → დახურვა მინიმალური ზარალით.
-        """
-        if not self.enabled:
-            return
-
-        open_shorts = _get_open_shorts()
-        if not open_shorts:
-            return
-
-        for pos in open_shorts:
-            try:
-                symbol       = str(pos.get("symbol", ""))
-                pos_id       = int(pos.get("id", 0))
-                add_on_count = int(pos.get("add_on_count", 0) or 0)
-                sl_addon     = float(pos.get("sl_price_addon", 0.0) or 0.0)
-
-                # SL მხოლოდ ADD-ON-ის შემდეგ!
-                if add_on_count < 1 or sl_addon <= 0:
-                    continue
-
-                current_price = self._fetch_price(symbol)
-                if current_price <= 0:
-                    continue
-
-                if current_price >= sl_addon:
-                    entry_price = float(pos.get("entry_price", 0.0))
-                    qty         = float(pos.get("qty", 0.0))
-                    price_diff  = entry_price - current_price
-                    pnl_quote   = round(price_diff * qty, 4)
-                    pnl_pct     = round((price_diff / entry_price) * 100.0 * self.leverage, 2)
-
-                    _close_short_db(pos_id, current_price, pnl_quote, pnl_pct, "ADDON_SL")
-
-                    logger.warning(
-                        f"[FUTURES] ADDON_SL_HIT | {symbol} "
-                        f"price={current_price:.2f} >= sl={sl_addon:.2f} "
-                        f"pnl={pnl_quote:+.4f}"
-                    )
-
-                    try:
-                        from execution.telegram_notifier import send_telegram_message
-                        send_telegram_message(
-                            f"🛡 <b>SHORT ADD-ON SL</b>\n\n"
-                            f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
-                            f"📤 <b>Exit:</b> <code>{current_price:.2f}</code>\n"
-                            f"💰 <b>PnL:</b> <code>{pnl_quote:+.4f} USDT</code>\n"
-                            f"✅ <b>მინიმალური ზარალი დაფიქსირდა</b>\n"
-                            f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
-                        )
-                    except Exception as tg_err:
-                        logger.warning(f"[FUTURES] ADDON_SL_TG_FAIL | err={tg_err}")
-
-            except Exception as e:
-                logger.error(f"[FUTURES] ADDON_SL_ERR | {pos.get('symbol')} err={e}")
+        """DCA mode: SL გათიშულია. Stub — no-op."""
+        pass
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: get_summary
