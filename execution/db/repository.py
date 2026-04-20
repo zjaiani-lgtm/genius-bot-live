@@ -851,7 +851,8 @@ def get_dca_position(position_id: int) -> Optional[Dict[str, Any]]:
                current_tp_price, current_sl_price, current_tp_pct, current_sl_pct,
                max_capital, max_drawdown_pct,
                exit_price, exit_qty, pnl_quote, pnl_pct, outcome,
-               opened_at, closed_at, updated_at
+               opened_at, closed_at, updated_at,
+               last_addon_price, last_rotation_ts
         FROM dca_positions WHERE id = ?
         """,
         (int(position_id),),
@@ -870,7 +871,8 @@ def get_open_dca_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
                current_tp_price, current_sl_price, current_tp_pct, current_sl_pct,
                max_capital, max_drawdown_pct,
                exit_price, exit_qty, pnl_quote, pnl_pct, outcome,
-               opened_at, closed_at, updated_at
+               opened_at, closed_at, updated_at,
+               last_addon_price, last_rotation_ts
         FROM dca_positions
         WHERE UPPER(symbol) = UPPER(?) AND status = 'OPEN'
         ORDER BY id DESC LIMIT 1
@@ -891,7 +893,8 @@ def get_all_open_dca_positions() -> List[Dict[str, Any]]:
                current_tp_price, current_sl_price, current_tp_pct, current_sl_pct,
                max_capital, max_drawdown_pct,
                exit_price, exit_qty, pnl_quote, pnl_pct, outcome,
-               opened_at, closed_at, updated_at
+               opened_at, closed_at, updated_at,
+               last_addon_price, last_rotation_ts
         FROM dca_positions
         WHERE status = 'OPEN'
         ORDER BY id ASC
@@ -909,8 +912,12 @@ def update_dca_position_after_addon(
     new_tp_price: float,
     new_sl_price: float,
     last_add_on_ts: float,
+    last_addon_price: Optional[float] = None,
 ) -> None:
-    """Add-on-ის შემდეგ position-ის განახლება."""
+    """
+    ADD-ON-ის შემდეგ position-ის განახლება.
+    last_addon_price: ახლო ADD-ON entry price — L3 rotation trigger reference.
+    """
     _execute(
         """
         UPDATE dca_positions SET
@@ -921,19 +928,69 @@ def update_dca_position_after_addon(
             current_tp_price  = ?,
             current_sl_price  = ?,
             last_add_on_ts    = ?,
+            last_addon_price  = ?,
             updated_at        = datetime('now')
         WHERE id = ?
         """,
         (
             float(new_avg_entry), float(new_total_qty), float(new_total_quote),
             int(new_add_on_count), float(new_tp_price), float(new_sl_price),
-            float(last_add_on_ts), int(position_id),
+            float(last_add_on_ts),
+            float(last_addon_price) if last_addon_price is not None else float(new_avg_entry),
+            int(position_id),
         ),
     )
     logger.info(
         f"[DCA_REPO] update_after_addon | id={position_id} "
         f"avg={new_avg_entry:.4f} add_on={new_add_on_count} "
-        f"tp={new_tp_price:.4f} sl={new_sl_price:.4f}"
+        f"tp={new_tp_price:.4f} last_addon_price={last_addon_price}"
+    )
+
+
+def update_dca_position_after_rotation(
+    position_id: int,
+    new_avg_entry: float,
+    new_total_qty: float,
+    new_total_quote: float,
+    new_tp_price: float,
+    last_rotation_ts: float,
+    rotation_pnl: float = 0.0,
+) -> None:
+    """
+    LIFO rotation-ის შემდეგ position განახლება.
+
+    LIFO rotation:
+      ძვირი unit გაიყიდა @ current_price (realized loss)
+      proceeds reinvest @ current_price (ახალი unit იმავე qty-ზე)
+      → avg ეცემა, TP = avg × 1.0035 (L3 zone)
+
+    last_rotation_ts: cooldown-ისთვის (300s rotation-ებს შორის)
+    rotation_pnl: realized loss/profit ამ rotation-ზე (logging-ისთვის)
+    """
+    _execute(
+        """
+        UPDATE dca_positions SET
+            avg_entry_price   = ?,
+            total_qty         = ?,
+            total_quote_spent = ?,
+            current_tp_price  = ?,
+            last_rotation_ts  = ?,
+            updated_at        = datetime('now')
+        WHERE id = ?
+        """,
+        (
+            float(new_avg_entry),
+            float(new_total_qty),
+            float(new_total_quote),
+            float(new_tp_price),
+            float(last_rotation_ts),
+            int(position_id),
+        ),
+    )
+    logger.info(
+        f"[DCA_REPO] update_after_rotation | id={position_id} "
+        f"new_avg={new_avg_entry:.4f} tp={new_tp_price:.4f} "
+        f"rotation_pnl={rotation_pnl:+.4f}"
     )
 
 
@@ -1062,4 +1119,7 @@ def _dca_row_to_dict(row) -> Optional[Dict[str, Any]]:
         "exit_price": row[18], "exit_qty": row[19],
         "pnl_quote": row[20], "pnl_pct": row[21], "outcome": row[22],
         "opened_at": row[23], "closed_at": row[24], "updated_at": row[25],
+        # ADDON CASCADE SYSTEM — rotation columns (None თუ migration ჯერ არ გაშვებულა)
+        "last_addon_price":  row[26] if len(row) > 26 else None,
+        "last_rotation_ts":  row[27] if len(row) > 27 else None,
     }
