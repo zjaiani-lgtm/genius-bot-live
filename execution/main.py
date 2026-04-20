@@ -785,7 +785,7 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     drop_pct_base  = float(os.getenv("CASCADE_DROP_PCT",    "1.5"))  # L2→L3 trigger
     tp_pct_base    = float(os.getenv("DCA_TP_PCT",          "0.55")) # L1-L2
     tp_pct_l3      = float(os.getenv("CASCADE_TP_L3_PCT",   "0.65")) # L3
-    max_layers     = int(os.getenv("CASCADE_MAX_LAYERS",     "3"))   # L3-ზე გაჩერება
+    max_layers     = 3   # CASCADE: L1→L2→L3 მხოლოდ. L4+ გათიშულია.
     symbols_raw    = os.getenv("CASCADE_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT")
     symbols        = [s.strip() for s in symbols_raw.split(",") if s.strip()]
     buffer         = float(os.getenv("SMART_ADDON_BUFFER", "5.0"))
@@ -928,7 +928,7 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                     # fallback: suffix-ის გარეშე ვეძებთ (BTC/USDT_L2 → BTC/USDT)
                     open_tr = get_open_trade_for_symbol(exchange_sym)
                 if not open_tr:
-                    # fallback2: base symbol-ის ყველა ვარიანტი (_L2 … _L10)
+                    # fallback2: base symbol-ის ვარიანტები (max_layers=3)
                     base = exchange_sym.replace("/USDT", "")
                     for suffix in ["", "_L2", "_L3"]:
                         _tr = get_open_trade_for_symbol(f"{base}/USDT{suffix}")
