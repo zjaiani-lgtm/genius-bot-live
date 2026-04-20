@@ -331,7 +331,7 @@ _protective_sell_ts: dict  = {}   # {symbol: float} — protective sell cooldown
 # -0.05 = სუსტი downtrend (default). -0.03 = უფრო მგრძნობიარე, -0.10 = გვიანი გასვლა
 SELL_TREND_THRESHOLD = float(os.getenv("SELL_TREND_THRESHOLD", "-0.05"))  # ENV=-0.05
 
-SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "99"))      # DCA: გათიშული
+SL_COOLDOWN_COUNT   = 999   # DCA: გათიშულია — SL=999%, არასოდეს ვარდება
 SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
 RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
 # FIX: 0.25% → 0.10% default. 15m flat ბაზარზე სანთლები 0.15-0.35%-ია.
@@ -623,56 +623,23 @@ def _get_outbox_path() -> str:
 
 
 def _notify_sl_event(symbol: str = "") -> None:
-    """SL hit — DB-ში counter გაიზარდე (restart-safe).
-    FIX I-8 FULL: per-symbol isolation — BTC SL → ETH-ს ვეღარ ბლოკავს.
-    """
-    # per-symbol (ახალი, primary)
-    if symbol:
-        new_count_sym = increment_consecutive_sl_per_symbol(
-            symbol, pause_seconds=SL_COOLDOWN_PAUSE
-        )
-        logger.info(
-            f"[SL_TRACK_SYM] {symbol} | consecutive_sl={new_count_sym} "
-            f"limit={SL_COOLDOWN_COUNT} (DB-saved)"
-        )
-
-    # global (backward compat — signal_generator-ის _sl_pause_active() კვლავ global-ს კითხულობს)
-    new_count = increment_consecutive_sl(pause_seconds=SL_COOLDOWN_PAUSE)
-    logger.info(f"[SL_TRACK] consecutive_sl={new_count} limit={SL_COOLDOWN_COUNT} (DB-saved)")
-    if new_count >= SL_COOLDOWN_COUNT:
-        logger.warning(
-            f"[SL_COOLDOWN] {new_count} consecutive SL → PAUSE {SL_COOLDOWN_PAUSE//60} min "
-            f"(saved to DB — restart-safe)"
-        )
+    """DCA mode: SL=999% — SL არასოდეს ვარდება. Stub — no-op."""
+    pass
 
 
 def _notify_tp_event(symbol: str = "") -> None:
-    """TP hit — DB-ში counter reset (restart-safe).
-    FIX I-8 FULL: per-symbol reset — მხოლოდ ამ symbol-ის counter ნულდება.
-    """
-    # per-symbol reset (ახალი, primary)
-    if symbol:
-        reset_consecutive_sl_per_symbol(symbol)
-
-    # global reset (backward compat)
-    state = get_sl_cooldown_state()
-    if state["consecutive_sl"] > 0:
-        logger.info(f"[SL_TRACK] TP hit → reset consecutive_sl {state['consecutive_sl']}→0 (DB)")
-    reset_consecutive_sl()
+    """DCA mode: SL cooldown გათიშულია. Stub — no-op."""
+    pass
 
 
 def _sl_pause_active() -> bool:
-    """DB-დან წაიკითხავს — restart-ზეც სწორია. (global — backward compat)"""
-    return is_sl_pause_active()
+    """DCA mode: SL cooldown გათიშულია — always False."""
+    return False
 
 
 def _sl_pause_active_for_symbol(symbol: str) -> bool:
-    """FIX I-8 FULL: symbol-specific pause check — global-ის ნაცვლად.
-    True თუ ამ კონკრეტული სიმბოლოს SL პაუზა აქტიურია.
-    """
-    if not symbol:
-        return is_sl_pause_active()  # fallback global
-    return is_sl_pause_active_per_symbol(symbol)
+    """DCA mode: SL cooldown გათიშულია — always False."""
+    return False
 
 
 def _trades_today_count() -> int:
@@ -1954,61 +1921,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # SL PAUSE — DB-based, restart-safe, PER-SYMBOL ONLY
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX BUG-2: global _sl_pause_active() check ამოღებულია.
-    # პრობლემა: global pause return None-ს ისვრიდა ყველა symbol-ისთვის —
-    #   BTC 3 SL → global pause → ETH/BNB-საც ბლოკავდა (per-symbol isolation ტყუილი).
-    # გამოსწორება: per-symbol check მხოლოდ BUY loop-ში (line ~1302) — ეს სწორია.
-    #   BTC pause → მხოლოდ BTC-ი ბლოკდება, ETH/BNB კვლავ ვაჭრობს.
-    # GLOBAL pause-ი ნარჩუნდება მხოლოდ recovery check-ისთვის ქვემოთ.
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    try:
-        sl_state = get_sl_cooldown_state()
-    except Exception as _sl_err:
-        logger.warning(f"[GEN] SL_STATE_FAIL | err={_sl_err} → skipping cooldown check")
-        sl_state = {"consecutive_sl": 0, "sl_pause_until": ""}
-    # FIX: თუ პაუზა დროით გაიარა (is_sl_pause_active()=False) მაგრამ
-    # consecutive_sl ჯერ კიდევ >= limit-ია DB-ში → recovery check საჭიროა.
-    # თუ recovery_candles=3 და ბაზარი flat-ია (0.15-0.20% სანთლები) →
-    # recovery NEVER passes და ბოტი დაბლოკილია indefinitely.
-    # FIX: RECOVERY_CANDLE_PCT-ს ENV-ით გასამართავად default 0.10%-ზე
-    # (0.25% ძალიან მაღალია 15m flat ბაზრისთვის).
-    # ასევე: consecutive_sl DB-ში reset-ი recovery pass-ის შემდეგ სწორდება.
-    if sl_state["consecutive_sl"] >= SL_COOLDOWN_COUNT:
-        # პაუზა დასრულდა — recovery check
-        recovery_passed = False
-        for sym in SYMBOLS:
-            try:
-                ohlcv_r = _fetch_ohlcv_direct(sym, TIMEFRAME, RECOVERY_CANDLES + 5)
-            except Exception:
-                continue
-            if not ohlcv_r or len(ohlcv_r) < RECOVERY_CANDLES + 1:
-                continue
-            ohlcv_r, _ = _drop_unclosed_candle(ohlcv_r, TIMEFRAME)
-            rec_ok, rec_reason = _recovery_ok(ohlcv_r)
-            logger.info(
-                f"[SL_RECOVERY] symbol={sym} ok={rec_ok} reason={rec_reason} "
-                f"consecutive_sl={sl_state['consecutive_sl']} (DB)"
-            )
-            if rec_ok:
-                recovery_passed = True
-                break
-
-        if not recovery_passed:
-            logger.info(
-                f"[SL_RECOVERY] WAITING (DB) | consecutive_sl={sl_state['consecutive_sl']} "
-                f"need={RECOVERY_CANDLES} green candles >= {RECOVERY_CANDLE_PCT}%"
-            )
-            return None
-        else:
-            logger.warning(
-                f"[SL_RECOVERY] PASSED ✅ (DB) | "
-                f"consecutive_sl={sl_state['consecutive_sl']}→0 | trading resumed"
-            )
-            reset_consecutive_sl()
+    # SL Cooldown სისტემა გათიშულია — DCA mode, SL=999%, consecutive SL არ ვარდება
+    # get_sl_cooldown_state / recovery check / reset_consecutive_sl — removed
 
     for symbol in SYMBOLS:
         logger.info(f"[GEN] LOOP_START | symbol={symbol}")
