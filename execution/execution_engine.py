@@ -594,65 +594,11 @@ class ExecutionEngine:
                 else:
                     current_status = ""
 
-                if current_status in {"CLOSED_TP", "CLOSED_SL", "CLOSED_SL_COOLDOWN"}:
+                if current_status in {"CLOSED_TP", "CLOSED_SL"}:
                     logger.debug(f"OCO_ALREADY_CLOSED | link={link_id} status={current_status}")
                     continue
 
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                # RECONCILE SL_COOLDOWN CHECK — backup layer
-                # თუ SL pause აქტიურია და OCO ჯერ კიდევ ღიაა →
-                # დაუყოვნებლივ გაუქმდეს (race condition backup).
-                # execute_signal-ის fix პირველი ხაზია, ეს მეორე.
-                # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                try:
-                    from execution.db.repository import is_sl_pause_active
-                    if is_sl_pause_active():
-                        logger.warning(
-                            f"[SL_COOLDOWN][RECONCILE] pause active + OCO open | "
-                            f"link={link_id} sym={symbol} → force cancel"
-                        )
-                        # cancel TP
-                        if tp_order_id:
-                            try:
-                                self.exchange.cancel_order(str(tp_order_id), str(symbol))
-                            except Exception:
-                                pass
-                        # cancel SL
-                        if sl_order_id:
-                            try:
-                                self.exchange.cancel_order(str(sl_order_id), str(symbol))
-                            except Exception:
-                                pass
-                        # market sell
-                        try:
-                            free_base = float(self.exchange.fetch_balance_free(str(base_asset)))
-                            if free_base > 0:
-                                # FIX EE-5: _safe_sell_amount — min_qty + min_notional guard
-                                _r_price = self.exchange.fetch_last_price(str(symbol)) if hasattr(self.exchange, 'fetch_last_price') else 0.0
-                                sell_amt = _safe_sell_amount(
-                                    self.exchange, str(symbol),
-                                    free_base * self.sell_buffer, _r_price
-                                )
-                                if sell_amt > 0:
-                                    self.exchange.place_market_sell(str(symbol), sell_amt)
-                                    logger.warning(
-                                        f"[SL_COOLDOWN][RECONCILE] market sold | "
-                                        f"sym={symbol} amount={sell_amt}"
-                                    )
-                                else:
-                                    logger.warning(
-                                        f"[SL_COOLDOWN][RECONCILE] sell_skip_below_min | "
-                                        f"sym={symbol} free={free_base:.8f}"
-                                    )
-                        except Exception as e_ms:
-                            logger.warning(f"[SL_COOLDOWN][RECONCILE] market sell fail | {e_ms}")
-
-                        set_oco_status(link_id, "CLOSED_SL_COOLDOWN")
-                        log_event("SL_COOLDOWN_RECONCILE_CLOSE", f"link={link_id} sym={symbol}")
-                        continue
-                except Exception as e_pause:
-                    logger.warning(f"[SL_COOLDOWN][RECONCILE] pause check err | {e_pause}")
-
+                # SL_COOLDOWN გათიშულია — DCA mode, SL=999%, OCO არ იდება
                 tr = get_trade(signal_id)
                 if not tr:
                     logger.warning(f"TRADE_ROW_MISSING | signal_id={signal_id}")
@@ -890,121 +836,8 @@ class ExecutionEngine:
                         except Exception:
                             pass
 
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # FIX: regime_engine SL Cooldown — SL increments counter
-                        # ეს არის ის კრიტიკული call რომელიც არ არსებობდა.
-                        # regime_engine.apply() SL Cooldown-ს ამოწმებს მხოლოდ
-                        # მაშინ თუ notify_outcome("SL") გამოიძახება.
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        try:
-                            _re_instance = getattr(self, "_regime_engine", None)
-                            if _re_instance is not None:
-                                _re_instance.notify_outcome(str(symbol), "SL")
-                                cons_sl = _re_instance.get_consecutive_sl(str(symbol))
-                                logger.warning(
-                                    f"[REGIME_OUTCOME] SL tracked | sym={symbol} "
-                                    f"consecutive_sl={cons_sl}"
-                                )
-                        except Exception as _re_err:
-                            logger.warning(f"[REGIME_OUTCOME] SL notify fail | {_re_err}")
-
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # FIX v2: SL hit-ის შემდეგ ყველა სხვა ღია OCO
-                        # დაუყოვნებლივ გაუქმდეს — race condition-ის
-                        # თავიდან ასაცილებლად.
-                        #
-                        # ძველი ლოგიკა: consecutive_sl >= limit(2) → cancel
-                        # პრობლემა: SL #2-ის cancel-ამდე ETH OCO უკვე
-                        # executed იყო → consecutive_sl=3.
-                        #
-                        # ახალი ლოგიკა: ნებისმიერი SL hit → სხვა სიმბოლოს
-                        # OCO-ები გაუქმდება + market sell.
-                        # limit-ზე: პაუზა + სრული დახურვა.
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        try:
-                            from execution.db.repository import get_sl_cooldown_state
-                            sl_state = get_sl_cooldown_state()
-                            sl_limit = int(os.getenv("SL_COOLDOWN_AFTER_N", "3"))   # ENV=3
-                            cur_sl   = sl_state["consecutive_sl"]
-
-                            # ── ნებისმიერ SL hit-ზე: სხვა სიმბოლოს OCO-ები გაუქმდეს ──
-                            # (current symbol-ის OCO უკვე exchange-ზე executed/closed)
-                            open_links = list_active_oco_links(limit=20)
-                            other_links = [
-                                lnk for lnk in open_links
-                                if str(lnk[1]) != str(signal_id)   # skip current
-                                and str(lnk[2]) != str(symbol)      # skip same symbol (race)
-                            ]
-
-                            if other_links:
-                                logger.warning(
-                                    f"[SL_COOLDOWN] SL hit #{cur_sl} | "
-                                    f"cancelling {len(other_links)} other open OCO(s) — race prevention"
-                                )
-
-                            for olink in other_links:
-                                try:
-                                    (ol_id, ol_sig, ol_sym, ol_base,
-                                     ol_tp_oid, ol_sl_oid, *_rest) = olink
-
-                                    # cancel TP order
-                                    if ol_tp_oid:
-                                        try:
-                                            self.exchange.cancel_order(str(ol_tp_oid), str(ol_sym))
-                                            logger.info(f"[SL_COOLDOWN] cancelled TP | sym={ol_sym} oid={ol_tp_oid}")
-                                        except Exception:
-                                            pass
-
-                                    # cancel SL order
-                                    if ol_sl_oid:
-                                        try:
-                                            self.exchange.cancel_order(str(ol_sl_oid), str(ol_sym))
-                                            logger.info(f"[SL_COOLDOWN] cancelled SL | sym={ol_sym} oid={ol_sl_oid}")
-                                        except Exception:
-                                            pass
-
-                                    # market sell remaining balance
-                                    try:
-                                        free_base = float(self.exchange.fetch_balance_free(str(ol_base)))
-                                        if free_base > 0:
-                                            # FIX EE-4: _safe_sell_amount — min_qty guard
-                                            _cl_price = self.exchange.fetch_last_price(str(ol_sym)) if hasattr(self.exchange, 'fetch_last_price') else 0.0
-                                            sell_amt = _safe_sell_amount(
-                                                self.exchange, str(ol_sym),
-                                                free_base * self.sell_buffer, _cl_price
-                                            )
-                                            if sell_amt > 0:
-                                                self.exchange.place_market_sell(str(ol_sym), sell_amt)
-                                                logger.warning(
-                                                    f"[SL_COOLDOWN] market sold remaining | "
-                                                    f"sym={ol_sym} amount={sell_amt}"
-                                                )
-                                            else:
-                                                logger.warning(
-                                                    f"[SL_COOLDOWN] sell_skip_below_min | "
-                                                    f"sym={ol_sym} free={free_base:.8f}"
-                                                )
-                                    except Exception as e2:
-                                        logger.warning(f"[SL_COOLDOWN] market sell fail | sym={ol_sym} err={e2}")
-
-                                    set_oco_status(int(ol_id), "CLOSED_SL_COOLDOWN")
-                                    log_event("SL_COOLDOWN_FORCE_CLOSE", f"sig={ol_sig} sym={ol_sym} triggered_by={signal_id}")
-
-                                except Exception as e3:
-                                    logger.warning(f"[SL_COOLDOWN] cancel_loop err | {e3}")
-
-                            # ── limit-ზე: დამატებითი warning (პაუზა signal_generator-ში უკვეა) ──
-                            if cur_sl >= sl_limit:
-                                logger.warning(
-                                    f"[SL_COOLDOWN] {cur_sl} consecutive SL — "
-                                    f"PAUSE active. All OCOs cancelled. No new BUY for "
-                                    f"{int(os.getenv('SL_COOLDOWN_PAUSE_SECONDS', '1800')) // 60}min"
-                                )
-                                log_event("SL_COOLDOWN_PAUSE_ACTIVE",
-                                          f"consecutive_sl={cur_sl} all_ocos_cancelled=True")
-
-                        except Exception as e:
-                            logger.warning(f"[SL_COOLDOWN] cancel_all_oco_fail | err={e}")
+                        # regime_engine SL notify — გათიშულია (DCA: SL=999%, OCO არ იდება)
+                        # _re_instance.notify_outcome("SL") — removed
 
                         self._run_post_close_diagnostics(
                             signal_id=str(signal_id),
