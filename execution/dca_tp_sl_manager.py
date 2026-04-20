@@ -1,17 +1,26 @@
 # execution/dca_tp_sl_manager.py
 # ============================================================
-# DCA TP/SL Manager — TP გამოთვლა avg_entry-დან.
+# DCA TP/SL Manager — ADDON CASCADE SYSTEM
 # SL=999% (გათიშული), Breakeven=გათიშული.
 #
-# FORCE CLOSE — 2 პირობა:
-#   1. MAX_OPEN_DAYS=7  → პოზიცია > 7 დღე ღიაა → დახურვა
-#   2. MAX_DRAWDOWN_PCT=15.0 → avg-დან -15% → დახურვა
+# ADAPTIVE TP — ზონის მიხედვით:
+#   L2 zone (add_on_count < max_add_ons): TP = DCA_TP_PCT (0.55%)
+#   L3 zone (add_on_count >= max_add_ons): TP = CASCADE_TP_L3_PCT (0.35%)
+#     L3-ზე bounce მოთხოვნა მცირეა — 0.35% საკმარისი avg-დან
+#     fee = 0.2% (2 trades), net = 0.15% — LIFO rotation-ს ფარავს
 #
-# ENV პარამეტრები:
-#   DCA_TP_PCT=0.55         ← L1-L2 TP პროცენტი
-#   DCA_SL_PCT=999.0        ← გათიშული (DCA ფილოსოფია)
-#   FORCE_CLOSE_MAX_DAYS=7  ← მაქს დღე ღია (0=გათიშული)
-#   FORCE_CLOSE_DRAWDOWN_PCT=15.0 ← მაქს drawdown % (0=გათიშული)
+# FORCE CLOSE — 2 safety net:
+#   1. FORCE_CLOSE_MAX_DAYS=10   → 10 დღეზე force exit
+#   2. FORCE_CLOSE_DRAWDOWN_PCT=22.0 → -22% avg-დან → exit
+#      (LIFO rotation-ი ვერ გადარჩინა)
+#
+# ENV:
+#   DCA_TP_PCT=0.55
+#   CASCADE_TP_L3_PCT=0.35
+#   DCA_SL_PCT=999.0
+#   DCA_MAX_ADD_ONS=5
+#   FORCE_CLOSE_MAX_DAYS=10
+#   FORCE_CLOSE_DRAWDOWN_PCT=22.0
 # ============================================================
 from __future__ import annotations
 
@@ -30,52 +39,85 @@ def _ef(name: str, default: float) -> float:
         return default
 
 
+def _ei(name: str, default: int) -> int:
+    try:
+        v = os.getenv(name)
+        return int(v) if v is not None else default
+    except Exception:
+        return default
+
+
 class DCATpSlManager:
     """
-    DCA TP/SL მართვა.
-    SL=999% (გათიშული) — ბოტი TP-ს ელოდება.
-    Breakeven და ForceClose გათიშულია.
+    ADDON CASCADE SYSTEM TP/SL Manager.
+
+    TP ადაპტური — ზონის მიხედვით:
+      L2 zone: 0.55% (ADD-ON active, სწრაფი scalp)
+      L3 zone: 0.35% (LIFO rotation, პატარა bounce საკმარისი)
+
+    SL: 999% = გათიშული.
+    LIFO rotation არის SL-ის ჩანაცვლება.
     """
 
     def __init__(self) -> None:
-        self.tp_pct = _ef("DCA_TP_PCT", 0.55)
-        self.sl_pct = _ef("DCA_SL_PCT", 999.0)
+        self.tp_pct    = _ef("DCA_TP_PCT",          0.55)  # L2 zone
+        self.tp_pct_l3 = _ef("CASCADE_TP_L3_PCT",   0.35)  # L3 zone
+        self.sl_pct    = _ef("DCA_SL_PCT",           999.0) # გათიშული
 
-        # FORCE CLOSE პარამეტრები
-        self.force_close_max_days     = _ef("FORCE_CLOSE_MAX_DAYS", 7.0)
-        self.force_close_drawdown_pct = _ef("FORCE_CLOSE_DRAWDOWN_PCT", 15.0)
+        self.force_close_max_days     = _ef("FORCE_CLOSE_MAX_DAYS",     10.0)
+        self.force_close_drawdown_pct = _ef("FORCE_CLOSE_DRAWDOWN_PCT", 22.0)
+
+        # L3 boundary განსაზღვრა
+        self.max_add_ons = _ei("DCA_MAX_ADD_ONS", 5)
 
         logger.info(
-            f"[DCA] DCATpSlManager init | TP={self.tp_pct}% SL={self.sl_pct}% "
-            f"force_close_days={self.force_close_max_days} "
+            f"[DCA] DCATpSlManager init | "
+            f"TP_L2={self.tp_pct}% TP_L3={self.tp_pct_l3}% SL=OFF | "
+            f"force_close_days={self.force_close_max_days}d "
             f"force_close_drawdown={self.force_close_drawdown_pct}%"
         )
 
-    def calculate(self, avg_entry_price: float) -> Dict[str, float]:
+    def _get_tp_pct(self, position: Optional[Dict[str, Any]] = None) -> float:
         """
-        avg_entry-დან TP და SL გამოთვლა.
-        გამოიძახება პოზიციის გახსნისას და ყოველ add-on-ის შემდეგ.
+        L2 vs L3 TP განსაზღვრა.
+        add_on_count >= max_add_ons → L3 zone → 0.35%
+        add_on_count <  max_add_ons → L2 zone → 0.55%
         """
-        avg = float(avg_entry_price)
-        tp  = round(avg * (1.0 + self.tp_pct / 100.0), 6)
-        sl  = round(avg * (1.0 - self.sl_pct / 100.0), 6)
+        if position is None:
+            return self.tp_pct
+        n = int(position.get("add_on_count", 0) or 0)
+        return self.tp_pct_l3 if n >= self.max_add_ons else self.tp_pct
+
+    def calculate(
+        self,
+        avg_entry_price: float,
+        position: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, float]:
+        """
+        avg_entry-დან TP/SL გამოთვლა.
+        position გადაეცემა L2/L3 zone განსაზღვრისთვის.
+        გამოიძახება: პოზიციის გახსნისას, ADD-ON-ის შემდეგ, LIFO rotation-ის შემდეგ.
+        """
+        avg    = float(avg_entry_price)
+        tp_pct = self._get_tp_pct(position)
+        tp     = round(avg * (1.0 + tp_pct / 100.0), 6)
+        sl     = round(avg * (1.0 - self.sl_pct / 100.0), 6)
         return {
             "tp_price": tp,
             "sl_price": sl,
-            "tp_pct":   self.tp_pct,
+            "tp_pct":   tp_pct,
             "sl_pct":   self.sl_pct,
         }
 
-    def is_sl_confirmed(
-        self,
-        sl_price: float,
-        ohlcv: Any,
-    ) -> Tuple[bool, str]:
+    def calculate_rotation_tp(self, new_avg: float) -> float:
         """
-        DCA სტრატეგია: SL confirmation გათიშულია.
-        ბოტი არ ყიდის SL-ზე — ინახავს პოზიციას.
+        LIFO rotation-ის შემდეგ ახალი TP.
+        L3 zone TP (0.35%) — პატარა bounce = TP hit.
         """
-        # DCA: SL disabled — hold until TP
+        return round(new_avg * (1.0 + self.tp_pct_l3 / 100.0), 6)
+
+    def is_sl_confirmed(self, sl_price: float, ohlcv: Any) -> Tuple[bool, str]:
+        """DCA: SL disabled. LIFO rotation არის SL-ის ჩანაცვლება."""
         return False, "SL_DISABLED_DCA_MODE"
 
     def check_breakeven(
@@ -84,11 +126,7 @@ class DCATpSlManager:
         current_price: float,
         current_sl_price: float,
     ) -> Tuple[bool, float]:
-        """
-        DCA სტრატეგია: Breakeven სრულად გათიშულია.
-        ბოტი ინახავს პოზიციას სანამ TP-ს არ მიაღწევს.
-        """
-        # DCA: breakeven disabled — hold until TP
+        """DCA: Breakeven გათიშულია."""
         return False, current_sl_price
 
     def should_force_close(
@@ -97,17 +135,14 @@ class DCATpSlManager:
         current_price: float,
     ) -> Tuple[bool, str]:
         """
-        FORCE CLOSE — 2 პირობა:
+        FORCE CLOSE — safety net LIFO rotation-ის შემდეგ.
 
-        1. MAX DAYS: პოზიცია > FORCE_CLOSE_MAX_DAYS დღე ღიაა
-           → კაპიტალი ჩაკეტილია → პატარა ზარალით დახურვა ჯობია
-           → FORCE_CLOSE_MAX_DAYS=0 → გათიშული
-
-        2. MAX DRAWDOWN: avg-დან -FORCE_CLOSE_DRAWDOWN_PCT%
-           → ბაზარიძლიერ ეცემა → SHORT hedge-ს ვეღარ ანაზღაურებს
-           → FORCE_CLOSE_DRAWDOWN_PCT=0 → გათიშული
+        1. MAX DAYS (10): კაპიტალი 10+ დღე ჩაკეტილია → გათავისუფლება
+        2. MAX DRAWDOWN (22%): LIFO rotation-მა ვერ გადარჩინა → force exit
+           -22% @ $80 invested = -$17.6 realized loss
+           vs კლასიკური SL -2% = -$1.48 (ანომალური სცენარი)
         """
-        # ── 1. MAX DAYS check ────────────────────────────────────────
+        # ── 1. MAX DAYS ──────────────────────────────────────────────
         if self.force_close_max_days > 0:
             try:
                 from datetime import datetime, timezone
@@ -117,9 +152,7 @@ class DCATpSlManager:
                     opened_dt  = datetime.fromisoformat(opened_str)
                     if opened_dt.tzinfo is None:
                         opened_dt = opened_dt.replace(tzinfo=timezone.utc)
-                    now_dt   = datetime.now(timezone.utc)
-                    days_open = (now_dt - opened_dt).total_seconds() / 86400.0
-
+                    days_open = (datetime.now(timezone.utc) - opened_dt).total_seconds() / 86400.0
                     if days_open >= self.force_close_max_days:
                         reason = (
                             f"MAX_DAYS_OPEN | "
@@ -130,7 +163,7 @@ class DCATpSlManager:
             except Exception as _e:
                 logger.warning(f"[FORCE_CLOSE] days_check_fail | err={_e}")
 
-        # ── 2. MAX DRAWDOWN check ────────────────────────────────────
+        # ── 2. MAX DRAWDOWN ───────────────────────────────────────────
         if self.force_close_drawdown_pct > 0:
             try:
                 avg_entry = float(position.get("avg_entry_price") or 0.0)
@@ -149,7 +182,6 @@ class DCATpSlManager:
         return False, "OK"
 
 
-# module-level singleton
 _tp_sl_mgr: Optional[DCATpSlManager] = None
 
 
