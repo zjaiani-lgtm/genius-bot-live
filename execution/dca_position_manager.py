@@ -23,10 +23,6 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("gbm")
 
 
-# ─────────────────────────────────────────────
-# ENV HELPERS
-# ─────────────────────────────────────────────
-
 def _ef(name: str, default: float) -> float:
     try:
         v = os.getenv(name)
@@ -59,10 +55,6 @@ def _parse_list_float(name: str, default: List[float]) -> List[float]:
     except Exception:
         return default
 
-
-# ─────────────────────────────────────────────
-# TECHNICAL INDICATORS (minimal, no deps)
-# ─────────────────────────────────────────────
 
 def _rsi(closes: List[float], period: int = 14) -> float:
     if len(closes) < period + 1:
@@ -131,20 +123,12 @@ def _volume_score(vols: List[float], n: int = 20) -> float:
     return min(1.0, vols[-1] / avg)
 
 
-# ─────────────────────────────────────────────
-# AVERAGE PRICE CALCULATOR
-# ─────────────────────────────────────────────
-
 def recalculate_average(
     old_qty: float,
     old_avg: float,
     new_qty: float,
     new_price: float,
 ) -> Dict[str, float]:
-    """
-    Weighted average entry price.
-    Returns: {avg_entry_price, total_qty, total_quote_spent_added}
-    """
     old_value = old_qty * old_avg
     new_value = new_qty * new_price
     total_qty = old_qty + new_qty
@@ -162,34 +146,15 @@ def recalculate_average(
     }
 
 
-# ─────────────────────────────────────────────
-# RECOVERY SIGNAL SCORER
-# "falling knife" vs "dip buy" detection
-# ─────────────────────────────────────────────
-
 def score_recovery_signals(ohlcv: List[List[float]]) -> Tuple[int, Dict[str, Any]]:
-    """
-    5 სიგნალს ამოწმებს — 5-დან მინიმუმ 3 უნდა გაიაროს.
-
-    Returns: (score: int, details: dict)
-
-    სიგნალები:
-      1. RSI oversold recovery zone (20-48)
-      2. MACD histogram improving (ბოლო 2 bar)
-      3. Volume >= 80% of 20-bar average (dip buy with volume)
-      4. ATR < 2.0% (არ არის extreme volatile / falling knife)
-      5. Lower wick rejection (ბოლო candle-ი)
-    """
     if len(ohlcv) < 30:
         return 0, {"error": "not_enough_candles"}
 
     closes = [float(c[4]) for c in ohlcv]
     vols   = [float(c[5]) for c in ohlcv]
     details: Dict[str, Any] = {}
-
     score = 0
 
-    # 1. RSI zone
     rsi = _rsi(closes, 14)
     rsi_ok = 20.0 <= rsi <= 48.0
     details["rsi"] = round(rsi, 2)
@@ -197,7 +162,6 @@ def score_recovery_signals(ohlcv: List[List[float]]) -> Tuple[int, Dict[str, Any
     if rsi_ok:
         score += 1
 
-    # 2. MACD improving
     hist = _macd_hist_series(closes, n=3)
     macd_ok = len(hist) >= 2 and hist[-1] > hist[-2]
     details["macd_hist_last"] = round(hist[-1], 8) if hist else None
@@ -205,7 +169,6 @@ def score_recovery_signals(ohlcv: List[List[float]]) -> Tuple[int, Dict[str, Any
     if macd_ok:
         score += 1
 
-    # 3. Volume >= 80% avg
     vol_s = _volume_score(vols, 20)
     vol_ok = vol_s >= 0.80
     details["vol_score"] = round(vol_s, 3)
@@ -213,7 +176,6 @@ def score_recovery_signals(ohlcv: List[List[float]]) -> Tuple[int, Dict[str, Any
     if vol_ok:
         score += 1
 
-    # 4. ATR not extreme
     atr = _atr_pct(ohlcv, 14)
     atr_ok = atr < 2.0
     details["atr_pct"] = round(atr, 4)
@@ -221,7 +183,6 @@ def score_recovery_signals(ohlcv: List[List[float]]) -> Tuple[int, Dict[str, Any
     if atr_ok:
         score += 1
 
-    # 5. Lower wick rejection
     last = ohlcv[-1]
     o, h, l, c = float(last[1]), float(last[2]), float(last[3]), float(last[4])
     body = abs(c - o)
@@ -239,48 +200,61 @@ def score_recovery_signals(ohlcv: List[List[float]]) -> Tuple[int, Dict[str, Any
     return score, details
 
 
-# ─────────────────────────────────────────────
-# DCA POSITION MANAGER
-# ─────────────────────────────────────────────
-
 class DCAPositionManager:
     """
-    Add-on logic — პასუხობს კითხვაზე:
-    "ახლა უნდა დაემატოს order ამ პოზიციაზე?"
+    ADDON CASCADE SYSTEM — Add-on + LIFO Rotation Manager.
 
-    გამოიყენება execution_engine.py-ის მიერ reconcile_oco() loop-ში.
+    L2 ZONE (ADD-ON active):
+      avg-დან -1%,-2.2%,-3.5%,-5%,-6.5% trigger → ADD-ON (pyramid-down)
+      sizes: $12,$15,$18,$15,$10 — ყველაზე დიდი bounce probability ზონაში
+
+    L3 ZONE (ROTATION active):
+      ADD-ONs exhausted + price კვლავ ეცემა → LIFO rotation
+      ყველაზე ძვირი unit sell → proceeds reinvest @ current
+      → avg ეცემა, TP ახლოვდება, ზარალი მინიმიზდება
     """
 
     def __init__(self) -> None:
-        # feature flag
-        self.enabled = _eb("DCA_ENABLED", False)
+        self.enabled      = _eb("DCA_ENABLED", False)
 
-        # add-on limits
-        self.max_add_ons     = _ei("DCA_MAX_ADD_ONS", 3)
-        self.max_capital     = _ef("DCA_MAX_CAPITAL_USDT", 40.0)
-        self.max_drawdown    = _ef("DCA_MAX_DRAWDOWN_PCT", 999.0)
+        # ── L2 ZONE: ADD-ON პარამეტრები ──────────────────────
+        self.max_add_ons  = _ei("DCA_MAX_ADD_ONS", 5)
+        self.max_capital  = _ef("DCA_MAX_CAPITAL_USDT", 80.0)
+        self.max_drawdown = _ef("DCA_MAX_DRAWDOWN_PCT", 999.0)
 
-        # trigger drawdowns per add-on level (list)
+        # pyramid-down triggers: bounce prob 95%→82%→71%→58%→44%
         self.trigger_pcts = _parse_list_float(
-            "DCA_ADDON_TRIGGER_PCTS", [2.0, 3.5, 5.5]
+            "DCA_ADDON_TRIGGER_PCTS", [1.0, 2.2, 3.5, 5.0, 6.5]
         )
-
-        # add-on sizes per level (USDT)
+        # pyramid-down sizes: ყველაზე დიდი სადაც bounce 71% (level 3)
         self.addon_sizes = _parse_list_float(
-            "DCA_ADDON_SIZES", [10.0, 10.0, 10.0]
+            "DCA_ADDON_SIZES", [12.0, 15.0, 18.0, 15.0, 10.0]
         )
+        # cooldown 3 წუთი (ადრე 15) — სწრაფ ვარდნაში ADD-ON არ გამოტოვდეს
+        self.addon_cooldown = _ei("DCA_ADDON_COOLDOWN_SECONDS", 180)
+        # recovery score გათიშულია — drawdown-based trigger საკმარისია
+        self.min_recovery_score = _ei("DCA_MIN_RECOVERY_SCORE", 0)
 
-        # cooldown between add-ons (seconds)
-        self.addon_cooldown = _ei("DCA_ADDON_COOLDOWN_SECONDS", 900)
-
-        # minimum recovery score
-        self.min_recovery_score = _ei("DCA_MIN_RECOVERY_SCORE", 3)
+        # ── L3 ZONE: LIFO ROTATION პარამეტრები ───────────────
+        self.rotation_enabled     = _eb("DCA_ROTATION_ENABLED", True)
+        # drop from last ADD-ON price to trigger rotation
+        self.rotation_trigger_pct = _ef("DCA_ROTATION_TRIGGER_PCT", 1.5)
+        # cooldown 5 წუთი rotation-ებს შორის (fee leak თავიდანაცილება)
+        self.rotation_cooldown    = _ei("DCA_ROTATION_COOLDOWN_SECONDS", 300)
 
         logger.info(
             f"[DCA] DCAPositionManager init | enabled={self.enabled} "
             f"max_add_ons={self.max_add_ons} max_capital={self.max_capital} "
-            f"triggers={self.trigger_pcts} sizes={self.addon_sizes}"
+            f"triggers={self.trigger_pcts} sizes={self.addon_sizes} "
+            f"cooldown={self.addon_cooldown}s | "
+            f"rotation={self.rotation_enabled} "
+            f"rot_trigger={self.rotation_trigger_pct}% "
+            f"rot_cooldown={self.rotation_cooldown}s"
         )
+
+    # ─────────────────────────────────────────────────────────
+    # L2 ZONE: ADD-ON LOGIC
+    # ─────────────────────────────────────────────────────────
 
     def should_add_on(
         self,
@@ -289,56 +263,51 @@ class DCAPositionManager:
         ohlcv: List[List[float]],
     ) -> Tuple[bool, str]:
         """
-        True + "OK" → add-on-ი შეიძლება გაიხსნას.
+        True + "OK" → ADD-ON შეიძლება.
         False + reason → ვერ გაიხსნება.
 
-        position dict keys:
-          add_on_count, total_quote_spent, avg_entry_price,
-          max_add_ons (optional), max_capital (optional),
-          last_add_on_ts (optional)
+        6 გეიტი:
+          1. max_add_ons limit
+          2. trigger list bounds
+          3. capital limit
+          4. price dropped enough (drawdown >= trigger)
+          5. max drawdown — force close territory
+          6. cooldown between add-ons
         """
         if not self.enabled:
             return False, "DCA_DISABLED"
 
-        n = int(position.get("add_on_count", 0))
-        max_n = int(position.get("max_add_ons", self.max_add_ons))
-        max_cap = float(position.get("max_capital", self.max_capital))
+        n           = int(position.get("add_on_count", 0))
+        max_n       = int(position.get("max_add_ons", self.max_add_ons))
+        max_cap     = float(position.get("max_capital", self.max_capital))
         total_spent = float(position.get("total_quote_spent", 0.0))
-        avg_entry = float(position.get("avg_entry_price", 0.0))
+        avg_entry   = float(position.get("avg_entry_price", 0.0))
 
-        # 1. max add-ons
         if n >= max_n:
             return False, f"MAX_ADD_ONS_REACHED ({n}/{max_n})"
 
-        # 2. trigger list bounds
         if n >= len(self.trigger_pcts):
             return False, f"NO_TRIGGER_DEFINED_FOR_LEVEL_{n}"
 
-        # 3. capital limit
         next_size = self.addon_sizes[n] if n < len(self.addon_sizes) else self.addon_sizes[-1]
         if total_spent + next_size > max_cap:
             return False, f"MAX_CAPITAL_REACHED ({total_spent:.1f}+{next_size:.1f}>{max_cap:.1f})"
 
-        # 4. price dropped enough?
         if avg_entry <= 0:
             return False, "AVG_ENTRY_ZERO"
         drawdown = (avg_entry - current_price) / avg_entry * 100.0
-        trigger = self.trigger_pcts[n]
+        trigger  = self.trigger_pcts[n]
         if drawdown < trigger:
             return False, f"DRAWDOWN_{drawdown:.2f}%_<_TRIGGER_{trigger:.1f}%"
 
-        # 5. max drawdown — force close territory
         if drawdown > self.max_drawdown:
             return False, f"DRAWDOWN_{drawdown:.2f}%_>_MAX_{self.max_drawdown:.1f}%_FORCE_CLOSE"
 
-        # 6. cooldown between add-ons
         last_ts = float(position.get("last_add_on_ts", 0.0) or 0.0)
         if last_ts > 0 and (time.time() - last_ts) < self.addon_cooldown:
             remaining = int(self.addon_cooldown - (time.time() - last_ts))
             return False, f"ADDON_COOLDOWN_ACTIVE ({remaining}s remaining)"
 
-        # DCA: recovery signal check გათიშულია
-        # ბოტი ყოველთვის ამატებს add-on-ს drawdown trigger-ზე
         logger.info(
             f"[DCA] ADD_ON_OK | level={n+1} drawdown={drawdown:.2f}% "
             f"trigger={trigger:.1f}% size={next_size}"
@@ -346,7 +315,7 @@ class DCAPositionManager:
         return True, "OK"
 
     def get_addon_size(self, add_on_count: int) -> float:
-        """Add-on-ის USDT ზომა level-ის მიხედვით."""
+        """ADD-ON ზომა USDT-ში level-ის მიხედვით."""
         n = int(add_on_count)
         if n < len(self.addon_sizes):
             return float(self.addon_sizes[n])
@@ -358,6 +327,98 @@ class DCAPositionManager:
         if n < len(self.trigger_pcts):
             return float(self.trigger_pcts[n])
         return float(self.trigger_pcts[-1]) if self.trigger_pcts else 5.0
+
+    # ─────────────────────────────────────────────────────────
+    # L3 ZONE: LIFO ROTATION
+    # ─────────────────────────────────────────────────────────
+
+    def should_rotate(
+        self,
+        position: Dict[str, Any],
+        current_price: float,
+    ) -> Tuple[bool, str]:
+        """
+        L3 zone: ADD-ONs exhausted + price კვლავ ეცემა → LIFO rotation.
+
+        LIFO მათემატიკა:
+          ძვირი unit sell → avg ეცემა (FIFO-ზე avg ამაღლდება!)
+          proceeds reinvest @ current → qty არ იცვლება
+          → TP ახლოვდება ყოველ rotation-ზე
+
+        გეიტები:
+          1. rotation_enabled=false → skip
+          2. add_on_count < max_add_ons → L2 zone, ADD-ON ჯერ active
+          3. drop from last_addon_price >= rotation_trigger_pct (1.5%)
+          4. cooldown: 300s rotation-ებს შორის
+        """
+        if not self.rotation_enabled:
+            return False, "ROTATION_DISABLED"
+
+        if not self.enabled:
+            return False, "DCA_DISABLED"
+
+        n     = int(position.get("add_on_count", 0))
+        max_n = int(position.get("max_add_ons", self.max_add_ons))
+
+        if n < max_n:
+            return False, f"L2_ZONE_ACTIVE ({n}/{max_n} add-ons used)"
+
+        # reference: last ADD-ON price (ან avg თუ არ გვაქვს)
+        last_addon_price = float(
+            position.get("last_addon_price") or
+            position.get("avg_entry_price") or 0.0
+        )
+        if last_addon_price <= 0:
+            return False, "NO_REFERENCE_PRICE"
+
+        drop_from_last = (last_addon_price - current_price) / last_addon_price * 100.0
+        if drop_from_last < self.rotation_trigger_pct:
+            return False, (
+                f"DROP_{drop_from_last:.2f}%_<_ROT_TRIGGER_{self.rotation_trigger_pct:.1f}%"
+            )
+
+        last_rot_ts = float(position.get("last_rotation_ts") or 0.0)
+        if last_rot_ts > 0:
+            elapsed = time.time() - last_rot_ts
+            if elapsed < self.rotation_cooldown:
+                remaining = int(self.rotation_cooldown - elapsed)
+                return False, f"ROTATION_COOLDOWN ({remaining}s remaining)"
+
+        logger.info(
+            f"[DCA] ROTATION_OK | L3 zone | "
+            f"drop_from_last={drop_from_last:.2f}% "
+            f"trigger={self.rotation_trigger_pct:.1f}% → LIFO"
+        )
+        return True, "ROTATE_LIFO"
+
+    def get_lifo_unit(
+        self,
+        dca_orders: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        LIFO: ყველაზე მაღალ ფასზე ნაყიდი unit.
+
+        რატომ LIFO და არა FIFO:
+          LIFO sell: avg ეცემა → TP ახლოვდება ✅
+          FIFO sell: avg ამაღლდება → TP შორდება ❌
+
+        მხოლოდ INITIAL და ADD_ON order-ები — ROTATION_REINVEST გამოვრიცხოთ
+        (reinvest units-ი უკვე current price-ზეა → LIFO-სთვის არ ვიყენებთ)
+        """
+        if not dca_orders:
+            return None
+
+        eligible = [
+            o for o in dca_orders
+            if str(o.get("order_type", "")).upper() in (
+                "INITIAL", "LAYER2_INITIAL", "CASCADE_LAYER",
+            ) or str(o.get("order_type", "")).startswith("ADD_ON_")
+        ]
+
+        if not eligible:
+            eligible = list(dca_orders)
+
+        return max(eligible, key=lambda o: float(o.get("entry_price", 0.0)))
 
 
 # module-level singleton
