@@ -6,8 +6,9 @@
 # მხოლოდ DB-ს კითხულობს და TP-ს ასწორებს avg_entry-დან
 #
 # ლოგიკა:
-#   L1-L2:  TP = avg_entry × 1.0055  (+0.55%)
-#   L3-L10: TP = avg_entry × 1.0065  (+0.65%)
+#   L1-L2: TP = avg_entry × 1.0055  (+0.55%)
+#   L3:    TP = avg_entry × 1.0065  (+0.65%)
+#   (max_layers=3 — L4+ არ იხსნება)
 #
 # TIME_BASED_TP_ENABLED=true შემთხვევაში:
 #   tp_fix-ი UTC session-ის მიხედვით TP-ს ასწორებს.
@@ -23,7 +24,7 @@
 #   TP_FIX_ENABLED=true          ← ჩართვა/გამორთვა
 #   TP_FIX_TOLERANCE=0.1         ← 0.1% სხვაობაზე გასწორება
 #   DCA_TP_PCT=0.55              ← L1-L2 TP პროცენტი
-#   CASCADE_TP_L3_PCT=0.65       ← L3+ TP პროცენტი
+#   CASCADE_TP_L3_PCT=0.65       ← L3 TP პროცენტი (max layer)
 #   TIME_BASED_TP_ENABLED=false  ← Time-based TP (default: false)
 # ============================================================
 
@@ -39,7 +40,7 @@ logger = logging.getLogger("gbm")
 
 TOLERANCE = float(os.getenv("TP_FIX_TOLERANCE", "0.1"))   # 0.1% სხვაობა
 TP_BASE   = float(os.getenv("DCA_TP_PCT",        "0.55"))  # L1-L2
-TP_L3     = float(os.getenv("CASCADE_TP_L3_PCT", "0.65"))  # L3-L10
+TP_L3     = float(os.getenv("CASCADE_TP_L3_PCT", "0.65"))  # L3 (max layer)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TIME_BASED_TP — signal_generator-თან სინქრონიზაცია.
@@ -73,7 +74,7 @@ def _session_mult() -> tuple:
 
 
 def _layer_num(symbol: str) -> int:
-    """BTC/USDT → 1, BTC/USDT_L2 → 2, BTC/USDT_L5 → 5"""
+    """BTC/USDT → 1, BTC/USDT_L2 → 2, BTC/USDT_L3 → 3 (max)"""
     m = re.search(r'_L(\d+)$', symbol)
     return int(m.group(1)) if m else 1
 
