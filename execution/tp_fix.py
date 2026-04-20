@@ -39,8 +39,8 @@ from datetime import datetime
 logger = logging.getLogger("gbm")
 
 TOLERANCE = float(os.getenv("TP_FIX_TOLERANCE", "0.1"))   # 0.1% სხვაობა
-TP_BASE   = float(os.getenv("DCA_TP_PCT",        "0.55"))  # L1-L2
-TP_L3     = float(os.getenv("CASCADE_TP_L3_PCT", "0.65"))  # L3 (max layer)
+TP_BASE   = float(os.getenv("DCA_TP_PCT",        "0.55"))  # L2 zone (ADD-ON active)
+TP_L3     = float(os.getenv("CASCADE_TP_L3_PCT", "0.35"))  # L3 zone (LIFO rotation)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # TIME_BASED_TP — signal_generator-თან სინქრონიზაცია.
