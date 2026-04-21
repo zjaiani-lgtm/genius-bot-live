@@ -1202,6 +1202,7 @@ def main():
                     futures_engine.check_tp_sl()
                 elif _market_regime == "BULL":
                     futures_engine.close_all_shorts(reason="BULL_MARKET")
+                    futures_engine.check_tp_sl()  # hedge SHORT-ების TP check
                 else:
                     futures_engine.check_tp_sl()
 
