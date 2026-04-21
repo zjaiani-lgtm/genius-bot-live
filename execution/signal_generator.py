@@ -24,7 +24,6 @@ from execution.db.repository import (
     get_all_symbol_cooldown_states,
     # FIX GLOBAL-1: global open trade count for MAX_OPEN_TRADES guard
     get_all_open_trades,
-    # FIX GLOBAL-1b: DCA mode — dca_positions ცხრილი (L1 only count)
     get_all_open_dca_positions,
 )
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
@@ -49,7 +48,7 @@ MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))   # ENV=10
 # Fee-aware edge gate
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.02"))  # DCA: 0.22→0.02 (BTC/BNB always passes)
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))  # ENV=0.14
-ESTIMATED_SLIPPAGE_PCT = 0.0  # DCA: disabled
+ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0"))
 TP_PCT = float(os.getenv("TP_PCT", "1.5"))                                               # ENV=1.5%
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.25"))                     # ENV=0.25
 
@@ -80,7 +79,7 @@ GEN_LOG_EVERY_TICK = os.getenv("GEN_LOG_EVERY_TICK", "true").strip().lower() == 
 MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H", "5000000"))   # DCA: 30M→5M
 
 # 2. Signal expiration — signal ts_utc-დან SIGNAL_EXPIRATION_SECONDS გასული → skip
-SIGNAL_EXPIRATION_SECONDS = 0  # DCA: disabled
+SIGNAL_EXPIRATION_SECONDS = int(os.getenv("SIGNAL_EXPIRATION_SECONDS", "0"))
 
 # 3. AI confidence boost — ai_score * AI_CONFIDENCE_BOOST (>1.0 ამაღლებს score-ს)
 AI_CONFIDENCE_BOOST = float(os.getenv("AI_CONFIDENCE_BOOST", "1.05"))  # ENV=1.05
@@ -203,18 +202,15 @@ MACD_HIST_ATR_FACTOR  = float(os.getenv("MACD_HIST_ATR_FACTOR", "0.2"))  # ENV=0
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #3 Trailing Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-TRAILING_STOP_ENABLED   = False  # DCA: disabled
-# FIX WIN-8: TRAILING_STOP_DISTANCE 0.25→0.35
-# BTC/ETH 15m candle noise ≈ 0.20-0.30%. 0.25% trailing = noise trigger.
-# 0.35% = beyond typical 15m noise, still locks in profits on real moves.
-TRAILING_STOP_DISTANCE  = 0.25  # DCA: disabled (trailing off)
+TRAILING_STOP_ENABLED   = os.getenv("TRAILING_STOP_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+TRAILING_STOP_DISTANCE  = float(os.getenv("TRAILING_STOP_DISTANCE", "0.25"))
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #4 Dynamic position sizing
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 USE_DYNAMIC_SIZING    = os.getenv("USE_DYNAMIC_SIZING", "true").strip().lower() == "true"
-DYNAMIC_SIZE_MIN      = 10.0  # DCA: fixed $10
-DYNAMIC_SIZE_MAX      = 10.0  # DCA: fixed $10
+DYNAMIC_SIZE_MIN      = float(os.getenv("DYNAMIC_SIZE_MIN", "10.0"))
+DYNAMIC_SIZE_MAX      = float(os.getenv("DYNAMIC_SIZE_MAX", "10.0"))
 DYNAMIC_SIZE_AI_LOW   = float(os.getenv("DYNAMIC_SIZE_AI_LOW",  "0.55"))
 DYNAMIC_SIZE_AI_HIGH  = float(os.getenv("DYNAMIC_SIZE_AI_HIGH", "0.80"))
 
@@ -228,7 +224,7 @@ PARTIAL_TP1_SIZE      = float(os.getenv("PARTIAL_TP1_SIZE", "0.5"))
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #7 Breakeven Stop
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-USE_BREAKEVEN_STOP    = False  # DCA: disabled
+USE_BREAKEVEN_STOP    = os.getenv("USE_BREAKEVEN_STOP", "false").strip().lower() in ("1", "true", "yes")
 # FIX WIN-9: BREAKEVEN_TRIGGER_PCT 0.40→0.30
 # Activates breakeven protection when price is 0.30% above entry (was 0.40%).
 # Earlier activation = more trades protected from reverting to SL loss.
@@ -333,7 +329,7 @@ _protective_sell_ts: dict  = {}   # {symbol: float} — protective sell cooldown
 # -0.05 = სუსტი downtrend (default). -0.03 = უფრო მგრძნობიარე, -0.10 = გვიანი გასვლა
 SELL_TREND_THRESHOLD = float(os.getenv("SELL_TREND_THRESHOLD", "-0.05"))  # ENV=-0.05
 
-SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "99"))      # DCA: გათიშული
+SL_COOLDOWN_COUNT   = int(os.getenv("SL_COOLDOWN_AFTER_N", "999"))
 SL_COOLDOWN_PAUSE   = int(os.getenv("SL_COOLDOWN_PAUSE_SECONDS", "1800"))
 RECOVERY_CANDLES    = int(os.getenv("RECOVERY_GREEN_CANDLES", "3"))
 # FIX: 0.25% → 0.10% default. 15m flat ბაზარზე სანთლები 0.15-0.35%-ია.
@@ -494,6 +490,121 @@ def _edge_ok(atr_pct: float) -> Tuple[bool, str]:
     return True, "OK"
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# SMART LONG + SHORT — MARKET REGIME DETECTOR
+# BTC 24h price change-ის მიხედვით ბაზრის რეჟიმი.
+#
+# ENV:
+#   MARKET_BEAR_THRESHOLD=-3.0    ← Bear trigger %
+#   MARKET_BULL_THRESHOLD=2.0     ← Bull trigger %
+#   MARKET_REGIME_SYMBOL=BTC/USDT ← რომელი coin-ი
+#   MARKET_REGIME_COOLDOWN=300    ← 5 წუთი regime cache
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_LAST_REGIME_TS: float = 0.0
+_LAST_REGIME_VAL: str = "NEUTRAL"
+
+
+def _detect_market_regime_24h() -> str:
+    """
+    BTC 24h price change-ის მიხედვით ბაზრის რეჟიმი.
+
+    Returns: "BEAR" | "BULL" | "NEUTRAL"
+
+    BEAR:    BTC_24h_change < MARKET_BEAR_THRESHOLD (default -3.0%)
+    BULL:    BTC_24h_change > MARKET_BULL_THRESHOLD (default +2.0%)
+    NEUTRAL: სხვა
+
+    Cache: MARKET_REGIME_COOLDOWN წამი (default 300s = 5 წუთი)
+    """
+    global _LAST_REGIME_TS, _LAST_REGIME_VAL
+
+    # Cache — ყოველ 5 წუთს ახლა, არა ყოველ tick-ზე
+    _regime_cooldown = int(os.getenv("MARKET_REGIME_COOLDOWN", "300"))
+    if (time.time() - _LAST_REGIME_TS) < _regime_cooldown:
+        logger.debug(f"[REGIME_24H] CACHED | regime={_LAST_REGIME_VAL}")
+        return _LAST_REGIME_VAL
+
+    bear_threshold = float(os.getenv("MARKET_BEAR_THRESHOLD", "-3.0"))
+    bull_threshold = float(os.getenv("MARKET_BULL_THRESHOLD",  "2.0"))
+    regime_symbol  = os.getenv("MARKET_REGIME_SYMBOL", "BTC/USDT")
+
+    try:
+        exchange = _build_exchange()
+        ticker = exchange.fetch_ticker(regime_symbol)
+        last    = float(ticker.get("last") or 0.0)
+        # previousClose = ბინანსის API-ში გუშინდელი close
+        prev    = float(
+            ticker.get("previousClose")
+            or ticker.get("open")
+            or 0.0
+        )
+
+        if prev <= 0 or last <= 0:
+            logger.warning(f"[REGIME_24H] NO_PRICE | {regime_symbol} → NEUTRAL")
+            return "NEUTRAL"
+
+        change_pct = (last - prev) / prev * 100.0
+
+        if change_pct < bear_threshold:
+            regime = "BEAR"
+        elif change_pct > bull_threshold:
+            regime = "BULL"
+        else:
+            regime = "NEUTRAL"
+
+        logger.info(
+            f"[REGIME_24H] DETECTED | {regime_symbol} "
+            f"last={last:.2f} prev={prev:.2f} "
+            f"change={change_pct:+.2f}% → {regime}"
+        )
+
+        # cache განახლება
+        if regime != _LAST_REGIME_VAL:
+            logger.info(
+                f"[REGIME_24H] CHANGE | {_LAST_REGIME_VAL} → {regime} "
+                f"(change={change_pct:+.2f}%)"
+            )
+            # Telegram — regime change შეტყობინება
+            try:
+                from execution.telegram_notifier import notify_market_regime_change
+                notify_market_regime_change(
+                    old_regime=_LAST_REGIME_VAL,
+                    new_regime=regime,
+                    btc_change_pct=change_pct,
+                )
+            except Exception as _tg:
+                logger.warning(f"[REGIME_24H] TG_FAIL | err={_tg}")
+
+        _LAST_REGIME_VAL = regime
+        _LAST_REGIME_TS  = time.time()
+        return regime
+
+    except Exception as e:
+        logger.warning(f"[REGIME_24H] DETECT_FAIL | err={e} → NEUTRAL (safe)")
+        return "NEUTRAL"
+
+
+def _allow_new_l1() -> bool:
+    """
+    BEAR market-ში ახალი L1 position-ის გახსნა დაბლოკილია.
+
+    BEAR:    False → ახალი L1 BLOCKED (ფული ნუ ჩაიკეტება!)
+    BULL:    True  → ნორმალური DCA
+    NEUTRAL: True  → ნორმალური DCA
+
+    ENV:
+      BEAR_BLOCK_NEW_L1=true   ← (default: true) BEAR-ზე L1 ბლოკი
+    """
+    if not os.getenv("BEAR_BLOCK_NEW_L1", "true").strip().lower() in ("1", "true", "yes"):
+        return True  # ბლოკი გათიშულია ENV-ით
+
+    regime = _detect_market_regime_24h()
+    if regime == "BEAR":
+        logger.info("[REGIME_24H] BEAR_BLOCK_L1 | new L1 positions BLOCKED (Bear market)")
+        return False
+    return True
+
+
 def _cooldown_ok() -> bool:
     global _last_emit_ts
     return (time.time() - _last_emit_ts) >= COOLDOWN_SECONDS
@@ -510,56 +621,23 @@ def _get_outbox_path() -> str:
 
 
 def _notify_sl_event(symbol: str = "") -> None:
-    """SL hit — DB-ში counter გაიზარდე (restart-safe).
-    FIX I-8 FULL: per-symbol isolation — BTC SL → ETH-ს ვეღარ ბლოკავს.
-    """
-    # per-symbol (ახალი, primary)
-    if symbol:
-        new_count_sym = increment_consecutive_sl_per_symbol(
-            symbol, pause_seconds=SL_COOLDOWN_PAUSE
-        )
-        logger.info(
-            f"[SL_TRACK_SYM] {symbol} | consecutive_sl={new_count_sym} "
-            f"limit={SL_COOLDOWN_COUNT} (DB-saved)"
-        )
-
-    # global (backward compat — signal_generator-ის _sl_pause_active() კვლავ global-ს კითხულობს)
-    new_count = increment_consecutive_sl(pause_seconds=SL_COOLDOWN_PAUSE)
-    logger.info(f"[SL_TRACK] consecutive_sl={new_count} limit={SL_COOLDOWN_COUNT} (DB-saved)")
-    if new_count >= SL_COOLDOWN_COUNT:
-        logger.warning(
-            f"[SL_COOLDOWN] {new_count} consecutive SL → PAUSE {SL_COOLDOWN_PAUSE//60} min "
-            f"(saved to DB — restart-safe)"
-        )
+    """DCA mode: SL=999% — SL არასოდეს ვარდება. Stub — no-op."""
+    pass
 
 
 def _notify_tp_event(symbol: str = "") -> None:
-    """TP hit — DB-ში counter reset (restart-safe).
-    FIX I-8 FULL: per-symbol reset — მხოლოდ ამ symbol-ის counter ნულდება.
-    """
-    # per-symbol reset (ახალი, primary)
-    if symbol:
-        reset_consecutive_sl_per_symbol(symbol)
-
-    # global reset (backward compat)
-    state = get_sl_cooldown_state()
-    if state["consecutive_sl"] > 0:
-        logger.info(f"[SL_TRACK] TP hit → reset consecutive_sl {state['consecutive_sl']}→0 (DB)")
-    reset_consecutive_sl()
+    """DCA mode: SL cooldown გათიშულია. Stub — no-op."""
+    pass
 
 
 def _sl_pause_active() -> bool:
-    """DB-დან წაიკითხავს — restart-ზეც სწორია. (global — backward compat)"""
-    return is_sl_pause_active()
+    """DCA mode: SL cooldown გათიშულია — always False."""
+    return False
 
 
 def _sl_pause_active_for_symbol(symbol: str) -> bool:
-    """FIX I-8 FULL: symbol-specific pause check — global-ის ნაცვლად.
-    True თუ ამ კონკრეტული სიმბოლოს SL პაუზა აქტიურია.
-    """
-    if not symbol:
-        return is_sl_pause_active()  # fallback global
-    return is_sl_pause_active_per_symbol(symbol)
+    """DCA mode: SL cooldown გათიშულია — always False."""
+    return False
 
 
 def _trades_today_count() -> int:
@@ -1466,7 +1544,11 @@ def _pairs_trading_check(outbox_path: str) -> Optional[Dict[str, Any]]:
     # ADD-ON ახალ row-ს ამატებს DB-ში — იგივე slot limit მოქმედებს
     if MAX_OPEN_TRADES > 0:
         try:
-            _total = len(get_all_open_trades() or [])
+            _pairs_dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            if _pairs_dca_mode:
+                _total = len(get_all_open_dca_positions() or [])
+            else:
+                _total = len(get_all_open_trades() or [])
             if _total >= MAX_OPEN_TRADES:
                 if GEN_DEBUG:
                     logger.debug(
@@ -1756,38 +1838,42 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX GLOBAL-1b: MAX_OPEN_TRADES — DCA mode: dca_positions L1 only.
-    # ძველი: get_all_open_trades() → trades ცხრილი
-    #   BTC+ETH+BNB = 3 rows → MAX_OPEN_TRADES=3 → მუდმივი ბლოკი!
-    #   generate_signal() ყოველ loop-ზე None-ს აბრუნებდა.
-    # ახალი: DCA mode → dca_positions WHERE status='OPEN'
-    #   მხოლოდ L1 base positions ითვლება (_L2/_L3 suffix = cascade layers, skip)
-    #   non-DCA mode → trades ცხრილი (ძველი ქცევა)
+    # FIX GLOBAL-1: MAX_OPEN_TRADES — global cross-symbol hard limit.
+    # ადრე: MAX_OPEN_TRADES=4 ENV-ში განსაზღვრული, მაგრამ ამ ფაილში
+    # არასოდეს გამოყენებული → 3 symbol-ზე ერთდროული entry შეუზღუდავი.
+    # ახლა: get_all_open_trades() → total count ყველა სიმბოლოზე.
+    # BUY loop-ის წინ: total >= MAX_OPEN_TRADES → return None.
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # DCA_ENABLED=true → dca_positions ცხრილი (მხოლოდ ამ ბოტის positions)
+    # DCA_ENABLED=false → trades ცხრილი (fallback)
+    # trades ცხრილი შეიძლება სხვა ბოტის positions-საც შეიცავდეს!
     if MAX_OPEN_TRADES > 0:
         try:
-            _dca_mode_gen = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
-            if _dca_mode_gen:
-                import re as _re_gen_suffix
-                _all_dca_gen = get_all_open_dca_positions() or []
-                _total_open = sum(
-                    1 for _p in _all_dca_gen
-                    if not _re_gen_suffix.search(r'_L\d+$', str(_p.get("symbol", "")))
-                )
-                _open_src = "dca_positions(L1)"
+            _dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            if _dca_mode:
+                _total_open = len(get_all_open_dca_positions() or [])
             else:
                 _total_open = len(get_all_open_trades() or [])
-                _open_src = "trades"
-
             if _total_open >= MAX_OPEN_TRADES:
                 logger.info(
-                    f"[GEN] BLOCKED_MAX_OPEN_TRADES | "
-                    f"total_open={_total_open} >= MAX_OPEN_TRADES={MAX_OPEN_TRADES} "
-                    f"source={_open_src}"
+                    f"[GEN] BLOCKED_MAX_OPEN_TRADES | total_open={_total_open} >= MAX_OPEN_TRADES={MAX_OPEN_TRADES} "
+                    f"(source={'dca_positions' if _dca_mode else 'trades'})"
                 )
                 return None
         except Exception as _e:
             logger.warning(f"[GEN] MAX_OPEN_TRADES_CHECK_FAIL | err={_e} → skipped (fail-open)")
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # SMART LONG + SHORT — BEAR MARKET L1 BLOCK
+    # BEAR market-ში ახალი L1 positions BLOCKED:
+    #   → კაპიტალი ნუ ჩაიკეტება ვარდნაში
+    #   → CASCADE გრძელდება (unrealized-ს TP-ს ელოდება)
+    #   → Futures SHORT hedge-ი მუშაობს
+    # BEAR_BLOCK_NEW_L1=false ENV-ით გათიშვა შეიძლება
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    if not _allow_new_l1():
+        logger.info("[GEN] BEAR_REGIME_BLOCK | new L1 position blocked (Bear market) → skip signal")
+        return None
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # FIX GLOBAL-2 v2: CROSS-SYMBOL CORRELATION FILTER (FULL).
@@ -1845,61 +1931,8 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # SL PAUSE — DB-based, restart-safe, PER-SYMBOL ONLY
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX BUG-2: global _sl_pause_active() check ამოღებულია.
-    # პრობლემა: global pause return None-ს ისვრიდა ყველა symbol-ისთვის —
-    #   BTC 3 SL → global pause → ETH/BNB-საც ბლოკავდა (per-symbol isolation ტყუილი).
-    # გამოსწორება: per-symbol check მხოლოდ BUY loop-ში (line ~1302) — ეს სწორია.
-    #   BTC pause → მხოლოდ BTC-ი ბლოკდება, ETH/BNB კვლავ ვაჭრობს.
-    # GLOBAL pause-ი ნარჩუნდება მხოლოდ recovery check-ისთვის ქვემოთ.
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    try:
-        sl_state = get_sl_cooldown_state()
-    except Exception as _sl_err:
-        logger.warning(f"[GEN] SL_STATE_FAIL | err={_sl_err} → skipping cooldown check")
-        sl_state = {"consecutive_sl": 0, "sl_pause_until": ""}
-    # FIX: თუ პაუზა დროით გაიარა (is_sl_pause_active()=False) მაგრამ
-    # consecutive_sl ჯერ კიდევ >= limit-ია DB-ში → recovery check საჭიროა.
-    # თუ recovery_candles=3 და ბაზარი flat-ია (0.15-0.20% სანთლები) →
-    # recovery NEVER passes და ბოტი დაბლოკილია indefinitely.
-    # FIX: RECOVERY_CANDLE_PCT-ს ENV-ით გასამართავად default 0.10%-ზე
-    # (0.25% ძალიან მაღალია 15m flat ბაზრისთვის).
-    # ასევე: consecutive_sl DB-ში reset-ი recovery pass-ის შემდეგ სწორდება.
-    if sl_state["consecutive_sl"] >= SL_COOLDOWN_COUNT:
-        # პაუზა დასრულდა — recovery check
-        recovery_passed = False
-        for sym in SYMBOLS:
-            try:
-                ohlcv_r = _fetch_ohlcv_direct(sym, TIMEFRAME, RECOVERY_CANDLES + 5)
-            except Exception:
-                continue
-            if not ohlcv_r or len(ohlcv_r) < RECOVERY_CANDLES + 1:
-                continue
-            ohlcv_r, _ = _drop_unclosed_candle(ohlcv_r, TIMEFRAME)
-            rec_ok, rec_reason = _recovery_ok(ohlcv_r)
-            logger.info(
-                f"[SL_RECOVERY] symbol={sym} ok={rec_ok} reason={rec_reason} "
-                f"consecutive_sl={sl_state['consecutive_sl']} (DB)"
-            )
-            if rec_ok:
-                recovery_passed = True
-                break
-
-        if not recovery_passed:
-            logger.info(
-                f"[SL_RECOVERY] WAITING (DB) | consecutive_sl={sl_state['consecutive_sl']} "
-                f"need={RECOVERY_CANDLES} green candles >= {RECOVERY_CANDLE_PCT}%"
-            )
-            return None
-        else:
-            logger.warning(
-                f"[SL_RECOVERY] PASSED ✅ (DB) | "
-                f"consecutive_sl={sl_state['consecutive_sl']}→0 | trading resumed"
-            )
-            reset_consecutive_sl()
+    # SL Cooldown სისტემა გათიშულია — DCA mode, SL=999%, consecutive SL არ ვარდება
+    # get_sl_cooldown_state / recovery check / reset_consecutive_sl — removed
 
     for symbol in SYMBOLS:
         logger.info(f"[GEN] LOOP_START | symbol={symbol}")
