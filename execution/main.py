@@ -160,7 +160,8 @@ def _run_performance_report_safe(send_telegram: bool = False) -> None:
 
 
 def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
-                  market_regime: str = "NEUTRAL") -> None:
+                  market_regime: str = "NEUTRAL",
+                  futures_engine=None) -> None:
     """
     DCA monitoring loop — ყოველ main loop iteration-ზე გამოიძახება.
 
@@ -170,7 +171,8 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
       3. Force close → max drawdown ან max add-ons + SL
       4. SL confirmed → close position
       5. Add-on → drawdown trigger + recovery signals
-         BEAR MODE: ADD-ON BLOCKED (SHORT-ს ეწინააღმდეგება!)
+         BEAR MODE: L2+L3 ADD-ON+rotation blocked
+      6. DCA Hedge SHORT trigger → add_on_count == max_add_ons
     """
     from execution.db.repository import (
         get_all_open_dca_positions,
@@ -387,13 +389,14 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
 
             # ── 6. Add-on check ──────────────────────────────────────────
 
-            # BEAR MODE: ADD-ON BLOCKED
-            if market_regime == "BEAR":
-                logger.info(f"[DCA] ADDON_BEAR_BLOCK | {sym} BEAR market → ADD-ON blocked")
-                continue
-
             all_positions = get_all_open_dca_positions()
             addon_ok, addon_reason = dca_mgr.should_add_on(pos, current_price, ohlcv)
+
+            # BEAR MODE: L2 ADD-ON ბლოკილია (SHORT-ს ეწინააღმდეგება)
+            # L3 zone: ბლოკი — ვარდნა გრძელდება, ADD-ON გაზრდის ზარალს
+            if market_regime == "BEAR":
+                logger.info(f"[DCA] BEAR_BLOCK | {sym} BEAR market → L2+L3 ADD-ON+rotation blocked")
+                continue
 
             if not addon_ok:
                 logger.debug(f"[DCA] NO_ADDON | {sym} reason={addon_reason}")
@@ -490,6 +493,27 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     last_add_on_ts=time.time(),
                     last_addon_price=buy_price,  # L3 rotation trigger reference
                 )
+
+                # ── DCA HEDGE SHORT trigger ───────────────────────────
+                # add_on_count+1 == max_add_ons → L2/L3 boundary
+                # პირველი და ერთადერთი ჯერ: SHORT hedge გაიხსნება
+                _new_add_on_count = add_on_count + 1
+                _max_add_ons = dca_mgr.max_add_ons
+                if _new_add_on_count == _max_add_ons and futures_engine is not None:
+                    try:
+                        _triggered = futures_engine.open_dca_hedge_short(
+                            symbol=exchange_sym,
+                            current_price=buy_price,
+                            dca_pos_id=pos_id,
+                        )
+                        if _triggered:
+                            logger.warning(
+                                f"[DCA] HEDGE_SHORT_TRIGGERED | {sym} "
+                                f"add_on={_new_add_on_count}/{_max_add_ons} "
+                                f"@ {buy_price:.4f}"
+                            )
+                    except Exception as _he:
+                        logger.warning(f"[DCA] HEDGE_TRIGGER_FAIL | {sym} err={_he}")
 
                 rsi_val = score_details.get("rsi", 0.0)
                 atr_val = score_details.get("atr_pct", 0.0)
@@ -1191,9 +1215,23 @@ def main():
             if _dca_enabled:
                 try:
                     _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
-                                  market_regime=_market_regime)
+                                  market_regime=_market_regime,
+                                  futures_engine=futures_engine)
                 except Exception as e:
                     logger.warning(f"DCA_LOOP_WARN | err={e}")
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # DCA HEDGE SHORT — ADD-ON + L3 EXCHANGE check
+            # LONG-ის DCA ADD-ON-ების სიმეტრიული mirror SHORT-ში:
+            #   ADD-ON: BTC bounce ↑ → avg_short ↑ → TP_short ↑
+            #   L3:     ADD-ONs exhausted + ↑ → EXCHANGE (close+reopen ↑)
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if _dca_enabled and futures_engine.enabled:
+                try:
+                    futures_engine.check_dca_hedge_addons()
+                    futures_engine.check_dca_hedge_l3()
+                except Exception as _he:
+                    logger.warning(f"HEDGE_CHECK_WARN | err={_he}")
 
             if generate_once is not None:
                 try:
