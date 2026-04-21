@@ -795,9 +795,9 @@ def open_dca_position(
     sl_price: float,
     tp_pct: float,
     sl_pct: float,
-    max_add_ons: int = 3,
-    max_capital: float = 40.0,
-    max_drawdown_pct: float = 8.0,
+    max_add_ons: int = 5,
+    max_capital: float = 82.0,
+    max_drawdown_pct: float = 999.0,
 ) -> int:
     """
     ახალი DCA position-ის გახსნა.
