@@ -1436,6 +1436,7 @@ def main():
                                       get_open_dca_position_for_symbol,
                                       get_executed_signal_action,
                                       get_all_open_trades,
+                                      get_all_open_dca_positions,
                                   )
                                   _sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
 
@@ -1463,16 +1464,16 @@ def main():
                                           f"[DEMO] SKIP_REJECTED | {_sym} "
                                           f"action={_exec_action} id={signal_id}"
                                       )
-                                  elif len(get_all_open_trades() or []) >= int(os.getenv("MAX_OPEN_TRADES", "5")):
+                                  elif len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "8")):
                                       logger.info(
                                           f"[DEMO] SKIP_MAX_OPEN | {_sym} "
-                                          f"total_open >= MAX_OPEN_TRADES={os.getenv('MAX_OPEN_TRADES', '5')}"
+                                          f"total_open >= MAX_OPEN_TRADES={os.getenv('MAX_OPEN_TRADES', '8')}"
                                       )
 
                                   _existing = get_open_dca_position_for_symbol(_sym)
                                   _rejected = (
                                       _is_real_reject
-                                      or len(get_all_open_trades() or []) >= int(os.getenv("MAX_OPEN_TRADES", "5"))
+                                      or len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "8"))
                                   )
                                   if not _existing and not _rejected:
                                       _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
