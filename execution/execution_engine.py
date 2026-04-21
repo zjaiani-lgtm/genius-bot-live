@@ -1843,8 +1843,11 @@ class ExecutionEngine:
                         sl_price=_sl_price,
                         tp_pct=_dca_tp_pct,
                         sl_pct=999.0,
-                        max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "3")),
-                        max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),  # FIX #6: 20→24
+                        max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
+                        max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT") or (
+                            float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0")) +
+                            sum(float(x.strip()) for x in os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10").split(",") if x.strip())
+                        )),
                         max_drawdown_pct=999.0,
                     )
 
