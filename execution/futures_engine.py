@@ -140,6 +140,8 @@ def _open_short_db(
     tp_price: float,
     sl_price: float,
     mode: str,
+    is_dca_hedge: int = 0,
+    dca_pos_id: int = 0,
 ) -> int:
     from execution.db.db import get_connection
     from datetime import datetime, timezone
@@ -149,11 +151,13 @@ def _open_short_db(
             """
             INSERT INTO futures_positions
               (signal_id, symbol, direction, entry_price, qty, quote_in,
-               leverage, tp_price, sl_price, status, opened_at, mode)
-            VALUES (?, ?, 'SHORT', ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?)
+               leverage, tp_price, sl_price, status, opened_at, mode,
+               is_dca_hedge, dca_pos_id, avg_entry_price)
+            VALUES (?, ?, 'SHORT', ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
             """,
             (signal_id, symbol, entry_price, qty, quote_in,
-             leverage, tp_price, sl_price, now, mode)
+             leverage, tp_price, sl_price, now, mode,
+             is_dca_hedge, dca_pos_id, entry_price)   # avg_entry_price = entry_price initially
         )
         conn.commit()
         return cur.lastrowid
@@ -191,7 +195,7 @@ def _ensure_exit_price_col() -> None:
 
 def _ensure_addon_cols() -> None:
     """
-    ADD-ON სვეტების auto-migration.
+    ADD-ON + DCA HEDGE სვეტების auto-migration.
     იდემპოტენტური — მეორედ გაშვება უვნებელია.
     """
     try:
@@ -201,10 +205,13 @@ def _ensure_addon_cols() -> None:
                 "PRAGMA table_info(futures_positions)"
             ).fetchall()]
             migrations = [
-                ("add_on_count",    "INTEGER DEFAULT 0"),
-                ("add_on_quote",    "REAL DEFAULT 0.0"),
-                ("avg_entry_price", "REAL DEFAULT 0.0"),
-                ("sl_price_addon",  "REAL DEFAULT 0.0"),
+                ("add_on_count",      "INTEGER DEFAULT 0"),
+                ("add_on_quote",      "REAL DEFAULT 0.0"),
+                ("avg_entry_price",   "REAL DEFAULT 0.0"),
+                ("sl_price_addon",    "REAL DEFAULT 0.0"),
+                # DCA HEDGE — ახალი columns
+                ("is_dca_hedge",      "INTEGER DEFAULT 0"),   # 1=DCA hedge SHORT
+                ("dca_pos_id",        "INTEGER DEFAULT 0"),   # DCA position-ის ID
             ]
             for col, col_def in migrations:
                 if col not in cols:
@@ -212,7 +219,7 @@ def _ensure_addon_cols() -> None:
                         f"ALTER TABLE futures_positions ADD COLUMN {col} {col_def}"
                     )
             conn.commit()
-        logger.info("[FUTURES] ADD-ON columns ready")
+        logger.info("[FUTURES] ADD-ON + DCA HEDGE columns ready")
     except Exception as e:
         logger.warning(f"[FUTURES] ADDON_COLS_FAIL | err={e}")
 
@@ -249,14 +256,30 @@ class FuturesEngine:
 
         # ADD-ON პარამეტრები
         self.addon_enabled      = _eb("FUTURES_ADDON_ENABLED", True)
-        self.addon_trigger_pct  = _ef("FUTURES_ADDON_TRIGGER_PCT", 1.0)   # +1% ზევით → ADD-ON
-        self.addon_quote        = _ef("FUTURES_ADDON_QUOTE", 12.0)         # $12 ADD-ON
-        self.addon_sl_pct       = 0.0   # DCA: SL გათიშულია
-        self.max_addons         = _ei("FUTURES_MAX_ADDONS", 1)             # მაქს 1 ADD-ON
+        self.addon_trigger_pct  = _ef("FUTURES_ADDON_TRIGGER_PCT", 1.0)
+        self.addon_quote        = _ef("FUTURES_ADDON_QUOTE", 12.0)
+        self.addon_sl_pct       = 0.0
+        self.max_addons         = _ei("FUTURES_MAX_ADDONS", 1)
 
         # EXCHANGE პარამეტრები
-        self.exchange_enabled   = _eb("FUTURES_EXCHANGE_ENABLED", True)
-        self.exchange_trigger_pct = _ef("FUTURES_EXCHANGE_TRIGGER_PCT", 2.5)  # +2.5% → EXCHANGE
+        self.exchange_enabled     = _eb("FUTURES_EXCHANGE_ENABLED", True)
+        self.exchange_trigger_pct = _ef("FUTURES_EXCHANGE_TRIGGER_PCT", 2.5)
+
+        # ── DCA HEDGE SHORT პარამეტრები ──────────────────────
+        # trigger: DCA add_on_count == max_add_ons (-6.5% L1-დან)
+        # TP: -3.5% entry-დან (DCA-ს TP-სგან დამოუკიდებელი)
+        # ADD-ON: +1% bounce → avg_short ↑
+        # L3 EXCHANGE: ADD-ONs exhausted + BTC ↑ → close+reopen
+        self.dca_hedge_quote           = _ef("FUTURES_DCA_HEDGE_QUOTE",         20.0)
+        self.dca_hedge_tp_pct          = _ef("FUTURES_DCA_HEDGE_TP_PCT",         3.5)
+        self.dca_hedge_addon_trigger_pct = _ef("FUTURES_DCA_ADDON_TRIGGER_PCT",  1.0)
+        self.dca_hedge_addon_quote     = _ef("FUTURES_DCA_ADDON_QUOTE",          12.0)
+        self.dca_hedge_max_addons      = _ei("FUTURES_DCA_MAX_ADDONS",           5)
+        self.dca_hedge_l3_trigger_pct  = _ef("FUTURES_DCA_L3_TRIGGER_PCT",       1.5)
+
+        # in-memory cooldown timestamps (per-loop spam guard)
+        self._last_hedge_addon_ts: float = 0.0   # ADD-ON cooldown
+        self._last_hedge_l3_ts:    float = 0.0   # L3 exchange cooldown
 
         # DB init
         _init_futures_table()
@@ -763,6 +786,369 @@ class FuturesEngine:
     def check_addon_sl(self) -> None:
         """DCA mode: SL გათიშულია. Stub — no-op."""
         pass
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: open_dca_hedge_short
+    # DCA add_on_count==max_add_ons → SHORT hedge გახსნა
+    # ────────────────────────────────────────────────────────
+    def open_dca_hedge_short(
+        self,
+        symbol: str,
+        current_price: float,
+        dca_pos_id: int,
+    ) -> bool:
+        """
+        DCA L2/L3 boundary-ზე SHORT hedge გახსნა.
+
+        trigger: add_on_count == max_add_ons (L2 exhausted, -6.5% L1-დან)
+        ერთხელ გაიხსნება per DCA position — dca_pos_id unique guard.
+
+        TP: FUTURES_DCA_TP_PCT (default 3.5%) — DCA TP-ზე გაცილებით ქვემოთ
+            SHORT-ი DCA-სგან დამოუკიდებლად იხურება TP-ზე.
+
+        Returns: True თუ გახსნა, False თუ skip.
+        """
+        if not self.enabled:
+            return False
+
+        # უკვე გახსნილია ამ DCA position-ისთვის?
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT id FROM futures_positions "
+                    "WHERE dca_pos_id=? AND is_dca_hedge=1 AND status='OPEN'",
+                    (dca_pos_id,)
+                ).fetchone()
+                if row:
+                    logger.debug(
+                        f"[HEDGE] ALREADY_OPEN | dca_pos_id={dca_pos_id} → skip"
+                    )
+                    return False
+        except Exception as e:
+            logger.warning(f"[HEDGE] CHECK_FAIL | err={e}")
+            return False
+
+        # balance check
+        hedge_quote = self.dca_hedge_quote
+        try:
+            from execution.dca_risk_manager import get_risk_manager as _rm
+            bal_ok, bal_reason = _rm().can_l3_operation(hedge_quote)
+            if not bal_ok:
+                logger.warning(f"[HEDGE] BALANCE_BLOCK | {symbol} reason={bal_reason}")
+                return False
+        except Exception as e:
+            logger.warning(f"[HEDGE] BALANCE_CHECK_FAIL | err={e}")
+
+        # SHORT TP — DCA TP-ს ქვევით
+        tp_price = round(current_price * (1.0 - self.dca_hedge_tp_pct / 100.0), 6)
+        qty      = round((hedge_quote * self.leverage) / current_price, 6)
+        sig_id   = f"HEDGE-{symbol.replace('/', '')}-{uuid.uuid4().hex[:8]}"
+
+        pos_id = _open_short_db(
+            signal_id=sig_id,
+            symbol=symbol,
+            entry_price=current_price,
+            qty=qty,
+            quote_in=hedge_quote,
+            leverage=self.leverage,
+            tp_price=tp_price,
+            sl_price=0.0,
+            mode=self.mode,
+            is_dca_hedge=1,
+            dca_pos_id=dca_pos_id,
+        )
+
+        logger.warning(
+            f"[HEDGE] SHORT_OPENED | {symbol} "
+            f"entry={current_price:.4f} tp={tp_price:.4f} "
+            f"qty={qty:.6f} quote={hedge_quote} "
+            f"dca_pos_id={dca_pos_id} pos_id={pos_id}"
+        )
+
+        self._last_open_ts = time.time()
+
+        try:
+            from execution.telegram_notifier import send_telegram_message
+            send_telegram_message(
+                f"🛡 <b>DCA HEDGE SHORT გახსნა</b>\n\n"
+                f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                f"📉 <b>DCA L2 exhausted — hedge active</b>\n"
+                f"💰 <b>Entry:</b> <code>{current_price:.2f}</code>\n"
+                f"🎯 <b>SHORT TP:</b> <code>{tp_price:.2f}</code> "
+                f"(<code>-{self.dca_hedge_tp_pct:.1f}%</code>)\n"
+                f"💼 <b>Quote:</b> <code>${hedge_quote:.0f}</code> "
+                f"<code>×{self.leverage}</code>\n"
+                f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+        except Exception as _tg:
+            logger.warning(f"[HEDGE] TG_FAIL | err={_tg}")
+
+        try:
+            from execution.db.repository import log_event
+            log_event(
+                "DCA_HEDGE_OPENED",
+                f"sym={symbol} entry={current_price:.4f} "
+                f"tp={tp_price:.4f} quote={hedge_quote} "
+                f"dca_pos_id={dca_pos_id} pos_id={pos_id}"
+            )
+        except Exception:
+            pass
+
+        return True
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: check_dca_hedge_addons
+    # SHORT ADD-ON ზევით bounce — avg_short ↑, TP ↑
+    # ────────────────────────────────────────────────────────
+    def check_dca_hedge_addons(self) -> None:
+        """
+        DCA hedge SHORT-ებზე ADD-ON შემოწმება.
+
+        BTC bounce ↑ → avg_short ↑ → TP_short ↑ → bounce მოთხოვნა ↓
+
+        trigger: current_price >= entry × (1 + FUTURES_DCA_ADDON_TRIGGER_PCT%)
+        max: FUTURES_DCA_MAX_ADDONS
+
+        ADD-ON მათემატიკა:
+          entry=$69,190, +1% → $69,882
+          add_on_quote=$12, leverage=×2
+          new_avg = (69190×20 + 69882×12) / 32 = $69,449
+          new_tp  = $69,449 × (1 - 3.5%) = $67,018
+        """
+        if not self.enabled:
+            return
+
+        # cooldown: 180s ADD-ON-ებს შორის (spam guard)
+        _addon_cooldown = 180
+        if (time.time() - self._last_hedge_addon_ts) < _addon_cooldown:
+            return
+
+        # მხოლოდ DCA hedge SHORT-ები
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM futures_positions "
+                    "WHERE status='OPEN' AND is_dca_hedge=1"
+                )
+                cols = [d[0] for d in cur.description]
+                hedge_shorts = [dict(zip(cols, r)) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning(f"[HEDGE] ADDON_FETCH_FAIL | err={e}")
+            return
+
+        for pos in hedge_shorts:
+            try:
+                symbol       = str(pos.get("symbol", ""))
+                pos_id       = int(pos.get("id", 0))
+                entry_price  = float(pos.get("entry_price", 0.0))
+                add_on_count = int(pos.get("add_on_count", 0) or 0)
+                quote_in     = float(pos.get("quote_in", 0.0))
+                avg_entry    = float(pos.get("avg_entry_price", 0.0) or entry_price)
+
+                if add_on_count >= self.dca_hedge_max_addons:
+                    continue
+
+                current_price = self._fetch_price(symbol)
+                if current_price <= 0:
+                    continue
+
+                trigger = entry_price * (1.0 + self.dca_hedge_addon_trigger_pct / 100.0)
+                if current_price < trigger:
+                    continue
+
+                # ADD-ON
+                total_quote = quote_in + self.dca_hedge_addon_quote
+                new_avg     = (avg_entry * quote_in + current_price * self.dca_hedge_addon_quote) / total_quote
+                new_tp      = round(new_avg * (1.0 - self.dca_hedge_tp_pct / 100.0), 6)
+                new_qty     = round((total_quote * self.leverage) / new_avg, 6)
+
+                logger.warning(
+                    f"[HEDGE] ADDON | {symbol} "
+                    f"entry={entry_price:.2f} current={current_price:.2f} "
+                    f"new_avg={new_avg:.2f} new_tp={new_tp:.2f}"
+                )
+
+                from execution.db.db import get_connection
+                with get_connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE futures_positions SET
+                            add_on_count    = ?,
+                            add_on_quote    = ?,
+                            avg_entry_price = ?,
+                            tp_price        = ?,
+                            qty             = ?,
+                            quote_in        = ?
+                        WHERE id = ?
+                        """,
+                        (add_on_count + 1, self.dca_hedge_addon_quote,
+                         round(new_avg, 6), new_tp, new_qty, total_quote, pos_id)
+                    )
+                    conn.commit()
+
+                try:
+                    from execution.telegram_notifier import send_telegram_message
+                    send_telegram_message(
+                        f"➕ <b>HEDGE SHORT ADD-ON</b>\n\n"
+                        f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                        f"📈 <b>BTC bounce:</b> <code>+{self.dca_hedge_addon_trigger_pct:.1f}%</code>\n"
+                        f"💰 <b>ADD-ON @ </b><code>{current_price:.2f}</code>\n"
+                        f"📊 <b>avg_short:</b> <code>{entry_price:.2f} → {new_avg:.2f}</code> ↑\n"
+                        f"🎯 <b>new TP:</b> <code>{new_tp:.2f}</code>\n"
+                        f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                    )
+                except Exception as _tg:
+                    logger.warning(f"[HEDGE] ADDON_TG_FAIL | err={_tg}")
+
+                try:
+                    from execution.db.repository import log_event
+                    log_event(
+                        "DCA_HEDGE_ADDON",
+                        f"sym={symbol} addon_price={current_price:.4f} "
+                        f"new_avg={new_avg:.4f} new_tp={new_tp:.4f} "
+                        f"addon_count={add_on_count+1}"
+                    )
+                except Exception:
+                    pass
+
+                # cooldown განახლება — spam guard
+                self._last_hedge_addon_ts = time.time()
+
+            except Exception as e:
+                logger.error(f"[HEDGE] ADDON_ERR | {pos.get('symbol')} err={e}")
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: check_dca_hedge_l3
+    # SHORT ADD-ONs exhausted + BTC კიდევ ↑ → EXCHANGE
+    # ძველი SHORT დაიხურება, ახალი ძვირ ფასზე (SHORT-ისთვის უკეთესი)
+    # ────────────────────────────────────────────────────────
+    def check_dca_hedge_l3(self) -> None:
+        """
+        DCA hedge L3 — ADD-ONs exhausted + BTC კვლავ ↑.
+
+        EXCHANGE ლოგიკა (SHORT mirror of DCA LIFO):
+          ყველაზე იაფი SHORT unit (ყველაზე დიდი ზარალი) → close
+          reinvest @ current (ახლა ძვირი SHORT entry → TP ახლოს)
+          avg_short ↑, TP_short ↑ → bounce მოთხოვნა ↓
+
+        trigger: add_on_count >= dca_hedge_max_addons
+                 + current >= entry × (1 + L3_TRIGGER_PCT%)
+        """
+        if not self.enabled:
+            return
+
+        # cooldown: 300s L3 exchange-ებს შორის
+        _l3_cooldown = 300
+        if (time.time() - self._last_hedge_l3_ts) < _l3_cooldown:
+            return
+
+        try:
+                cols = [d[0] for d in cur.description]
+                hedge_shorts = [dict(zip(cols, r)) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning(f"[HEDGE] L3_FETCH_FAIL | err={e}")
+            return
+
+        for pos in hedge_shorts:
+            try:
+                symbol       = str(pos.get("symbol", ""))
+                pos_id       = int(pos.get("id", 0))
+                entry_price  = float(pos.get("entry_price", 0.0))
+                add_on_count = int(pos.get("add_on_count", 0) or 0)
+                dca_pos_id   = int(pos.get("dca_pos_id", 0) or 0)
+
+                # L3 trigger: ADD-ONs exhausted
+                if add_on_count < self.dca_hedge_max_addons:
+                    continue
+
+                current_price = self._fetch_price(symbol)
+                if current_price <= 0:
+                    continue
+
+                l3_trigger = entry_price * (1.0 + self.dca_hedge_l3_trigger_pct / 100.0)
+                if current_price < l3_trigger:
+                    continue
+
+                logger.warning(
+                    f"[HEDGE] L3_EXCHANGE | {symbol} "
+                    f"entry={entry_price:.2f} current={current_price:.2f} "
+                    f"trigger={l3_trigger:.2f} → close+reopen"
+                )
+
+                # ძველი SHORT დახურვა
+                qty         = float(pos.get("qty", 0.0))
+                price_diff  = entry_price - current_price  # negative (SHORT ზარალი)
+                pnl_quote   = round(price_diff * qty, 4)
+                pnl_pct     = round((price_diff / entry_price) * 100.0 * self.leverage, 2)
+
+                _close_short_db(pos_id, current_price, pnl_quote, pnl_pct, "HEDGE_L3_EXCHANGE")
+
+                logger.warning(
+                    f"[HEDGE] L3_CLOSED | {symbol} "
+                    f"pnl={pnl_quote:+.4f} → reopening @ {current_price:.2f}"
+                )
+
+                # ახალი SHORT გახსნა ახლა ძვირ ფასზე
+                # TP = current × (1 - dca_hedge_tp_pct%) — ახლა TP უფრო ახლოა!
+                hedge_quote = self.dca_hedge_quote
+                tp_new      = round(current_price * (1.0 - self.dca_hedge_tp_pct / 100.0), 6)
+                qty_new     = round((hedge_quote * self.leverage) / current_price, 6)
+                sig_new     = f"HEDGE-L3-{symbol.replace('/', '')}-{uuid.uuid4().hex[:8]}"
+
+                new_pos_id = _open_short_db(
+                    signal_id=sig_new,
+                    symbol=symbol,
+                    entry_price=current_price,
+                    qty=qty_new,
+                    quote_in=hedge_quote,
+                    leverage=self.leverage,
+                    tp_price=tp_new,
+                    sl_price=0.0,
+                    mode=self.mode,
+                    is_dca_hedge=1,
+                    dca_pos_id=dca_pos_id,
+                )
+
+                logger.warning(
+                    f"[HEDGE] L3_REOPENED | {symbol} "
+                    f"entry={current_price:.4f} tp={tp_new:.4f} "
+                    f"pos_id={new_pos_id}"
+                )
+
+                try:
+                    from execution.telegram_notifier import send_telegram_message
+                    send_telegram_message(
+                        f"🔄 <b>HEDGE L3 EXCHANGE</b>\n\n"
+                        f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                        f"📤 <b>ძველი:</b> <code>{entry_price:.2f} → {current_price:.2f}</code> "
+                        f"(<code>{pnl_quote:+.4f} USDT</code>)\n"
+                        f"📥 <b>ახალი SHORT:</b> <code>{current_price:.2f}</code>\n"
+                        f"🎯 <b>TP:</b> <code>{tp_new:.2f}</code> "
+                        f"(<code>-{self.dca_hedge_tp_pct:.1f}%</code>)\n"
+                        f"💡 <b>avg_short ↑ → TP ახლოს!</b>\n"
+                        f"🕒 <code>{__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                    )
+                except Exception as _tg:
+                    logger.warning(f"[HEDGE] L3_TG_FAIL | err={_tg}")
+
+                try:
+                    from execution.db.repository import log_event
+                    log_event(
+                        "DCA_HEDGE_L3_EXCHANGE",
+                        f"sym={symbol} old_entry={entry_price:.4f} "
+                        f"new_entry={current_price:.4f} pnl={pnl_quote:+.4f} "
+                        f"new_tp={tp_new:.4f} new_pos_id={new_pos_id}"
+                    )
+                except Exception:
+                    pass
+
+                # cooldown განახლება — 300s სანამ შემდეგი L3 exchange
+                self._last_hedge_l3_ts = time.time()
+
+            except Exception as e:
+                logger.error(f"[HEDGE] L3_ERR | {pos.get('symbol')} err={e}")
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: get_summary
