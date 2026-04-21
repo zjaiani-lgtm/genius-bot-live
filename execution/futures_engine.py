@@ -93,15 +93,6 @@ def _get_open_shorts() -> List[Dict[str, Any]]:
     try:
         from execution.db.db import get_connection
         with get_connection() as conn:
-            rows = conn.execute(
-                "SELECT * FROM futures_positions WHERE status='OPEN' AND direction='SHORT'"
-            ).fetchall()
-            if not rows:
-                return []
-            cols = [d[0] for d in conn.execute(
-                "SELECT * FROM futures_positions WHERE status='OPEN' LIMIT 0"
-            ).description or []]
-            # description from actual query
             cur = conn.execute(
                 "SELECT * FROM futures_positions WHERE status='OPEN' AND direction='SHORT'"
             )
@@ -443,8 +434,9 @@ class FuturesEngine:
     # ────────────────────────────────────────────────────────
     def close_all_shorts(self, reason: str = "BULL_MARKET") -> None:
         """
-        BULL market → ყველა ღია SHORT-ი დახურვა.
-        DEMO: ვირტუალური close — ახლანდელი ფასით PnL გათვლა.
+        BULL market → BEAR hedge SHORT-ების დახურვა.
+        DCA hedge SHORT-ები (is_dca_hedge=1) არ იხურება —
+        ისინი DCA position-ის სიცოცხლეს მიყვება, BULL market-ს არა.
         """
         if not self.enabled:
             return
@@ -454,11 +446,25 @@ class FuturesEngine:
             logger.debug("[FUTURES] CLOSE_ALL | no open shorts → skip")
             return
 
+        # DCA hedge SHORT-ები გამოვრიცხოთ — ისინი ცალკე iხურება
+        bear_shorts = [p for p in open_shorts if not int(p.get("is_dca_hedge", 0) or 0)]
+        hedge_shorts = [p for p in open_shorts if int(p.get("is_dca_hedge", 0) or 0)]
+
+        if hedge_shorts:
+            logger.info(
+                f"[FUTURES] CLOSE_ALL | skipping {len(hedge_shorts)} DCA hedge SHORT(s) "
+                f"— they close independently via TP"
+            )
+
+        if not bear_shorts:
+            logger.debug("[FUTURES] CLOSE_ALL | no BEAR shorts to close → skip")
+            return
+
         logger.warning(
-            f"[FUTURES] CLOSING_ALL_SHORTS | count={len(open_shorts)} reason={reason}"
+            f"[FUTURES] CLOSING_BEAR_SHORTS | count={len(bear_shorts)} reason={reason}"
         )
 
-        for pos in open_shorts:
+        for pos in bear_shorts:
             self._close_short(pos, reason=reason)
 
     def _close_short(self, pos: Dict[str, Any], reason: str = "MANUAL") -> None:
