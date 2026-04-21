@@ -219,7 +219,6 @@ class DCAPositionManager:
 
         # ── L2 ZONE: ADD-ON პარამეტრები ──────────────────────
         self.max_add_ons  = _ei("DCA_MAX_ADD_ONS", 5)
-        self.max_capital  = _ef("DCA_MAX_CAPITAL_USDT", 80.0)
         self.max_drawdown = _ef("DCA_MAX_DRAWDOWN_PCT", 999.0)
 
         # pyramid-down triggers: bounce prob 95%→82%→71%→58%→44%
@@ -230,6 +229,13 @@ class DCAPositionManager:
         self.addon_sizes = _parse_list_float(
             "DCA_ADDON_SIZES", [12.0, 15.0, 18.0, 15.0, 10.0]
         )
+
+        # AUTO-CALC: max_capital = BOT_QUOTE_PER_TRADE + sum(DCA_ADDON_SIZES)
+        # ENV DCA_MAX_CAPITAL_USDT-ი თუ დაყენებულია — ის იმარჯვებს
+        _quote_pt = _ef("BOT_QUOTE_PER_TRADE", 12.0)
+        _auto_cap = _quote_pt + sum(self.addon_sizes)
+        _env_cap  = os.getenv("DCA_MAX_CAPITAL_USDT")
+        self.max_capital = float(_env_cap) if _env_cap is not None else _auto_cap
         # cooldown 3 წუთი (ადრე 15) — სწრაფ ვარდნაში ADD-ON არ გამოტოვდეს
         self.addon_cooldown = _ei("DCA_ADDON_COOLDOWN_SECONDS", 180)
         # recovery score გათიშულია — drawdown-based trigger საკმარისია
