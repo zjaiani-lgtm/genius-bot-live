@@ -283,6 +283,14 @@ class FuturesEngine:
             f"tp={self.tp_pct}% addon={self.addon_trigger_pct}% "
             f"exchange={self.exchange_trigger_pct}% symbols={self.symbols}"
         )
+        logger.info(
+            f"[FUTURES] DCA HEDGE params | "
+            f"quote={self.dca_hedge_quote} tp={self.dca_hedge_tp_pct}% "
+            f"addon_trigger={self.dca_hedge_addon_trigger_pct}% "
+            f"addon_quote={self.dca_hedge_addon_quote} "
+            f"max_addons={self.dca_hedge_max_addons} "
+            f"l3_trigger={self.dca_hedge_l3_trigger_pct}%"
+        )
 
     def _fetch_price(self, symbol: str) -> float:
         """ახლანდელი ფასი — public API (DEMO/LIVE ორივეზე მუშაობს)."""
@@ -1051,6 +1059,12 @@ class FuturesEngine:
             return
 
         try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM futures_positions "
+                    "WHERE status='OPEN' AND is_dca_hedge=1"
+                )
                 cols = [d[0] for d in cur.description]
                 hedge_shorts = [dict(zip(cols, r)) for r in cur.fetchall()]
         except Exception as e:
