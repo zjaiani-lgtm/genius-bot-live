@@ -24,6 +24,7 @@ from execution.db.repository import (
     get_all_symbol_cooldown_states,
     # FIX GLOBAL-1: global open trade count for MAX_OPEN_TRADES guard
     get_all_open_trades,
+    get_all_open_dca_positions,
 )
 from execution.excel_live_core import ExcelLiveCore, CoreInputs
 from execution.regime_engine import MarketRegimeEngine
@@ -1546,7 +1547,11 @@ def _pairs_trading_check(outbox_path: str) -> Optional[Dict[str, Any]]:
     # ADD-ON ახალ row-ს ამატებს DB-ში — იგივე slot limit მოქმედებს
     if MAX_OPEN_TRADES > 0:
         try:
-            _total = len(get_all_open_trades() or [])
+            _pairs_dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            if _pairs_dca_mode:
+                _total = len(get_all_open_dca_positions() or [])
+            else:
+                _total = len(get_all_open_trades() or [])
             if _total >= MAX_OPEN_TRADES:
                 if GEN_DEBUG:
                     logger.debug(
@@ -1842,12 +1847,20 @@ def generate_signal() -> Optional[Dict[str, Any]]:
     # ახლა: get_all_open_trades() → total count ყველა სიმბოლოზე.
     # BUY loop-ის წინ: total >= MAX_OPEN_TRADES → return None.
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # DCA_ENABLED=true → dca_positions ცხრილი (მხოლოდ ამ ბოტის positions)
+    # DCA_ENABLED=false → trades ცხრილი (fallback)
+    # trades ცხრილი შეიძლება სხვა ბოტის positions-საც შეიცავდეს!
     if MAX_OPEN_TRADES > 0:
         try:
-            _total_open = len(get_all_open_trades() or [])
+            _dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+            if _dca_mode:
+                _total_open = len(get_all_open_dca_positions() or [])
+            else:
+                _total_open = len(get_all_open_trades() or [])
             if _total_open >= MAX_OPEN_TRADES:
                 logger.info(
-                    f"[GEN] BLOCKED_MAX_OPEN_TRADES | total_open={_total_open} >= MAX_OPEN_TRADES={MAX_OPEN_TRADES}"
+                    f"[GEN] BLOCKED_MAX_OPEN_TRADES | total_open={_total_open} >= MAX_OPEN_TRADES={MAX_OPEN_TRADES} "
+                    f"(source={'dca_positions' if _dca_mode else 'trades'})"
                 )
                 return None
         except Exception as _e:
