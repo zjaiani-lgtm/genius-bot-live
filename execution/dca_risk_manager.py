@@ -96,17 +96,37 @@ class DCARiskManager:
 
     def __init__(self) -> None:
         self.max_open_positions = _ei("MAX_OPEN_TRADES",      1)
-        self.max_per_symbol     = _ef("DCA_MAX_CAPITAL_USDT", 80.0)
-        self.max_total_exposure = _ef("DCA_MAX_TOTAL_USDT",   80.0)
         self.max_drawdown_pct   = _ef("DCA_MAX_DRAWDOWN_PCT", 999.0)
         self.min_notional       = _ef("DCA_MIN_NOTIONAL",     10.0)
         self.smart_addon_buffer = _ef("SMART_ADDON_BUFFER",   10.0)
 
+        # AUTO-CALC: max_per_symbol = BOT_QUOTE_PER_TRADE + sum(DCA_ADDON_SIZES)
+        # ENV DCA_MAX_CAPITAL_USDT-ი თუ დაყენებულია — ის იმარჯვებს (override)
+        # თუ არ არის — ავტომატურად: BOT_QUOTE + sum(ADDON_SIZES)
+        _quote     = _ef("BOT_QUOTE_PER_TRADE", 12.0)
+        _sizes_raw = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
+        try:
+            _sizes = [float(x.strip()) for x in _sizes_raw.split(",") if x.strip()]
+        except Exception:
+            _sizes = [12.0, 15.0, 18.0, 15.0, 10.0]
+        _auto_cap  = _quote + sum(_sizes)
+
+        _env_cap = os.getenv("DCA_MAX_CAPITAL_USDT")
+        self.max_per_symbol = float(_env_cap) if _env_cap is not None else _auto_cap
+
+        # AUTO-CALC: max_total = MAX_OPEN_TRADES × max_per_symbol
+        # ENV DCA_MAX_TOTAL_USDT-ი თუ დაყენებულია — ის იმარჯვებს (override)
+        _auto_total = self.max_open_positions * self.max_per_symbol
+        _env_total  = os.getenv("DCA_MAX_TOTAL_USDT")
+        self.max_total_exposure = float(_env_total) if _env_total is not None else _auto_total
+
         logger.info(
             f"[DCA] DCARiskManager init | "
             f"max_positions={self.max_open_positions} "
-            f"max_per_symbol={self.max_per_symbol} "
-            f"max_total={self.max_total_exposure} "
+            f"max_per_symbol={self.max_per_symbol:.1f} "
+            f"({'ENV' if _env_cap else f'AUTO={_quote}+{sum(_sizes):.0f}'}) "
+            f"max_total={self.max_total_exposure:.1f} "
+            f"({'ENV' if _env_total else 'AUTO=positions×cap'}) "
             f"smart_buffer={self.smart_addon_buffer}"
         )
 
