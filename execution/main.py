@@ -596,7 +596,7 @@ def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> Non
     exchange_sym = _re_l3.sub(r'_L\d+$', '', sym)
 
     try:
-        l3_addon_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "10.0"))
+        l3_addon_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
 
         # RISK CHECK — balance საკმარისია?
         from execution.dca_risk_manager import get_risk_manager as _get_rm
@@ -1066,7 +1066,7 @@ def main():
     tp_sl_mgr = get_tp_sl_manager() if _dca_enabled else None
     risk_mgr  = get_risk_manager()  if _dca_enabled else None
     if _dca_enabled:
-        logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '5')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', '80')}")
+        logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '5')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', 'AUTO')}")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # SMART LONG + SHORT — Futures Engine init
@@ -1484,6 +1484,14 @@ def main():
                                           _qty = _quote / _price
                                           _tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
                                           _tp = round(_price * (1.0 + _tp_pct / 100.0), 6)
+                                          _quote_pt  = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
+                                          _sizes_str = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
+                                          try:
+                                              _addon_sum = sum(float(x.strip()) for x in _sizes_str.split(",") if x.strip())
+                                          except Exception:
+                                              _addon_sum = 70.0
+                                          _auto_cap = _quote_pt + _addon_sum
+                                          _max_cap  = float(os.getenv("DCA_MAX_CAPITAL_USDT") or _auto_cap)
                                           _pos_id = open_dca_position(
                                               symbol=_sym,
                                               initial_entry_price=_price,
@@ -1494,7 +1502,7 @@ def main():
                                               tp_pct=_tp_pct,
                                               sl_pct=999.0,
                                               max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
-                                              max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "80.0")),
+                                              max_capital=_max_cap,
                                               max_drawdown_pct=999.0,
                                           )
                                           # INITIAL order — dca_orders ცხრილი
