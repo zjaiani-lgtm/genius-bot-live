@@ -1,5 +1,22 @@
 # execution/tp_fix.py
 # ============================================================
+# TP FIX — Take Profit ავტომატური გასწორება — ADDON CASCADE SYSTEM
+# ============================================================
+# Binance API არ სჭირდება — DB-ს კითხულობს მხოლოდ.
+#
+# Zone detection (add_on_count + l3_addon_done):
+#   L2 zone: add_on_count < DCA_MAX_ADD_ONS, l3_addon_done=0 → 0.55%
+#   L3 zone: add_on_count >= DCA_MAX_ADD_ONS OR l3_addon_done=1 → 0.35%
+#
+# ENV:
+#   TP_FIX_ENABLED=true
+#   TP_FIX_TOLERANCE=0.1
+#   DCA_TP_PCT=0.55
+#   CASCADE_TP_L3_PCT=0.35
+#   DCA_MAX_ADD_ONS=5
+#   TIME_BASED_TP_ENABLED=false
+# ============================================================
+
 # TP FIX — Take Profit ავტომატური გასწორება
 # ============================================================
 # მსუბუქი ვერსია — Binance API არ სჭირდება!
@@ -73,10 +90,6 @@ def _session_mult() -> tuple:
         return TIME_TP_EVENING_MULT, "EVENING"
 
 
-def _layer_num(symbol: str) -> int:
-    """BTC/USDT → 1, BTC/USDT_L2 → 2, BTC/USDT_L3 → 3 (max)"""
-    m = re.search(r'_L(\d+)$', symbol)
-    return int(m.group(1)) if m else 1
 
 
 def run_tp_fix() -> dict:
@@ -84,18 +97,25 @@ def run_tp_fix() -> dict:
     DB-ის ყველა ღია პოზიციის TP შემოწმება და გასწორება.
     Binance API არ სჭირდება — memory-safe!
 
+    ADDON CASCADE SYSTEM zone detection:
+      L2 zone: add_on_count < max_add_ons AND l3_addon_done=0 → TP_BASE (0.55%)
+      L3 zone: add_on_count >= max_add_ons OR l3_addon_done=1  → TP_L3 (0.35%)
+
     Returns:
         dict — {"checked": N, "fixed": N, "skipped": N}
     """
+    import os as _os
+    _max_add_ons = int(_os.getenv("DCA_MAX_ADD_ONS", "5"))
+
     result = {"checked": 0, "fixed": 0, "skipped": 0}
-    conn   = None
 
     try:
         from execution.db.db import get_connection
 
         conn = get_connection()
         rows = conn.execute("""
-            SELECT id, symbol, avg_entry_price, current_tp_price
+            SELECT id, symbol, avg_entry_price, current_tp_price,
+                   add_on_count, l3_addon_done
             FROM dca_positions
             WHERE status='OPEN'
             ORDER BY symbol
@@ -105,15 +125,18 @@ def run_tp_fix() -> dict:
             logger.info("[TP_FIX] No open positions → skip")
             return result
 
-        # TIME_BASED_TP: ახლანდელი session multiplier — ყველა position-ისთვის ერთი
         _mult, _session = _session_mult()
         if TIME_BASED_TP_ENABLED:
             logger.info(f"[TP_FIX] session={_session} mult={_mult}")
 
         for row in rows:
-            pos_id, sym, avg, tp = row
-            avg = float(avg or 0)
-            tp  = float(tp  or 0)
+            pos_id = row[0]
+            sym    = row[1]
+            avg    = float(row[2] or 0)
+            tp     = float(row[3] or 0)
+            add_on_count  = int(row[4] or 0)
+            l3_addon_done = int(row[5] or 0) if len(row) > 5 and row[5] is not None else 0
+
             result["checked"] += 1
 
             if avg <= 0:
@@ -121,38 +144,34 @@ def run_tp_fix() -> dict:
                 result["skipped"] += 1
                 continue
 
-            # Layer-ის მიხედვით base tp_pct
-            layer    = _layer_num(sym)
-            tp_pct   = TP_L3 if layer >= 3 else TP_BASE
+            # ADDON CASCADE SYSTEM: zone detection via add_on_count + l3_addon_done
+            # L3 zone: ADD-ONs exhausted OR L3 ADD-ON გახსნილია
+            in_l3_zone = (add_on_count >= _max_add_ons) or (l3_addon_done == 1)
+            tp_pct = TP_L3 if in_l3_zone else TP_BASE
 
-            # TIME_BASED_TP: L1-L2-ზე session multiplier-ი.
-            # L3+ CASCADE positions — TP cascade-ის ლოგიკით იმართება,
-            # time-based override არ ეხება (CASCADE_TP_L3_PCT ფიქსირებულია).
-            if TIME_BASED_TP_ENABLED and layer < 3 and _mult != 1.0:
+            # TIME_BASED_TP: L2 zone-ზე მხოლოდ
+            if TIME_BASED_TP_ENABLED and not in_l3_zone and _mult != 1.0:
                 tp_pct = round(tp_pct * _mult, 4)
                 tp_pct = max(TIME_TP_MIN_PCT, min(TIME_TP_MAX_PCT, tp_pct))
 
-            correct = round(avg * (1 + tp_pct / 100.0), 6)
-
-            # სხვაობა
+            correct  = round(avg * (1 + tp_pct / 100.0), 6)
             diff_pct = abs(tp - correct) / correct * 100 if correct > 0 else 100.0
 
             if diff_pct < TOLERANCE:
                 logger.info(
                     f"[TP_FIX] OK    {sym} | "
-                    f"layer={layer} tp={tp:.4f} ✅"
+                    f"zone={'L3' if in_l3_zone else 'L2'} tp={tp:.4f} ✅"
                 )
                 result["skipped"] += 1
                 continue
 
-            # გასწორება
             conn.execute(
                 "UPDATE dca_positions SET current_tp_price=? WHERE id=? AND status='OPEN'",
                 (correct, pos_id)
             )
             logger.warning(
                 f"[TP_FIX] FIXED {sym} | "
-                f"layer={layer} tp_pct={tp_pct:.2f}% | "
+                f"zone={'L3' if in_l3_zone else 'L2'} tp_pct={tp_pct:.2f}% | "
                 f"{tp:.4f} → {correct:.4f} (diff={diff_pct:.2f}%)"
             )
             result["fixed"] += 1
