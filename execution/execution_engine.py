@@ -23,6 +23,7 @@ from execution.db.repository import (
     get_trade_stats,
     count_open_trades_for_symbol,
     get_all_open_trades,
+    get_all_open_dca_positions,
     # FIX GLOBAL-3: OCO failure rollback — orphaned trade cleanup
     delete_orphaned_trade,
 )
@@ -1393,7 +1394,13 @@ class ExecutionEngine:
         _min_open = int(os.getenv("MIN_OPEN_TRADES", "5"))
         if _max_open > 0:
             try:
-                _total_open_now = len(get_all_open_trades() or [])
+                # DCA mode: dca_positions ცხრილი (მხოლოდ ამ ბოტის positions)
+                # სხვა ბოტის trades ცხრილი არ ჩაერევა
+                _dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
+                if _dca_mode:
+                    _total_open_now = len(get_all_open_dca_positions() or [])
+                else:
+                    _total_open_now = len(get_all_open_trades() or [])
                 if _total_open_now >= _max_open:
                     msg = (
                         f"EXEC_REJECT | MAX_OPEN_TRADES | "
@@ -1408,10 +1415,8 @@ class ExecutionEngine:
                         symbol=str(symbol)
                     )
                     return
-                elif _total_open_now > _min_open:
-                    # MIN-სა და MAX-ს შორის — ბლოკავს
-                    # მაგ: open=6 (min=5, max=6) → ბლოკავს
-                    # მაგ: open=5 (min=5) → 5 > 5 False → ყიდის ✅
+                elif not _dca_mode and _total_open_now > _min_open:
+                    # MIN/MAX refill სტრატეგია — DCA mode-ში არ გამოიყენება
                     msg = (
                         f"EXEC_REJECT | ABOVE_MIN_OPEN_TRADES | "
                         f"total_open={_total_open_now} > min={_min_open} | id={signal_id}"
