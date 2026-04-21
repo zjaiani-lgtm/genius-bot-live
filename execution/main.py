@@ -15,33 +15,9 @@ from typing import Optional, Dict, Any
 #   პრობლემა: BTC/USDT_L2 trade ვერ იპოვებოდა DB-ში
 #   გამოსწორება: sym პირველი, exchange_sym fallback
 #
-# FIX #3 — CASCADE symbol suffix regex
-#   გამოსწორება: re.sub(r'_L\d+$', '') — ყველა suffix იფარება
-#
-# FIX #4 — ADD-ON exchange_sym
-#   გამოსწორება: exchange_sym (suffix გარეშე) Binance-ისთვის
-#
-# FIX #9 — LAYER2 Cooldown 180s (2026-04-12)
-#   პრობლემა: BTC/ETH/BNB ერთდროულად L2 → $36 ერთ წამში!
-#   გამოსწორება: _LAST_L2_TS + LAYER2_COOLDOWN_SECONDS=180
-#
-# FIX #10 — CASCADE net_proceeds < $10 → skip (2026-04-12)
-#   პრობლემა: max(net_proceeds, 10.0) → გარე ფულის დამატება
-#   გამოსწორება: net_proceeds < $10 → skip
-#
-# FIX #11 — Layer პოზიციებზე ADD-ON skip (2026-04-12)
-#   პრობლემა: BTC/USDT_L2-ზე ADD-ON → CASCADE conflict
-#   გამოსწორება: is_layer2=True → SKIP_ADDON → continue
-#
-# FIX #13 — CASCADE buy_quote fixed $12 (2026-04-12)
-#   პრობლემა: net_proceeds ცვალებადია → TP < avg → არასოდეს გაიყიდება
-#   გამოსწორება: buy_quote = BOT_QUOTE_PER_TRADE (fixed $12)
-#   ადგილი: _check_cascade_exchange() ახალი Layer გახსნა
-#
 # FIX #14 — TP_FIX ყოველ loop-ზე (2026-04-12)
-#   პრობლემა: CASCADE-ის შემდეგ TP < avg → პოზიცია არასოდეს იყიდება
-#   გამოსწორება: run_tp_fix() ყოველ 120s loop-ზე
-#   ადგილი: main loop, DCA loop-მდე
+#   პრობლემა: ADD-ON-ის შემდეგ TP < avg → პოზიცია არასოდეს იყიდება
+#   გამოსწორება: run_tp_fix() ყოველ loop-ზე
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -72,7 +48,7 @@ from execution.execution_engine import ExecutionEngine
 from execution.signal_client import pop_next_signal
 from execution.kill_switch import is_kill_switch_active
 from execution.dca_position_manager import get_dca_manager
-from execution.dca_tp_sl_manager import get_tp_sl_manager, DCATpSlManager
+from execution.dca_tp_sl_manager import get_tp_sl_manager
 from execution.dca_risk_manager import get_risk_manager
 from execution.futures_engine import get_futures_engine
 from execution.telegram_notifier import (
@@ -214,12 +190,8 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
         sym = pos["symbol"]
         pos_id = pos["id"]
 
-        # FIX #2 + #4: exchange_sym — ყველა Layer suffix ამოვიღოთ
-        # DB-ში "BTC/USDT_L2", "BTC/USDT_L3"... ინახება
-        # Binance-ს მხოლოდ "BTC/USDT" სჭირდება
         import re as _re_sym
         exchange_sym = _re_sym.sub(r'_L\d+$', '', sym)
-        is_layer2 = sym != exchange_sym  # True თუ რაიმე suffix აქვს
 
         try:
             # current price — DEMO: price_feed, LIVE: exchange
@@ -271,8 +243,7 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     # ── dca_positions დახურვა ──────────────────────────
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "TP")
 
-                    # ── FIX #2: trades ცხრილის დახურვა ────────────────
-                    # sym პირველი (DB-ში "BTC/USDT_L2"), exchange_sym fallback
+                    # trades ცხრილის დახურვა
                     _open_tr = get_open_trade_for_symbol(sym)
                     if not _open_tr:
                         _open_tr = get_open_trade_for_symbol(exchange_sym)
@@ -321,8 +292,7 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
 
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "FORCE_CLOSE")
 
-                    # ── FIX #2: trades ცხრილის დახურვა ────────────────
-                    # sym პირველი (DB-ში "BTC/USDT_L2"), exchange_sym fallback
+                    # trades ცხრილის დახურვა
                     _open_tr = get_open_trade_for_symbol(sym)
                     if not _open_tr:
                         _open_tr = get_open_trade_for_symbol(exchange_sym)
@@ -375,8 +345,7 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
 
                         close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "SL")
 
-                        # ── FIX #2: trades ცხრილის დახურვა ────────────
-                        # sym პირველი (DB-ში "BTC/USDT_L2"), exchange_sym fallback
+                            # trades ცხრილის დახურვა
                         _open_tr = get_open_trade_for_symbol(sym)
                         if not _open_tr:
                             _open_tr = get_open_trade_for_symbol(exchange_sym)
@@ -417,10 +386,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                 sl_price = new_sl
 
             # ── 6. Add-on check ──────────────────────────────────────────
-            # FIX #11: Layer პოზიციებზე ADD-ON არ უნდა მოხდეს!
-            if is_layer2:
-                logger.debug(f"[DCA] SKIP_ADDON | {sym} is Layer position → CASCADE manages")
-                continue
 
             # BEAR MODE: ADD-ON BLOCKED
             if market_regime == "BEAR":
@@ -504,7 +469,12 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                 new_qty    = avg_result["total_qty"]
                 new_quote  = total_quote + addon_size
 
-                tp_sl = tp_sl_mgr.calculate(new_avg)
+                # TP: position-ს ვაბარებთ — zone განსაზღვრისთვის
+                # add_on_count+1 შემდეგ: L2 zone (< max_add_ons) → 0.55%
+                #                        L3 zone (>= max_add_ons) → 0.35%
+                _pos_after_addon = dict(pos)
+                _pos_after_addon["add_on_count"] = add_on_count + 1
+                tp_sl = tp_sl_mgr.calculate(new_avg, position=_pos_after_addon)
                 new_tp = tp_sl["tp_price"]
                 new_sl = tp_sl["sl_price"]
 
@@ -603,6 +573,13 @@ def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> Non
 
     try:
         l3_addon_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "10.0"))
+
+        # RISK CHECK — balance საკმარისია?
+        from execution.dca_risk_manager import get_risk_manager as _get_rm
+        _l3_risk_ok, _l3_risk_reason = _get_rm().can_l3_operation(l3_addon_quote)
+        if not _l3_risk_ok:
+            logger.warning(f"[L3_ADDON] RISK_BLOCK | {sym} reason={_l3_risk_reason}")
+            return
 
         if engine.exchange is None:
             buy_price = current_price
@@ -746,6 +723,13 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
         fee          = proceeds * 0.001   # 0.1% Binance fee
         net_proceeds = proceeds - fee
 
+        # RISK CHECK — net_proceeds საკმარისია reinvest-ისთვის?
+        from execution.dca_risk_manager import get_risk_manager as _get_rm
+        _rot_risk_ok, _rot_risk_reason = _get_rm().can_l3_operation(net_proceeds)
+        if not _rot_risk_ok:
+            logger.warning(f"[L3_ROT] RISK_BLOCK | {sym} net_proceeds={net_proceeds:.2f} reason={_rot_risk_reason}")
+            return
+
         realized_pnl = (sell_price - lifo_price) * lifo_qty - fee
 
         logger.warning(
@@ -763,14 +747,13 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             reinvest_price  = float(reinvest_result.get("average") or reinvest_result.get("price") or current_price)
             reinvest_qty    = float(reinvest_result.get("filled") or reinvest_result.get("amount") or (net_proceeds / reinvest_price))
 
-        # 4. new_avg გამოთვლა
-        # ძველი unit ამოვიღოთ, ახალი დავამატოთ
+        # 4. new_avg გამოთვლა — სწორი LIFO მათემატიკა
+        # total position value-დან LIFO unit-ის ზუსტი value ამოვაკლოთ
+        # (არა remaining_qty * avg_entry — ეს approximate-ია)
         remaining_qty   = total_qty - lifo_qty
-        remaining_value = remaining_qty * avg_entry  # approximate (LIFO unit-ი avg-ის ნაწილია)
+        total_value     = total_qty * avg_entry
+        remaining_value = total_value - lifo_qty * lifo_price  # ზუსტი: ვაკლებთ actual entry price
 
-        # სწორი გამოთვლა: weighted average-ის recalculation
-        # remaining: total_qty - lifo_qty @ avg_entry (approximate)
-        # new unit: reinvest_qty @ reinvest_price
         new_qty   = remaining_qty + reinvest_qty
         new_value = remaining_value + reinvest_qty * reinvest_price
         new_avg   = round(new_value / new_qty, 8) if new_qty > 0 else avg_entry
@@ -843,579 +826,6 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
 
     except Exception as e:
         logger.error(f"[L3_ROT] ROTATION_FAIL | {sym} err={e}")
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# FIX #9 REAL: LAYER2 Cooldown — global timestamp (CHANGELOG-ში
-# წერია "გამოსწორება: _LAST_L2_TS", მაგრამ ცვლადი არ არსებობდა).
-# _LAST_L2_TS: ბოლო ნებისმიერი Layer2 გახსნის unix timestamp.
-# LAYER2_COOLDOWN_SECONDS=180 → 3 წუთი BTC/ETH/BNB-ს შორის.
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_LAST_L2_TS: float = 0.0
-
-
-def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
-    """
-    Layer 2 — Crash Detection & Parallel Trading.
-
-    ლოგიკა:
-      1. თითო symbol-ისთვის 24h HIGH ამოიღე
-      2. თუ current_price <= HIGH × (1 - LAYER2_DROP_PCT/100) → crash!
-      3. Layer 2 პოზიცია უკვე ღიაა? → გამოტოვე
-      4. USDT ბალანსი საკმარისია? → გახსენი Layer 2
-
-    ENV:
-      LAYER2_DROP_PCT=5.0      ← HIGH-დან რამდენი % ვარდნაზე გაიხსნოს
-      LAYER2_ENABLED=true      ← ჩართვა/გამორთვა
-      LAYER2_QUOTE=10.0        ← Layer 2-ის trade ზომა
-      LAYER2_SYMBOLS=BTC/USDT,BNB/USDT,ETH/USDT
-    """
-    import os
-
-    # Layer 2 ჩართულია?
-    if not os.getenv("LAYER2_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
-        return
-
-    # FIX #9 REAL: cooldown — BTC/ETH/BNB ერთდროულად trigger → $36 ერთ loop-ში
-    global _LAST_L2_TS
-    import time as _l2_time
-    _l2_cooldown = int(os.getenv("LAYER2_COOLDOWN_SECONDS", "180"))
-    _l2_elapsed  = _l2_time.time() - _LAST_L2_TS
-    if _l2_elapsed < _l2_cooldown:
-        logger.debug(
-            f"[LAYER2] GLOBAL_COOLDOWN | remaining={int(_l2_cooldown - _l2_elapsed)}s → skip"
-        )
-        return
-
-    from execution.db.repository import (
-        get_open_dca_position_for_symbol,
-        open_dca_position,
-        add_dca_order,
-        open_trade,
-        log_event,
-    )
-
-    drop_pct    = float(os.getenv("LAYER2_DROP_PCT",  "5.0"))
-    quote       = float(os.getenv("LAYER2_QUOTE",     "10.0"))
-    symbols_raw = os.getenv("LAYER2_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT")
-    symbols     = [s.strip() for s in symbols_raw.split(",") if s.strip()]
-    tp_pct      = float(os.getenv("DCA_TP_PCT", "0.55"))
-    buffer      = float(os.getenv("SMART_ADDON_BUFFER", "5.0"))
-
-    # USDT ბალანსი — DEMO: ვირტუალური $120
-    try:
-        if engine.exchange is not None:
-            free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
-        else:
-            free_usdt = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
-    except Exception as _e:
-        logger.warning(f"[LAYER2] balance_fetch_fail | err={_e}")
-        free_usdt = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
-
-    for sym in symbols:
-        exchange_sym = sym  # Layer2: symbols სუფთაა (_L2 suffix არ აქვს)
-        try:
-            # current price — DEMO: price_feed
-            if engine.exchange is not None:
-                current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
-            else:
-                _t = engine.price_feed.fetch_ticker(exchange_sym)
-                current_price = float(_t.get("last") or 0.0)
-            if current_price <= 0:
-                continue
-
-            # 24h HIGH — ohlcv 1d candle
-            try:
-                ticker = engine.price_feed.fetch_ticker(sym)
-                high_24h = float(ticker.get("high") or ticker.get("info", {}).get("highPrice") or 0.0)
-            except Exception:
-                high_24h = 0.0
-
-            if high_24h <= 0:
-                logger.debug(f"[LAYER2] NO_HIGH | {sym} → skip")
-                continue
-
-            drop_from_high = (high_24h - current_price) / high_24h * 100.0
-
-            logger.info(
-                f"[LAYER2] CHECK | {sym} price={current_price:.4f} "
-                f"high24h={high_24h:.4f} drop={drop_from_high:.2f}% "
-                f"trigger={drop_pct:.1f}%"
-            )
-
-            # crash trigger?
-            if drop_from_high < drop_pct:
-                logger.debug(f"[LAYER2] NO_CRASH | {sym} drop={drop_from_high:.2f}% < {drop_pct:.1f}%")
-                continue
-
-            # Layer 2 უკვე ღიაა ამ symbol-ზე?
-            # Layer 2 პოზიციები tag-ით განვასხვავებთ: symbol = "BTC/USDT_L2"
-            sym_l2 = f"{sym}_L2"
-            existing_l2 = get_open_dca_position_for_symbol(sym_l2)
-            if existing_l2:
-                logger.debug(f"[LAYER2] ALREADY_OPEN | {sym_l2}")
-                continue
-
-            # ბალანსი საკმარისია?
-            required = quote + buffer
-            if free_usdt < required:
-                logger.warning(
-                    f"[LAYER2] INSUFFICIENT_BALANCE | {sym} "
-                    f"free={free_usdt:.2f} < required={required:.2f}"
-                )
-                continue
-
-            # Layer 2 გახსნა!
-            logger.warning(
-                f"[LAYER2] CRASH_DETECTED | {sym} "
-                f"drop={drop_from_high:.2f}% >= {drop_pct:.1f}% → opening Layer 2"
-            )
-
-            # ყიდვა — DEMO: ვირტუალური
-            if engine.exchange is None:
-                buy_price = current_price
-                buy_qty   = quote / buy_price
-                buy = {"average": buy_price, "price": buy_price, "filled": buy_qty}
-            else:
-                buy = engine.exchange.place_market_buy_by_quote(sym, quote)
-                buy_price = float(buy.get("average") or buy.get("price") or current_price)
-                # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
-                buy_qty   = float(buy.get("filled") or buy.get("amount") or (quote / buy_price))
-
-            tp_price = round(buy_price * (1.0 + tp_pct / 100.0), 6)
-
-            # dca_positions — sym_l2 tag-ით
-            pos_id = open_dca_position(
-                symbol=sym_l2,
-                initial_entry_price=buy_price,
-                initial_qty=buy_qty,
-                initial_quote_spent=quote,
-                tp_price=tp_price,
-                sl_price=0.0,
-                tp_pct=tp_pct,
-                sl_pct=999.0,
-                max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "1")),
-                max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),  # FIX #4a: 20→24
-                max_drawdown_pct=999.0,
-            )
-
-            add_dca_order(
-                position_id=pos_id,
-                symbol=sym_l2,
-                order_type="LAYER2_INITIAL",
-                entry_price=buy_price,
-                qty=buy_qty,
-                quote_spent=quote,
-                avg_entry_after=buy_price,
-                tp_after=tp_price,
-                sl_after=0.0,
-                trigger_drawdown_pct=drop_from_high,
-                exchange_order_id=str(buy.get("id", "")),
-            )
-
-            # trades ცხრილი
-            import uuid
-            l2_signal_id = f"L2-{sym.replace('/', '')}-{uuid.uuid4().hex[:8]}"
-            open_trade(
-                signal_id=l2_signal_id,
-                symbol=sym_l2,
-                qty=buy_qty,
-                quote_in=quote,
-                entry_price=buy_price,
-            )
-
-            free_usdt -= quote  # ბალანსი განახლება in-memory
-
-            try:
-                log_event(
-                    "LAYER2_OPENED",
-                    f"sym={sym_l2} entry={buy_price:.4f} "
-                    f"tp={tp_price:.4f} drop={drop_from_high:.2f}% "
-                    f"pos_id={pos_id}"
-                )
-            except Exception:
-                pass
-
-            # Telegram
-            try:
-                from execution.telegram_notifier import notify_signal_created
-                notify_signal_created(
-                    symbol=sym_l2,
-                    entry_price=buy_price,
-                    quote_amount=quote,
-                    tp_price=tp_price,
-                    sl_price=0.0,
-                    verdict="LAYER2_BUY",
-                    mode=engine.mode,
-                )
-            except Exception as _tg:
-                logger.warning(f"[LAYER2] TG_FAIL | {sym} err={_tg}")
-
-            logger.warning(
-                f"[LAYER2] OPENED | {sym_l2} entry={buy_price:.4f} "
-                f"tp={tp_price:.4f} qty={buy_qty:.6f}"
-            )
-            # FIX #9 REAL: cooldown timestamp განახლება — შემდეგი symbol skip-ავს
-            _LAST_L2_TS = _l2_time.time()
-
-        except Exception as e:
-            logger.error(f"[LAYER2] ERR | {sym} err={e}")
-
-
-def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
-    """
-    Cascade DCA — "Rolling Exchange" სტრატეგია.
-
-    მხოლოდ L2→L3 ორი layer:
-      L2 open → price drops -1.5% from L2 avg → sells L2, opens L3
-      L3 open → SHORT trigger (FIX #15)
-      CASCADE_MAX_LAYERS=3 → L3-ზე ჩერდება
-
-    ENV:
-      CASCADE_ENABLED=true
-      CASCADE_START_LAYER=2   ← L2-დან იწყება
-      CASCADE_DROP_PCT=1.5    ← ერთიანი trigger L3-სთვის
-      CASCADE_TP_L3_PCT=0.65  ← L3 TP პროცენტი
-      CASCADE_MAX_LAYERS=3    ← L3-ზე გაჩერება
-      CASCADE_SYMBOLS=BTC/USDT,BNB/USDT,ETH/USDT
-    """
-    import os
-
-    if not os.getenv("CASCADE_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
-        return
-
-    from execution.db.repository import (
-        get_all_open_dca_positions,
-        close_dca_position,
-        open_dca_position,
-        add_dca_order,
-        open_trade,
-        get_open_trade_for_symbol,
-        close_trade,
-        log_event,
-    )
-
-    cascade_start  = int(os.getenv("CASCADE_START_LAYER",  "2"))
-    drop_pct_base  = float(os.getenv("CASCADE_DROP_PCT",    "1.5"))  # L2→L3 trigger
-    tp_pct_base    = float(os.getenv("DCA_TP_PCT",          "0.55")) # L1-L2
-    tp_pct_l3      = float(os.getenv("CASCADE_TP_L3_PCT",   "0.65")) # L3
-    max_layers     = 3   # CASCADE: L1→L2→L3 მხოლოდ. L4+ გათიშულია.
-    symbols_raw    = os.getenv("CASCADE_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT")
-    symbols        = [s.strip() for s in symbols_raw.split(",") if s.strip()]
-    buffer         = float(os.getenv("SMART_ADDON_BUFFER", "5.0"))
-
-    # ყველა ღია პოზიცია
-    all_positions = get_all_open_dca_positions()
-
-    # სულ რამდენი Layer გვაქვს — მხოლოდ ლოგისთვის
-    total_layers = len(all_positions)
-
-    logger.info(
-        f"[CASCADE] CHECK | total_layers={total_layers} "
-        f"start_at={cascade_start} max={max_layers}"
-    )
-
-    # FIX #7: global total_layers check ამოღებულია!
-    # ძველი კოდი: total_layers=5 (BTC+ETH+BNB L1+L2) >= max_layers=3 → MAX_REACHED → CASCADE ბლოკი
-    # სწორი: per-symbol layers-ს ვამოწმებთ loop-ში (sym_positions)
-    # cascade_start/max_layers შემოწმება sym_positions-ზე ხდება ქვემოთ
-
-    if not all_positions:
-        logger.debug("[CASCADE] NO_POSITIONS → skip")
-        return
-
-    for sym in symbols:
-        try:
-            exchange_sym = sym
-
-            # current price — DEMO: price_feed
-            if engine.exchange is not None:
-                current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
-            else:
-                _t = engine.price_feed.fetch_ticker(exchange_sym)
-                current_price = float(_t.get("last") or 0.0)
-            if current_price <= 0:
-                continue
-
-            # ამ symbol-ის ყველა Layer — გახსნის დროის მიხედვით დავალაგოთ
-            # FIX #3: regex — _L2, _L3 ... _L99+ ყველა suffix იფარება
-            import re as _re
-            sym_positions = [
-                p for p in all_positions
-                if _re.sub(r'_L\d+$', '', str(p.get("symbol", "")).upper()) == sym.upper()
-            ]
-
-            if len(sym_positions) < 2:
-                logger.debug(f"[CASCADE] {sym} | only {len(sym_positions)} layer(s) → skip")
-                continue
-
-            # FIX #7: per-symbol max_layers check (ადრე global იყო → ბლოკავდა)
-            if len(sym_positions) >= max_layers:
-                logger.info(
-                    f"[CASCADE] {sym} | MAX_LAYERS_REACHED | "
-                    f"{len(sym_positions)}/{max_layers} → stop"
-                )
-                continue
-
-            # ყველაზე ძველი Layer — opened_at მიხედვით
-            oldest = sorted(sym_positions, key=lambda p: str(p.get("opened_at", "")))[0]
-            oldest_avg   = float(oldest.get("avg_entry_price", 0.0))
-            oldest_qty   = float(oldest.get("total_qty", 0.0))
-            oldest_quote = float(oldest.get("total_quote_spent", 0.0))
-            oldest_id    = oldest["id"]
-            oldest_sym   = oldest["symbol"]
-
-            # Layer ნომერი — მხოლოდ L2→L3
-            layer_num = len(sym_positions)  # 2 = L2 open → triggers L3
-
-            # ── drop_pct და tp_pct — ყველა layer ერთნაირი ──────────
-            drop_pct = drop_pct_base   # 1.5%
-            tp_pct   = tp_pct_l3       # 0.65%
-
-            logger.info(
-                f"[CASCADE] {sym} | layer={layer_num} "
-                f"drop_trigger={drop_pct:.1f}% tp={tp_pct:.2f}%"
-            )
-
-            if oldest_avg <= 0 or oldest_qty <= 0:
-                continue
-
-            # FIX: trigger ვზომავთ ყველაზე ახალი Layer-ის avg-დან
-            # ანუ: Layer 2 გახსნიდან კიდევ -1.5% → CASCADE იწყება
-            # (არა oldest-იდან — ის Layer 2-ის trigger-თან ემთხვეოდა)
-            newest = sorted(sym_positions, key=lambda p: str(p.get("opened_at", "")))[-1]
-            newest_avg = float(newest.get("avg_entry_price", 0.0))
-            if newest_avg <= 0:
-                newest_avg = oldest_avg
-
-            drop_from_newest = (newest_avg - current_price) / newest_avg * 100.0
-
-            logger.info(
-                f"[CASCADE] {sym} | oldest={oldest_sym} avg={oldest_avg:.4f} "
-                f"newest_avg={newest_avg:.4f} price={current_price:.4f} "
-                f"drop_from_newest={drop_from_newest:.2f}% trigger={drop_pct:.1f}%"
-            )
-
-            if drop_from_newest < drop_pct:
-                logger.debug(f"[CASCADE] {sym} | drop={drop_from_newest:.2f}% < {drop_pct:.1f}% → wait")
-                continue
-
-            # ბალანსი შემოწმება — DEMO: ვირტუალური $120
-            if engine.exchange is not None:
-                free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
-            else:
-                free_usdt = float(os.getenv("DEMO_INITIAL_BALANCE", "120.0"))
-            if free_usdt < buffer:
-                logger.warning(f"[CASCADE] {sym} | low_balance={free_usdt:.2f} < buffer={buffer:.1f}")
-                continue
-
-            # ── Exchange: ძველი Layer-ის გაყიდვა ──────────────────────
-            logger.warning(
-                f"[CASCADE] EXCHANGE | {oldest_sym} avg={oldest_avg:.4f} "
-                f"qty={oldest_qty:.6f} drop={drop_from_newest:.2f}%"
-            )
-
-            try:
-                # DEMO: ვირტუალური გაყიდვა
-                if engine.exchange is None:
-                    sell_price = current_price
-                    sell = {"average": sell_price, "price": sell_price}
-                else:
-                    sell = engine.exchange.place_market_sell(exchange_sym, oldest_qty)
-                    sell_price = float(sell.get("average") or sell.get("price") or current_price)
-                proceeds = sell_price * oldest_qty
-                fee = proceeds * 0.001  # 0.1% fee
-                net_proceeds = round(proceeds - fee, 4)
-
-                pnl_quote = (sell_price - oldest_avg) * oldest_qty
-                pnl_pct   = (sell_price / oldest_avg - 1.0) * 100.0
-
-                # dca_positions დახურვა
-                close_dca_position(
-                    oldest_id, sell_price, oldest_qty,
-                    pnl_quote, pnl_pct, "CASCADE_EXCHANGE"
-                )
-
-                # trades დახურვა
-                open_tr = get_open_trade_for_symbol(oldest_sym)
-                if not open_tr:
-                    # fallback: suffix-ის გარეშე ვეძებთ (BTC/USDT_L2 → BTC/USDT)
-                    open_tr = get_open_trade_for_symbol(exchange_sym)
-                if not open_tr:
-                    # fallback2: base symbol-ის ვარიანტები (max_layers=3)
-                    base = exchange_sym.replace("/USDT", "")
-                    for suffix in ["", "_L2", "_L3"]:
-                        _tr = get_open_trade_for_symbol(f"{base}/USDT{suffix}")
-                        if _tr:
-                            open_tr = _tr
-                            break
-                if open_tr:
-                    close_trade(open_tr[0], sell_price, "CASCADE_EXCHANGE", pnl_quote, pnl_pct)
-                    logger.info(f"[CASCADE] TRADE_CLOSED | {oldest_sym} signal_id={open_tr[0]}")
-                else:
-                    logger.warning(f"[CASCADE] TRADE_NOT_FOUND | {oldest_sym} → DB may be out of sync")
-
-                logger.warning(
-                    f"[CASCADE] SOLD | {oldest_sym} price={sell_price:.4f} "
-                    f"proceeds={net_proceeds:.4f} pnl={pnl_quote:+.4f}"
-                )
-
-                # ── Telegram — CASCADE გაყიდვის შეტყობინება (D: გაუმჯობესებული) ──
-                try:
-                    from execution.telegram_notifier import notify_cascade_exchange
-                    # ახალი layer სახელი (ჯერ გამოვთვალოთ)
-                    _new_layer_name = f"{sym}_L{layer_num + 1}"
-                    notify_cascade_exchange(
-                        symbol=sym,
-                        old_avg=oldest_avg,
-                        old_layer=oldest_sym,
-                        new_avg=current_price,  # ახლანდელი ფასი = ახალი entry
-                        new_layer=_new_layer_name,
-                        sell_price=sell_price,
-                        pnl_quote=pnl_quote,
-                        drop_pct=drop_from_newest,
-                        new_tp=round(current_price * (1.0 + tp_pct / 100.0), 6),
-                    )
-                except Exception as _tg_sell:
-                    # fallback — ძველი ნოტიფიკაცია
-                    try:
-                        notify_dca_closed(
-                            symbol=oldest_sym,
-                            entry_price=oldest_avg,
-                            exit_price=sell_price,
-                            pnl_quote=pnl_quote,
-                            pnl_pct=pnl_pct,
-                            outcome="CASCADE_SELL",
-                            add_on_count=0,
-                            stats=None,
-                        )
-                    except Exception:
-                        pass
-                    logger.warning(f"[CASCADE] TG_SELL_FAIL | err={_tg_sell}")
-
-                # ── C: DAILY LOSS TRACKING ────────────────────────────
-                # FIX BUG#3: _daily_loss_total main()-ის scope-ში იყო →
-                # UnboundLocalError inner function-ში.
-                # გამოსწორება: DB audit_log-ში ვწერთ (restart-safe),
-                # main() loop-ი ამ event-ებს კითხულობს daily sum-ისთვის.
-                if pnl_quote < 0:
-                    try:
-                        log_event(
-                            "CASCADE_LOSS",
-                            f"sym={oldest_sym} pnl={pnl_quote:.4f}"
-                        )
-                        logger.info(
-                            f"[DAILY_LOSS] CASCADE | {oldest_sym} "
-                            f"pnl={pnl_quote:+.4f} (logged to DB)"
-                        )
-                    except Exception:
-                        pass
-
-            except Exception as _se:
-                logger.error(f"[CASCADE] SELL_FAIL | {oldest_sym} err={_se}")
-                continue
-
-            # ── ახალი Layer გახსნა ───────────────────────────────────
-            # FIX #13: ყოველთვის ENV-დან fixed quote — net_proceeds კი არა!
-            # net_proceeds ცვალებადია (ზარალით გაყიდვა → ნაკლები თანხა)
-            # fixed quote = ყოველთვის $12 → Binance minimum notional ✅
-            if net_proceeds < 5.0:
-                logger.warning(f"[CASCADE] LOW_PROCEEDS | {net_proceeds:.4f} < $5 → skip new layer")
-                continue
-
-            # Layer ნომერი განვსაზღვროთ
-            layer_num = len(sym_positions)  # მიმდინარე + 1
-            new_sym = f"{sym}_L{layer_num + 1}"
-
-            try:
-                # FIX #13: fixed quote ENV-დან (BOT_QUOTE_PER_TRADE=12)
-                buy_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
-                # DEMO: ვირტუალური ყიდვა
-                if engine.exchange is None:
-                    buy_price = current_price
-                    buy_qty   = buy_quote / buy_price
-                    buy = {"average": buy_price, "price": buy_price, "filled": buy_qty}
-                else:
-                    buy = engine.exchange.place_market_buy_by_quote(exchange_sym, buy_quote)
-                    buy_price = float(buy.get("average") or buy.get("price") or current_price)
-                    # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty
-                    buy_qty   = float(buy.get("filled") or buy.get("amount") or (buy_quote / buy_price))
-                tp_price  = round(buy_price * (1.0 + tp_pct / 100.0), 6)
-
-                # dca_positions გახსნა
-                pos_id = open_dca_position(
-                    symbol=new_sym,
-                    initial_entry_price=buy_price,
-                    initial_qty=buy_qty,
-                    initial_quote_spent=buy_quote,
-                    tp_price=tp_price,
-                    sl_price=0.0,
-                    tp_pct=tp_pct,
-                    sl_pct=999.0,
-                    max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "1")),
-                    max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),  # FIX #4b: 20→24
-                    max_drawdown_pct=999.0,
-                )
-
-                add_dca_order(
-                    position_id=pos_id,
-                    symbol=new_sym,
-                    order_type="CASCADE_LAYER",
-                    entry_price=buy_price,
-                    qty=buy_qty,
-                    quote_spent=buy_quote,  # FIX #13: fixed $12
-                    avg_entry_after=buy_price,
-                    tp_after=tp_price,
-                    sl_after=0.0,
-                    trigger_drawdown_pct=drop_from_newest,
-                    exchange_order_id=str(buy.get("id", "")),
-                )
-
-                # trades გახსნა
-                import uuid
-                cascade_signal_id = f"CAS-{sym.replace('/', '')}-{uuid.uuid4().hex[:8]}"
-                open_trade(
-                    signal_id=cascade_signal_id,
-                    symbol=new_sym,
-                    qty=buy_qty,
-                    quote_in=buy_quote,  # FIX #13: fixed $12
-                    entry_price=buy_price,
-                )
-
-                try:
-                    log_event(
-                        "CASCADE_LAYER_OPENED",
-                        f"sym={new_sym} entry={buy_price:.4f} tp={tp_price:.4f} "
-                        f"quote={buy_quote:.4f} from={oldest_sym}"  # FIX #13
-                    )
-                except Exception:
-                    pass
-
-                # Telegram
-                try:
-                    from execution.telegram_notifier import notify_signal_created
-                    notify_signal_created(
-                        symbol=new_sym,
-                        entry_price=buy_price,
-                        quote_amount=buy_quote,  # FIX #13: fixed $12
-                        tp_price=tp_price,
-                        sl_price=0.0,
-                        verdict="CASCADE_BUY",
-                        mode=engine.mode,
-                    )
-                except Exception as _tg:
-                    logger.warning(f"[CASCADE] TG_FAIL | err={_tg}")
-
-                logger.warning(
-                    f"[CASCADE] NEW_LAYER | {new_sym} entry={buy_price:.4f} "
-                    f"tp={tp_price:.4f} quote={buy_quote:.4f}"  # FIX #13
-                )
-
-            except Exception as _be:
-                logger.error(f"[CASCADE] BUY_FAIL | {new_sym} err={_be}")
-
-        except Exception as e:
-            logger.error(f"[CASCADE] ERR | {sym} err={e}")
 
 
 def _start_bot_api_server() -> None:
@@ -1507,7 +917,7 @@ def main():
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # C: DAILY LOSS LIMIT — დღიური ზარალის ჭერი
     # DAILY_MAX_LOSS_USDT=5.0 (default: $5 = 5% of $100)
-    # თუ CASCADE ზარალი > limit → PAUSE until next day
+    # თუ დღიური ზარალი > limit → PAUSE until next day
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     daily_max_loss = float(os.getenv("DAILY_MAX_LOSS_USDT", "5.0"))
     _daily_loss_date = ""    # რომელ დღეზე ვთვლით
@@ -1632,7 +1042,7 @@ def main():
     tp_sl_mgr = get_tp_sl_manager() if _dca_enabled else None
     risk_mgr  = get_risk_manager()  if _dca_enabled else None
     if _dca_enabled:
-        logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '3')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', '40')}")
+        logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '5')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', '80')}")
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # SMART LONG + SHORT — Futures Engine init
@@ -1688,8 +1098,6 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # C: DAILY LOSS — დღის reset შემოწმება
-            # FIX BUG#3: _daily_loss_total ახლა DB CASCADE_LOSS events-დანაც
-            # ივსება (inner function scope bug გამოსწორება).
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _today = _now_dt().date().isoformat()
             if _today != _daily_loss_date:
@@ -1697,27 +1105,26 @@ def main():
                 _daily_loss_total = 0.0
                 logger.info(f"DAILY_LOSS_RESET | date={_today} limit={daily_max_loss}")
 
-            # CASCADE_LOSS events DB-დან — inner function scope fix
-            # FIX CRIT#1: _daily_loss_total = _cascade_total (არა +=!)
-            # += იყო: ყოველ 2 წუთში -$0.88 ემატებოდა → -$40 double-counting!
-            # = არის: DB-დან ყოველ loop-ზე სრულ ჯამს კითხულობს → ერთხელ ითვლება
+            # L3_ROTATION_LOSS events DB-დან — daily loss tracking
+            # L3 rotation realized loss-ები + force_close-ები
             try:
                 from execution.db.repository import _fetchall
-                _cascade_losses = _fetchall(
-                    "SELECT message FROM audit_log WHERE event_type='CASCADE_LOSS' "
-                    "AND created_at >= date('now') ORDER BY id DESC LIMIT 50"
+                import re as _re_loss
+                _loss_rows = _fetchall(
+                    "SELECT message FROM audit_log "
+                    "WHERE event_type IN ('L3_ROTATION','DCA_FORCE_CLOSE') "
+                    "AND created_at >= date('now') ORDER BY id DESC LIMIT 100"
                 )
-                _cascade_total = 0.0
-                for _row in (_cascade_losses or []):
+                _loss_total = 0.0
+                for _row in (_loss_rows or []):
                     try:
-                        import re as _re_loss
                         _m = _re_loss.search(r'pnl=([+-]?\d+\.\d+)', str(_row[0]))
                         if _m:
-                            _cascade_total += float(_m.group(1))
+                            _loss_total += float(_m.group(1))
                     except Exception:
                         pass
-                if _cascade_total < 0:
-                    _daily_loss_total = _cascade_total  # ← FIX: = არა +=
+                if _loss_total < 0:
+                    _daily_loss_total = _loss_total
             except Exception:
                 pass
 
@@ -1742,7 +1149,7 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # FIX #14: TP_FIX — ყოველ loop-ზე TP სისწორის შემოწმება
-            # CASCADE-ის შემდეგ TP შეიძლება avg-ზე დაბლა დარჩეს → არასოდეს გაიყიდება!
+            # ADD-ON-ის შემდეგ TP შეიძლება avg-ზე დაბლა დარჩეს → გასწორება
             # memory-safe: მხოლოდ DB-ს კითხულობს, Binance API არ სჭირდება
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
@@ -1758,7 +1165,7 @@ def main():
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
-            # BEAR  → SHORT გახსნა + ADD-ON/CASCADE/LAYER2 BLOCKED
+            # BEAR  → SHORT გახსნა + ADD-ON BLOCKED
             # BULL  → SHORT-ები დახურვა + ყველაფერი ნორმალური
             # NEUTRAL → TP/SL check + ყველაფერი ნორმალური
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1787,33 +1194,6 @@ def main():
                                   market_regime=_market_regime)
                 except Exception as e:
                     logger.warning(f"DCA_LOOP_WARN | err={e}")
-
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # LAYER 2 — Crash detection & parallel trading
-            # BEAR MODE: BLOCKED — ახალი layer არ გაიხსნოს!
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            if _dca_enabled:
-                if _market_regime == "BEAR":
-                    logger.info("[LAYER2] BEAR_BLOCK | BEAR market → Layer2 open BLOCKED")
-                else:
-                    try:
-                        _check_and_open_layer2(engine, tp_sl_mgr)
-                    except Exception as e:
-                        logger.warning(f"LAYER2_CHECK_WARN | err={e}")
-
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # CASCADE DCA — Rolling Exchange სტრატეგია
-            # BEAR MODE: BLOCKED — ახალი layer ყიდვა შეაჩერებს SHORT-ს!
-            # არსებული CASCADE TP-ს ელოდება (TP hit = cascade დახურვა ✅)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            if _dca_enabled:
-                if _market_regime == "BEAR":
-                    logger.info("[CASCADE] BEAR_BLOCK | BEAR market → new CASCADE layer BLOCKED")
-                else:
-                    try:
-                        _check_cascade_exchange(engine, tp_sl_mgr)
-                    except Exception as e:
-                        logger.warning(f"CASCADE_CHECK_WARN | err={e}")
 
             if generate_once is not None:
                 try:
@@ -1946,6 +1326,7 @@ def main():
                                                 new_tp_price=_pa_new_tp,
                                                 new_sl_price=0.0,
                                                 last_add_on_ts=time.time(),
+                                                last_addon_price=_pa_price,
                                             )
                                             add_dca_order(
                                                 position_id=_pa_pos["id"],
@@ -2073,9 +1454,24 @@ def main():
                                               sl_price=0.0,
                                               tp_pct=_tp_pct,
                                               sl_pct=999.0,
-                                              max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "1")),
-                                              max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "24.0")),
+                                              max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
+                                              max_capital=float(os.getenv("DCA_MAX_CAPITAL_USDT", "80.0")),
                                               max_drawdown_pct=999.0,
+                                          )
+                                          # INITIAL order — dca_orders ცხრილი
+                                          # საჭიროა get_lifo_unit()-ისთვის (L3 rotation)
+                                          add_dca_order(
+                                              position_id=_pos_id,
+                                              symbol=_sym,
+                                              order_type="INITIAL",
+                                              entry_price=_price,
+                                              qty=_qty,
+                                              quote_spent=_quote,
+                                              avg_entry_after=_price,
+                                              tp_after=_tp,
+                                              sl_after=0.0,
+                                              trigger_drawdown_pct=0.0,
+                                              exchange_order_id=signal_id,
                                           )
                                           open_trade(
                                               signal_id=signal_id,
