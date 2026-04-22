@@ -18,6 +18,10 @@ from typing import Optional, Dict, Any
 # FIX #14 — TP_FIX ყოველ loop-ზე (2026-04-12)
 #   პრობლემა: ADD-ON-ის შემდეგ TP < avg → პოზიცია არასოდეს იყიდება
 #   გამოსწორება: run_tp_fix() ყოველ loop-ზე
+#
+# FIX #15 — notify_signal_created გამოძახება DCA position გახსნისას
+#   პრობლემა: Telegram-ზე "NEW SIGNAL OPENED" შეტყობინება არ მოდიოდა
+#   გამოსწორება: notify_signal_created() დამატება open_dca_position()-ის შემდეგ
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -58,6 +62,7 @@ from execution.telegram_notifier import (
     notify_dca_addon,
     notify_dca_closed,
     notify_dca_breakeven,
+    notify_signal_created,
     _now_dt,
 )
 
@@ -1533,6 +1538,24 @@ def main():
                                               f"price={_price:.4f} qty={_qty:.6f} "
                                               f"tp={_tp:.4f} quote={_quote}"
                                           )
+                                          # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                          # FIX #15: notify_signal_created — Telegram შეტყობინება
+                                          # DCA position გახსნისთანავე → "NEW SIGNAL OPENED"
+                                          # ადგილი 1: ჩვეულებრივი L1/L2/L3 TRADE სიგნალი
+                                          # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                          try:
+                                              notify_signal_created(
+                                                  symbol=_sym,
+                                                  entry_price=_price,
+                                                  quote_amount=_quote,
+                                                  tp_price=_tp,
+                                                  sl_price=0.0,
+                                                  verdict=str(sig.get("signal_type", "BUY")),
+                                                  mode=os.getenv("MODE", "DEMO"),
+                                              )
+                                          except Exception as _tg_open:
+                                              logger.warning(f"[DEMO] TG_OPEN_NOTIFY_FAIL | err={_tg_open}")
+
                               except Exception as _de:
                                   logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
 
