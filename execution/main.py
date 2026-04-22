@@ -22,6 +22,12 @@ from typing import Optional, Dict, Any
 # FIX #15 — notify_signal_created გამოძახება DCA position გახსნისას
 #   პრობლემა: Telegram-ზე "NEW SIGNAL OPENED" შეტყობინება არ მოდიოდა
 #   გამოსწორება: notify_signal_created() დამატება open_dca_position()-ის შემდეგ
+#
+# FIX #16 — PAIRS_ADDON add_on_count counter bug
+#   პრობლემა: PAIRS_ADDON ზრდიდა add_on_count-ს → ETH/USDT add_ons=9 (max=5)
+#             → ბოტი L3 zone-ში ხვდებოდა, ნორმალური DCA add_on-ები ბლოკდებოდა
+#   გამოსწორება: new_add_on_count=_pa_addons (არ ზრდის) — PAIRS_ADDON მხოლოდ
+#             avg/qty/quote/tp განაახლებს, DCA zone counter ხელუხლებელი
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1366,7 +1372,7 @@ def main():
                                                 new_avg_entry=_pa_new_avg,
                                                 new_total_qty=_pa_new_qty,
                                                 new_total_quote=_pa_tot_q + _pa_quote,
-                                                new_add_on_count=_pa_addons + 1,
+                                                new_add_on_count=_pa_addons,  # FIX #16: PAIRS_ADDON არ ზრდის DCA counter-ს — მხოლოდ avg/qty/quote განახლება
                                                 new_tp_price=_pa_new_tp,
                                                 new_sl_price=0.0,
                                                 last_add_on_ts=time.time(),
