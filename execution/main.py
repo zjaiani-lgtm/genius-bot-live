@@ -1513,18 +1513,45 @@ def main():
                                           f"[DEMO] SKIP_REJECTED | {_sym} "
                                           f"action={_exec_action} id={signal_id}"
                                       )
-                                  elif len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "6")):
+
+                                  # FIX: count L1-only positions — _L2/_L3 CASCADE layers
+                                  # არ ჩაითვლება (execution_engine-ის ლოგიკა მირორდება).
+                                  # ძველი: len(get_all_open_dca_positions()) → _L2/_L3 ჩათვლით
+                                  # = double-counting → DEMO-ში ახალი positions ვეღარ იხსნებოდა.
+                                  import re as _re_main_cnt
+                                  _all_dca_cnt = get_all_open_dca_positions() or []
+                                  _l1_open_cnt = sum(
+                                      1 for _p in _all_dca_cnt
+                                      if not _re_main_cnt.search(r'_L\d+$', str(_p.get("symbol", "")))
+                                  )
+                                  _max_open_cnt = int(os.getenv("MAX_OPEN_TRADES", "6"))
+                                  _at_max = _l1_open_cnt >= _max_open_cnt
+                                  if _at_max:
                                       logger.info(
                                           f"[DEMO] SKIP_MAX_OPEN | {_sym} "
-                                          f"total_open >= MAX_OPEN_TRADES={os.getenv('MAX_OPEN_TRADES', '6')}"
+                                          f"l1_open={_l1_open_cnt} >= MAX_OPEN_TRADES={_max_open_cnt}"
                                       )
 
-                                  _existing = get_open_dca_position_for_symbol(_sym)
-                                  _rejected = (
-                                      _is_real_reject
-                                      or len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "6"))
-                                  )
-                                  if not _existing and not _rejected:
+                                  # ALLOW_DCA_DUPLICATE: ერთი symbol-ი 2 L1 position
+                                  # _existing = get_open_dca_position_for_symbol(_sym) → True/False
+                                  # DUPLICATE mode: count vs MAX_DCA_PER_SYMBOL limit
+                                  _allow_dup = os.getenv("ALLOW_DCA_DUPLICATE", "false").strip().lower() in ("1", "true", "yes")
+                                  _max_dca_per_sym = int(os.getenv("MAX_DCA_PER_SYMBOL", "1"))
+                                  try:
+                                      from execution.db.repository import count_open_dca_positions_for_symbol
+                                      _sym_dca_count = count_open_dca_positions_for_symbol(_sym)
+                                  except Exception:
+                                      _sym_dca_count = 1 if get_open_dca_position_for_symbol(_sym) else 0
+
+                                  if _allow_dup:
+                                      # duplicate mode: block only if count >= MAX_DCA_PER_SYMBOL
+                                      _existing_blocked = _sym_dca_count >= _max_dca_per_sym
+                                  else:
+                                      # normal mode: block if ANY position open for symbol
+                                      _existing_blocked = _sym_dca_count > 0
+
+                                  _rejected = _is_real_reject or _at_max or _existing_blocked
+                                  if not _rejected:
                                       _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
                                       _price = _price_cache.get(_sym, 0.0)
                                       if _price <= 0:
@@ -1582,6 +1609,23 @@ def main():
                                               f"price={_price:.4f} qty={_qty:.6f} "
                                               f"tp={_tp:.4f} quote={_quote}"
                                           )
+                                          # ── TELEGRAM: 🚀 NEW SIGNAL OPENED ─────────────
+                                          # FIX: DEMO mode-ში execution_engine `return`-ს
+                                          # აკეთებს notify_signal_created-მდე (LIVE path).
+                                          # DCA position გახსნის შემდეგ TG notification ხდება.
+                                          try:
+                                              from execution.telegram_notifier import notify_signal_created
+                                              notify_signal_created(
+                                                  symbol=_sym,
+                                                  entry_price=_price,
+                                                  quote_amount=_quote,
+                                                  tp_price=_tp,
+                                                  sl_price=0.0,
+                                                  verdict=str(sig.get("final_verdict", "BUY")),
+                                                  mode=os.getenv("MODE", "DEMO"),
+                                              )
+                                          except Exception as _tg_new:
+                                              logger.warning(f"[DEMO] TG_NEW_SIGNAL_FAIL | {_sym} err={_tg_new}")
                               except Exception as _de:
                                   logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
 
