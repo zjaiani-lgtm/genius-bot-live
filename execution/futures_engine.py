@@ -834,6 +834,7 @@ class FuturesEngine:
         try:
             from execution.db.db import get_connection
             with get_connection() as conn:
+                # FIX-DUP: pos_id-level check (original)
                 row = conn.execute(
                     "SELECT id FROM futures_positions "
                     "WHERE dca_pos_id=? AND is_dca_hedge=1 AND status='OPEN'",
@@ -841,6 +842,21 @@ class FuturesEngine:
                 ).fetchone()
                 if row:
                     logger.debug(f"[HEDGE] ALREADY_OPEN | dca_pos_id={dca_pos_id} → skip")
+                    return False
+                # FIX-DUP: symbol-level guard — ALLOW_DCA_DUPLICATE=true-ზე
+                # ერთი symbol-ი 2 L1 position-ს ქმნის (სხვადასხვა dca_pos_id).
+                # ორივე ADD-ON#5-ზე hedge-ს ხსნიდა → double capital drain.
+                # symbol-ზე უკვე ღია hedge? → skip (1 hedge per symbol max).
+                sym_row = conn.execute(
+                    "SELECT id FROM futures_positions "
+                    "WHERE symbol=? AND is_dca_hedge=1 AND status='OPEN'",
+                    (symbol,)
+                ).fetchone()
+                if sym_row:
+                    logger.warning(
+                        f"[HEDGE] SYMBOL_HEDGE_EXISTS | {symbol} "
+                        f"dca_pos_id={dca_pos_id} → skip (1 hedge/symbol max)"
+                    )
                     return False
         except Exception as e:
             logger.warning(f"[HEDGE] CHECK_FAIL | err={e}")
