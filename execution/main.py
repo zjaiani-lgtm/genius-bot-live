@@ -29,6 +29,13 @@ from typing import Optional, Dict, Any
 #   პრობლემა: main.py os.getenv("MAX_OPEN_TRADES","8") — ENV=6, config=2
 #             triple conflict: 3 სხვადასხვა მნიშვნელობა სამ ადგილში
 #   გამოსწორება: fallback "8" → "6" (ENV-ს ემთხვევა)
+#
+# FIX #19 — INDEPENDENT SHORT DCA სისტემა
+#   სარკე სტრატეგია: LONG L1 გახსნის შემდეგ SHORT იხსნება -1.6%-ზე
+#   ADD-ONs ვარდნაზე (LONG-ის სარკე): -1.0%, -2.2%, -3.5%
+#   TP: avg × 0.9945 — სავალდებულო დახურვა
+#   FC: 10 დღე / +15% drawdown — ღია ტრეიდი არ რჩება
+#   ENV: SHORT_DCA_ENABLED=true + SHORT_* params
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1223,23 +1230,15 @@ def main():
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
 
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # SMART LONG + SHORT — Market Regime Detection + Futures Hedge
-            # BEAR  → SHORT გახსნა + ADD-ON BLOCKED
-            # BULL  → SHORT-ები დახურვა + ყველაფერი ნორმალური
-            # NEUTRAL → TP/SL check + ყველაფერი ნორმალური
+            # FUTURES — TP/SL check + FC (ყველა regime-ზე)
+            # BEAR regime SHORT (ძველი) — წაშლილია, ახალი Independent SHORT-ით
+            # ჩანაცვლდა (price-level trigger, საკუთარი TP/FC lifecycle)
+            # DCA hedge SHORT და Independent SHORT TP/FC — check_tp_sl() ფარავს
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 from execution.signal_generator import _detect_market_regime_24h
                 _market_regime = _detect_market_regime_24h()
-
-                if _market_regime == "BEAR":
-                    futures_engine.check_and_open_short(_market_regime)
-                    futures_engine.check_tp_sl()
-                elif _market_regime == "BULL":
-                    futures_engine.close_all_shorts(reason="BULL_MARKET")
-                    futures_engine.check_tp_sl()  # hedge SHORT-ების TP check
-                else:
-                    futures_engine.check_tp_sl()
+                futures_engine.check_tp_sl()
 
             except Exception as _fe:
                 logger.warning(f"FUTURES_LOOP_WARN | err={_fe}")
@@ -1268,6 +1267,21 @@ def main():
                     futures_engine.check_dca_hedge_l3()
                 except Exception as _he:
                     logger.warning(f"HEDGE_CHECK_WARN | err={_he}")
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX #19: INDEPENDENT SHORT DCA — სარკე სტრატეგია
+            # LONG L1 გახსნის შემდეგ: SHORT იხსნება -1.6%-ზე (L2-L3 შუა)
+            # ADD-ONs ვარდნაზე: -1.0%, -2.2%, -3.5% from SHORT L1
+            # TP: avg × 0.9945 → სავალდებულო დახურვა
+            # FC: 10 days / +15% drawdown → ღია ტრეიდი არ რჩება
+            # SHORT_DCA_ENABLED=true ENV-ით ჩართვა
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if _dca_enabled and futures_engine.enabled and futures_engine.short_dca_enabled:
+                try:
+                    futures_engine.check_independent_short_open()
+                    futures_engine.check_independent_short_addons()
+                except Exception as _se:
+                    logger.warning(f"SHORT_DCA_LOOP_WARN | err={_se}")
 
             if generate_once is not None:
                 try:
