@@ -461,7 +461,7 @@ class FuturesEngine:
         if hedge_shorts:
             logger.info(
                 f"[FUTURES] CLOSE_ALL | skipping {len(hedge_shorts)} DCA hedge SHORT(s) "
-                f"— they close independently via TP"
+                f"— they close via TP or close_dca_hedge_for_position()"
             )
 
         if not bear_shorts:
@@ -1169,6 +1169,61 @@ class FuturesEngine:
 
             except Exception as e:
                 logger.error(f"[HEDGE] L3_ERR | {pos.get('symbol')} err={e}")
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: close_dca_hedge_for_position
+    # DCA TP / FORCE_CLOSE → შესაბამისი hedge SHORT-ის დახურვა
+    # ────────────────────────────────────────────────────────
+    def close_dca_hedge_for_position(
+        self,
+        dca_pos_id: int,
+        reason: str = "DCA_CLOSED",
+    ) -> None:
+        """
+        DCA position-ის დახურვისას (TP ან FORCE_CLOSE) —
+        ამ position-თან დაკავშირებული hedge SHORT-ების დახურვა.
+
+        გამოიძახება main.py-დან:
+          - TP hit     → reason="DCA_TP_HIT"
+          - FORCE_CLOSE → reason="DCA_FORCE_CLOSE"
+          - SL hit     → reason="DCA_SL_HIT"
+
+        Edge cases:
+          - hedge ჯერ არ გახსნილა (add_on_count < max) → fetchall empty → no-op ✓
+          - hedge უკვე დაიხურა TP-ზე (futures check_tp_sl) → status!='OPEN' → no-op ✓
+          - multiple hedge rows (L3 exchange reopened) → ყველა იხურება ✓
+        """
+        if not self.enabled:
+            return
+
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM futures_positions "
+                    "WHERE dca_pos_id=? AND is_dca_hedge=1 AND status='OPEN'",
+                    (dca_pos_id,),
+                )
+                cols = [d[0] for d in cur.description]
+                hedge_positions = [dict(zip(cols, r)) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning(f"[HEDGE] CLOSE_FOR_DCA_FETCH_FAIL | dca_pos_id={dca_pos_id} err={e}")
+            return
+
+        if not hedge_positions:
+            logger.debug(
+                f"[HEDGE] CLOSE_FOR_DCA | dca_pos_id={dca_pos_id} "
+                f"no open hedge SHORT → skip"
+            )
+            return
+
+        for pos in hedge_positions:
+            logger.warning(
+                f"[HEDGE] CLOSE_FOR_DCA | dca_pos_id={dca_pos_id} "
+                f"sym={pos.get('symbol')} hedge_id={pos.get('id')} "
+                f"reason={reason}"
+            )
+            self._close_short(pos, reason=reason)
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: get_summary
