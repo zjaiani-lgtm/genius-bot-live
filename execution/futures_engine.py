@@ -237,6 +237,9 @@ def _ensure_addon_cols() -> None:
                 # INDEPENDENT SHORT DCA — ახალი სარკე სისტემა
                 ("is_independent_short",  "INTEGER DEFAULT 0"),  # 1=independent SHORT DCA
                 ("long_ref_price",        "REAL DEFAULT 0.0"),   # LONG L1 entry reference
+                # FIX BUG-3: ADD-ON cooldown DB-ში (restart-safe)
+                # in-memory _short_addon_cooldown_map → Render restart-ზე იკარგება
+                ("last_short_addon_ts",   "REAL DEFAULT 0.0"),   # unix timestamp last addon
             ]
             for col, col_def in migrations:
                 if col not in cols:
@@ -1512,7 +1515,13 @@ class FuturesEngine:
                 sym = str(pos.get("symbol", ""))
                 # base symbol only (no _L2/_L3 suffix)
                 exchange_sym = _re_sym.sub(r'_L\d+$', '', sym)
-                long_entry = float(pos.get("initial_entry_price") or pos.get("avg_entry_price") or 0.0)
+                # FIX BUG-1 (SHORT_DCA): initial_entry_price ONLY — avg_entry_price
+                # ცვლილდება ADD-ON-ებთან ერთად და trigger price-ს ცვლიდა.
+                # spec: "long_ref_price ფიქსირდება ერთხელ" = LONG-ის initial_entry_price.
+                # 0.0 falsy-ია → or-chain-ი avg-ზე ვარდებოდა (bug).
+                # ახლა: None ან 0.0 → skip (safe, არ fallback ცვალებად ფასზე).
+                _ie = pos.get("initial_entry_price")
+                long_entry = float(_ie) if _ie is not None else 0.0
                 if long_entry <= 0:
                     continue
                 self.open_independent_short(exchange_sym, long_entry)
@@ -1583,8 +1592,10 @@ class FuturesEngine:
                     )
                     continue
 
-                # per-position cooldown
-                last_ts = self._short_addon_cooldown_map.get(pos_id, 0.0)
+                # per-position cooldown — DB-based (restart-safe, BUG-3 FIX)
+                # in-memory map Render restart-ზე იბინდება → double ADD-ON-ის რისკი.
+                # ახლა: last_short_addon_ts column futures_positions-ში.
+                last_ts = float(pos.get("last_short_addon_ts") or 0.0)
                 if (time.time() - last_ts) < self._short_addon_cooldown_s:
                     continue
 
@@ -1629,20 +1640,23 @@ class FuturesEngine:
                 )
 
                 from execution.db.db import get_connection
+                _now_ts = time.time()
                 with get_connection() as conn:
                     conn.execute(
                         """
                         UPDATE futures_positions SET
                             add_on_count=?, add_on_quote=?, avg_entry_price=?,
-                            tp_price=?, qty=?, quote_in=?
+                            tp_price=?, qty=?, quote_in=?,
+                            last_short_addon_ts=?
                         WHERE id=?
                         """,
                         (add_on_count + 1, self.short_addon_quote,
-                         round(new_avg, 6), new_tp, new_qty, total_quote, pos_id)
+                         round(new_avg, 6), new_tp, new_qty, total_quote,
+                         _now_ts, pos_id)
                     )
                     conn.commit()
-
-                self._short_addon_cooldown_map[pos_id] = time.time()
+                # in-memory map also updated (fast path for same-session rapid checks)
+                self._short_addon_cooldown_map[pos_id] = _now_ts
 
                 try:
                     from execution.telegram_notifier import send_telegram_message
