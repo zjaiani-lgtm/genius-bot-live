@@ -882,6 +882,26 @@ def get_open_dca_position_for_symbol(symbol: str) -> Optional[Dict[str, Any]]:
     return _dca_row_to_dict(row) if row else None
 
 
+def count_open_dca_positions_for_symbol(symbol: str) -> int:
+    """
+    Symbol-ისთვის ღია DCA L1 positions-ის რაოდენობა.
+
+    ALLOW_DCA_DUPLICATE=true → ერთი symbol-ი 2 L1 position-ს ფარავს.
+    ეს ფუნქცია count-ს აბრუნებს (exists check-ის მაგივრად),
+    რათა MAX_DCA_PER_SYMBOL-თან შედარება შესაძლებელი იყოს.
+
+    მხოლოდ base symbol-ს ამოწმებს (_L2/_L3 suffix გამოირიცხება).
+    """
+    row = _fetchone(
+        """
+        SELECT COUNT(*) FROM dca_positions
+        WHERE UPPER(symbol) = UPPER(?) AND status = 'OPEN'
+        """,
+        (str(symbol),),
+    )
+    return int(row[0]) if row else 0
+
+
 def get_all_open_dca_positions() -> List[Dict[str, Any]]:
     """ყველა ღია DCA position."""
     rows = _fetchall(
