@@ -1851,13 +1851,19 @@ def generate_signal() -> Optional[Dict[str, Any]]:
         try:
             _dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
             if _dca_mode:
-                _total_open = len(get_all_open_dca_positions() or [])
+                import re as _re_sg_cnt
+                # FIX: count L1-only — _L2/_L3 CASCADE layers are not new signals
+                _all_dca_sg = get_all_open_dca_positions() or []
+                _total_open = sum(
+                    1 for _p in _all_dca_sg
+                    if not _re_sg_cnt.search(r'_L\d+$', str(_p.get("symbol", "")))
+                )
             else:
                 _total_open = len(get_all_open_trades() or [])
             if _total_open >= MAX_OPEN_TRADES:
                 logger.info(
                     f"[GEN] BLOCKED_MAX_OPEN_TRADES | total_open={_total_open} >= MAX_OPEN_TRADES={MAX_OPEN_TRADES} "
-                    f"(source={'dca_positions' if _dca_mode else 'trades'})"
+                    f"(source={'dca_positions(L1)' if _dca_mode else 'trades'})"
                 )
                 return None
         except Exception as _e:
@@ -2146,9 +2152,34 @@ def generate_signal() -> Optional[Dict[str, Any]]:
             # DCA MODE: ღია trade-ზე SELL სიგნალს აღარ ვამოწმებთ signal_generator-ში.
             # გაყიდვა მართავს dca_tp_sl_manager.py — TP hit, SL confirmed, force close.
             # PROTECTIVE_SELL (crash EXTREME) კვლავ მუშაობს protective_sell ბლოკში.
-            if GEN_DEBUG:
-                logger.info(f"[GEN] OPEN_TRADE | {symbol} → DCA manager handles exit, skipping BUY")
-            continue
+            #
+            # ALLOW_DCA_DUPLICATE=true: ერთი symbol-ი 2 L1 position (duplicate buy strategy).
+            # MAX_DCA_PER_SYMBOL=2 → count-based gate ნაცვლად exists-based.
+            _dup_allowed = os.getenv("ALLOW_DCA_DUPLICATE", "false").strip().lower() in ("1", "true", "yes")
+            if _dup_allowed:
+                _max_per_sym = int(os.getenv("MAX_DCA_PER_SYMBOL", "1"))
+                try:
+                    from execution.db.repository import count_open_dca_positions_for_symbol
+                    _sym_cnt = count_open_dca_positions_for_symbol(symbol)
+                except Exception:
+                    _sym_cnt = 1  # safe: assume 1 open → block unless confirmed lower
+                if _sym_cnt >= _max_per_sym:
+                    if GEN_DEBUG:
+                        logger.info(
+                            f"[GEN] OPEN_TRADE | {symbol} cnt={_sym_cnt}/{_max_per_sym} "
+                            f"→ DCA duplicate limit reached, skipping BUY"
+                        )
+                    continue
+                # count < max → allow second BUY — fall through to BUY PATH below
+                if GEN_DEBUG:
+                    logger.info(
+                        f"[GEN] OPEN_TRADE_DUPLICATE | {symbol} cnt={_sym_cnt}/{_max_per_sym} "
+                        f"→ ALLOW_DCA_DUPLICATE=true, proceeding with BUY"
+                    )
+            else:
+                if GEN_DEBUG:
+                    logger.info(f"[GEN] OPEN_TRADE | {symbol} → DCA manager handles exit, skipping BUY")
+                continue
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # BUY PATH — მხოლოდ open_trade=False შემთხვევაში
