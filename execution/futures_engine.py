@@ -228,12 +228,15 @@ def _ensure_addon_cols() -> None:
                 "PRAGMA table_info(futures_positions)"
             ).fetchall()]
             migrations = [
-                ("add_on_count",      "INTEGER DEFAULT 0"),
-                ("add_on_quote",      "REAL DEFAULT 0.0"),
-                ("avg_entry_price",   "REAL DEFAULT 0.0"),
-                ("sl_price_addon",    "REAL DEFAULT 0.0"),
-                ("is_dca_hedge",      "INTEGER DEFAULT 0"),
-                ("dca_pos_id",        "INTEGER DEFAULT 0"),
+                ("add_on_count",          "INTEGER DEFAULT 0"),
+                ("add_on_quote",          "REAL DEFAULT 0.0"),
+                ("avg_entry_price",       "REAL DEFAULT 0.0"),
+                ("sl_price_addon",        "REAL DEFAULT 0.0"),
+                ("is_dca_hedge",          "INTEGER DEFAULT 0"),
+                ("dca_pos_id",            "INTEGER DEFAULT 0"),
+                # INDEPENDENT SHORT DCA — ახალი სარკე სისტემა
+                ("is_independent_short",  "INTEGER DEFAULT 0"),  # 1=independent SHORT DCA
+                ("long_ref_price",        "REAL DEFAULT 0.0"),   # LONG L1 entry reference
             ]
             for col, col_def in migrations:
                 if col not in cols:
@@ -314,6 +317,25 @@ class FuturesEngine:
         self._hedge_addon_cooldown_s = 180  # 3 წუთი ADD-ON-ებს შორის
         self._last_hedge_l3_ts: float = 0.0
 
+        # ── INDEPENDENT SHORT DCA პარამეტრები ────────────────
+        # სარკე სისტემა: LONG-ის L2-L3 midpoint-ზე SHORT იხსნება
+        # ADD-ONs ვარდნაზე (LONG ADD-ON-ების სარკე)
+        # TP + FC — სავალდებულო დახურვა, ღია ტრეიდი არ რჩება
+        self.short_dca_enabled       = _eb("SHORT_DCA_ENABLED",        False)
+        self.short_l1_trigger_pct    = _ef("SHORT_L1_TRIGGER_PCT",      1.6)
+        self.short_addon_trigger_pcts = _parse_list_float(
+            "SHORT_ADDON_TRIGGER_PCTS", [1.0, 2.2, 3.5]
+        )
+        self.short_addon_quote       = _ef("SHORT_ADDON_QUOTE",         25.0)
+        self.short_max_addons        = _ei("SHORT_MAX_ADDONS",           3)
+        self.short_tp_pct            = _ef("SHORT_TP_PCT",               0.55)
+        self.short_fc_max_days       = _ef("SHORT_FC_MAX_DAYS",         10.0)
+        self.short_fc_drawdown_pct   = _ef("SHORT_FC_DRAWDOWN_PCT",     15.0)
+
+        # per-position cooldown for independent SHORT ADD-ONs
+        self._short_addon_cooldown_map: Dict[int, float] = {}
+        self._short_addon_cooldown_s = 300  # 5 წუთი ADD-ON-ებს შორის
+
         # DB init
         _init_futures_table()
         _ensure_exit_price_col()
@@ -333,6 +355,16 @@ class FuturesEngine:
             f"l3_trigger={self.dca_hedge_l3_trigger_pct}% "
             f"fc_days={self.dca_hedge_fc_max_days}d "
             f"fc_drawdown={self.dca_hedge_fc_drawdown_pct}%"
+        )
+        logger.info(
+            f"[SHORT_DCA] INDEPENDENT SHORT | enabled={self.short_dca_enabled} "
+            f"l1_trigger={self.short_l1_trigger_pct}% "
+            f"addon_triggers={self.short_addon_trigger_pcts} "
+            f"addon_quote={self.short_addon_quote} "
+            f"max_addons={self.short_max_addons} "
+            f"tp={self.short_tp_pct}% "
+            f"fc_days={self.short_fc_max_days}d "
+            f"fc_drawdown={self.short_fc_drawdown_pct}%"
         )
 
     def _fetch_price(self, symbol: str) -> float:
@@ -430,8 +462,9 @@ class FuturesEngine:
             except Exception:
                 pass
 
-            # FIX-S5: cleanup per-position cooldown
+            # FIX-S5: cleanup per-position cooldown (hedge + independent)
             self._hedge_addon_cooldown_map.pop(pos_id, None)
+            self._short_addon_cooldown_map.pop(pos_id, None)
 
         except Exception as e:
             logger.error(f"[FUTURES] CLOSE_SHORT_FAIL | id={pos.get('id')} err={e}")
@@ -525,13 +558,20 @@ class FuturesEngine:
         if not open_shorts:
             return
 
-        bear_shorts  = [p for p in open_shorts if not int(p.get("is_dca_hedge", 0) or 0)]
+        bear_shorts  = [p for p in open_shorts if not int(p.get("is_dca_hedge", 0) or 0)
+                        and not int(p.get("is_independent_short", 0) or 0)]
         hedge_shorts = [p for p in open_shorts if int(p.get("is_dca_hedge", 0) or 0)]
+        indep_shorts = [p for p in open_shorts if int(p.get("is_independent_short", 0) or 0)]
 
         if hedge_shorts:
             logger.info(
                 f"[FUTURES] CLOSE_ALL | skipping {len(hedge_shorts)} DCA hedge SHORT(s) "
                 f"— they close via TP or close_dca_hedge_for_position()"
+            )
+        if indep_shorts:
+            logger.info(
+                f"[FUTURES] CLOSE_ALL | skipping {len(indep_shorts)} independent SHORT(s) "
+                f"— they close via own TP/FC lifecycle"
             )
 
         for pos in bear_shorts:
@@ -565,6 +605,7 @@ class FuturesEngine:
             symbol    = str(pos.get("symbol", ""))
             tp_price  = float(pos.get("tp_price", 0.0))
             is_hedge  = int(pos.get("is_dca_hedge", 0) or 0)
+            is_indep  = int(pos.get("is_independent_short", 0) or 0)
 
             current_price = self._fetch_price(symbol)
             if current_price <= 0:
@@ -588,11 +629,19 @@ class FuturesEngine:
                 self._close_short(pos, reason="TP")
                 continue
 
-            # ── FIX-S3: Force Close (hedge SHORT-ებზე) ──────
-            if not is_hedge:
+            # ── FIX-S3: Force Close ──────────────────────────
+            # hedge SHORTs: FUTURES_DCA_FC_* params
+            # independent SHORTs: SHORT_FC_* params
+            if not is_hedge and not is_indep:
                 continue  # BEAR SHORT — FC არ ვრთავთ (TP-ს ელოდება)
 
-            fc_reason = self._check_hedge_force_close(pos, current_price, avg_entry)
+            if is_indep:
+                # INDEPENDENT SHORT — საკუთარი FC params
+                fc_reason = self._check_independent_short_fc(pos, current_price, avg_entry)
+            else:
+                # DCA HEDGE SHORT — hedge FC params
+                fc_reason = self._check_hedge_force_close(pos, current_price, avg_entry)
+
             if fc_reason:
                 logger.warning(
                     f"[FUTURES] HEDGE_FC | {symbol} reason={fc_reason} "
@@ -603,8 +652,9 @@ class FuturesEngine:
                 try:
                     from execution.telegram_notifier import send_telegram_message
                     pnl_approx = round((avg_entry - current_price) * float(pos.get("qty", 0.0)), 4)
+                    fc_type = "INDEPENDENT SHORT" if is_indep else "HEDGE SHORT"
                     send_telegram_message(
-                        f"⛔ <b>HEDGE SHORT FORCE CLOSE</b>\n\n"
+                        f"⛔ <b>{fc_type} FORCE CLOSE</b>\n\n"
                         f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
                         f"📋 <b>Reason:</b> <code>{fc_reason}</code>\n"
                         f"💰 <b>avg_entry:</b> <code>{avg_entry:.2f}</code>\n"
@@ -1253,6 +1303,381 @@ class FuturesEngine:
                 f"sym={pos.get('symbol')} hedge_id={pos.get('id')} reason={reason}"
             )
             self._close_short(pos, reason=reason)
+
+    # ────────────────────────────────────────────────────────
+    # INTERNAL: _check_independent_short_fc
+    # ────────────────────────────────────────────────────────
+    def _check_independent_short_fc(
+        self,
+        pos: Dict[str, Any],
+        current_price: float,
+        avg_entry: float,
+    ) -> Optional[str]:
+        """
+        FC check for independent SHORT DCA positions.
+        SHORT-ისთვის ზევით მოძრაობა = ზარალი.
+        FC by time: SHORT_FC_MAX_DAYS
+        FC by drawdown: (current - avg) / avg >= SHORT_FC_DRAWDOWN_PCT%
+        """
+        if self.short_fc_max_days > 0:
+            opened_at_str = str(pos.get("opened_at", "") or "")
+            if opened_at_str:
+                try:
+                    opened_dt = datetime.fromisoformat(opened_at_str.replace("Z", "+00:00"))
+                    if opened_dt.tzinfo is None:
+                        opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                    days_open = (datetime.now(timezone.utc) - opened_dt).total_seconds() / 86400.0
+                    if days_open >= self.short_fc_max_days:
+                        return f"MAX_DAYS_{days_open:.1f}d>={self.short_fc_max_days:.0f}d"
+                except Exception as _e:
+                    logger.warning(f"[SHORT_DCA] FC_TIME_PARSE_FAIL | err={_e}")
+
+        if self.short_fc_drawdown_pct > 0 and avg_entry > 0:
+            upside_pct = (current_price - avg_entry) / avg_entry * 100.0
+            if upside_pct >= self.short_fc_drawdown_pct:
+                return f"DRAWDOWN_{upside_pct:.2f}%>={self.short_fc_drawdown_pct:.1f}%"
+
+        return None
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: open_independent_short
+    # LONG L1 გახსნის შემდეგ — price-level trigger-ზე SHORT
+    # ────────────────────────────────────────────────────────
+    def open_independent_short(
+        self,
+        symbol: str,
+        long_entry_price: float,
+    ) -> bool:
+        """
+        Independent SHORT DCA — LONG L1-ის გახსნის შემდეგ გამოიძახება.
+
+        trigger: current_price <= long_entry_price * (1 - SHORT_L1_TRIGGER_PCT%)
+        SHORT L1 opens at: long_entry_price * 0.984  (-1.6%)
+
+        ეს არ არის hedge — LONG-ის სიცოცხლეს არ მიყვება.
+        საკუთარი TP + FC lifecycle.
+
+        edge cases:
+          - SHORT_DCA_ENABLED=false → skip
+          - already open for this symbol → skip (duplicate guard)
+          - current_price > trigger → skip (not yet)
+          - long_entry_price=0 → skip (invalid)
+        """
+        if not self.enabled or not self.short_dca_enabled:
+            return False
+
+        if long_entry_price <= 0:
+            return False
+
+        # duplicate guard — symbol-ზე უკვე ღია independent SHORT?
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT id FROM futures_positions "
+                    "WHERE symbol=? AND is_independent_short=1 AND status='OPEN'",
+                    (symbol,)
+                ).fetchone()
+                if row:
+                    logger.debug(f"[SHORT_DCA] ALREADY_OPEN | {symbol} → skip")
+                    return False
+        except Exception as e:
+            logger.warning(f"[SHORT_DCA] CHECK_FAIL | {symbol} err={e}")
+            return False
+
+        # price check — trigger not yet reached?
+        current_price = self._fetch_price(symbol)
+        if current_price <= 0:
+            return False
+
+        trigger_price = round(long_entry_price * (1.0 - self.short_l1_trigger_pct / 100.0), 6)
+        if current_price > trigger_price:
+            logger.debug(
+                f"[SHORT_DCA] TRIGGER_WAIT | {symbol} "
+                f"price={current_price:.2f} trigger={trigger_price:.2f} "
+                f"(LONG={long_entry_price:.2f} -{self.short_l1_trigger_pct:.1f}%)"
+            )
+            return False
+
+        # balance check — same pattern as hedge
+        short_quote = self.short_addon_quote  # L1 = same size as ADD-ON ($25)
+        try:
+            from execution.dca_risk_manager import get_risk_manager as _rm
+            bal_ok, bal_reason = _rm().can_l3_operation(short_quote)
+            if not bal_ok:
+                logger.warning(f"[SHORT_DCA] BALANCE_BLOCK | {symbol} reason={bal_reason}")
+                return False
+        except Exception as e:
+            logger.warning(f"[SHORT_DCA] BALANCE_CHECK_FAIL | {symbol} err={e} → blocking (safe)")
+            return False
+
+        # TP = entry * (1 - short_tp_pct%)
+        tp_price = round(current_price * (1.0 - self.short_tp_pct / 100.0), 6)
+        qty      = round((short_quote * self.leverage) / current_price, 6)
+        sig_id   = f"SINDEP-{symbol.replace('/', '')}-{uuid.uuid4().hex[:8]}"
+
+        try:
+            from execution.db.db import get_connection
+            now = datetime.now(timezone.utc).isoformat()
+            with get_connection() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO futures_positions
+                      (signal_id, symbol, direction, entry_price, qty, quote_in,
+                       leverage, tp_price, sl_price, status, opened_at, mode,
+                       is_dca_hedge, dca_pos_id, avg_entry_price,
+                       is_independent_short, long_ref_price)
+                    VALUES (?, ?, 'SHORT', ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (sig_id, symbol, current_price, qty, short_quote,
+                     self.leverage, tp_price, 0.0, now, self.mode,
+                     0, 0, current_price,
+                     1, long_entry_price)
+                )
+                conn.commit()
+                pos_id = cur.lastrowid
+        except Exception as e:
+            logger.error(f"[SHORT_DCA] OPEN_DB_FAIL | {symbol} err={e}")
+            return False
+
+        logger.warning(
+            f"[SHORT_DCA] SHORT_OPENED | {symbol} "
+            f"entry={current_price:.4f} tp={tp_price:.4f} "
+            f"long_ref={long_entry_price:.4f} trigger={trigger_price:.4f} "
+            f"qty={qty:.6f} quote={short_quote} pos_id={pos_id}"
+        )
+
+        try:
+            from execution.telegram_notifier import send_telegram_message
+            send_telegram_message(
+                f"📉 <b>SHORT DCA გახსნა</b>\n\n"
+                f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                f"💰 <b>Entry:</b> <code>{current_price:.2f}</code> "
+                f"(<code>-{self.short_l1_trigger_pct:.1f}%</code> from LONG)\n"
+                f"🎯 <b>TP:</b> <code>{tp_price:.2f}</code> "
+                f"(<code>-{self.short_tp_pct:.1f}%</code>)\n"
+                f"📊 <b>ADD-ON triggers:</b> <code>{self.short_addon_trigger_pcts}</code> (ქვევით)\n"
+                f"💼 <b>Quote:</b> <code>${short_quote:.0f}</code> "
+                f"<code>×{self.leverage}</code>\n"
+                f"🔗 <b>LONG ref:</b> <code>{long_entry_price:.2f}</code>\n"
+                f"🕒 <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+            )
+        except Exception as _tg:
+            logger.warning(f"[SHORT_DCA] TG_FAIL | err={_tg}")
+
+        try:
+            from execution.db.repository import log_event
+            log_event("SHORT_DCA_OPENED",
+                f"sym={symbol} entry={current_price:.4f} "
+                f"tp={tp_price:.4f} long_ref={long_entry_price:.4f} "
+                f"quote={short_quote} pos_id={pos_id}"
+            )
+        except Exception:
+            pass
+
+        return True
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: check_independent_short_open
+    # ყოველ loop-ზე — ყველა LONG position-ზე SHORT trigger check
+    # ────────────────────────────────────────────────────────
+    def check_independent_short_open(self) -> None:
+        """
+        ყოველ main loop iteration-ზე გამოიძახება.
+        ყოველ ღია LONG DCA position-ზე შეამოწმებს:
+          - SHORT უკვე ღიაა? → skip
+          - current_price <= long_entry * (1 - 1.6%)? → open_independent_short()
+
+        edge cases:
+          - SHORT_DCA_ENABLED=false → skip
+          - LONG position-ი არ არის → skip (nothing to mirror)
+          - per-symbol: 1 SHORT max (duplicate guard in open_independent_short)
+        """
+        if not self.enabled or not self.short_dca_enabled:
+            return
+
+        try:
+            from execution.db.repository import get_all_open_dca_positions
+            long_positions = get_all_open_dca_positions()
+        except Exception as e:
+            logger.warning(f"[SHORT_DCA] LONG_FETCH_FAIL | err={e}")
+            return
+
+        if not long_positions:
+            return
+
+        import re as _re_sym
+        for pos in long_positions:
+            try:
+                sym = str(pos.get("symbol", ""))
+                # base symbol only (no _L2/_L3 suffix)
+                exchange_sym = _re_sym.sub(r'_L\d+$', '', sym)
+                long_entry = float(pos.get("initial_entry_price") or pos.get("avg_entry_price") or 0.0)
+                if long_entry <= 0:
+                    continue
+                self.open_independent_short(exchange_sym, long_entry)
+            except Exception as e:
+                logger.warning(f"[SHORT_DCA] OPEN_CHECK_ERR | {pos.get('symbol')} err={e}")
+
+    # ────────────────────────────────────────────────────────
+    # PUBLIC: check_independent_short_addons
+    # ვარდნაზე ADD-ONs — LONG ADD-ON-ების სარკე
+    # ────────────────────────────────────────────────────────
+    def check_independent_short_addons(self) -> None:
+        """
+        ყოველ loop-ზე — ღია independent SHORT-ებზე ADD-ON შემოწმება.
+
+        trigger: current_price <= entry_price * (1 - addon_trigger_pcts[add_on_count])
+        trigger reference: entry_price (SHORT L1 original entry — ფიქსირებული)
+
+        ADD-ON direction: ვარდნაზე (ქვევით) — LONG-ის სარკე
+          SHORT A1: entry * (1 - 1.0%) = -1.0% from SHORT L1
+          SHORT A2: entry * (1 - 2.2%) = -2.2% from SHORT L1
+          SHORT A3: entry * (1 - 3.5%) = -3.5% from SHORT L1
+
+        avg update: weighted average (avg drops as we add lower)
+        TP update: new_avg * (1 - short_tp_pct%) — TP ახლოვდება bounce-ზე
+
+        edge cases:
+          - add_on_count >= max_addons → exhausted, skip
+          - add_on_count >= len(triggers) → no trigger defined, skip
+          - current_price > trigger → not yet, skip
+          - per-position cooldown 300s spam guard
+        """
+        if not self.enabled or not self.short_dca_enabled:
+            return
+
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                cur = conn.execute(
+                    "SELECT * FROM futures_positions "
+                    "WHERE status='OPEN' AND is_independent_short=1"
+                )
+                cols = [d[0] for d in cur.description]
+                indep_shorts = [dict(zip(cols, r)) for r in cur.fetchall()]
+        except Exception as e:
+            logger.warning(f"[SHORT_DCA] ADDON_FETCH_FAIL | err={e}")
+            return
+
+        for pos in indep_shorts:
+            try:
+                symbol       = str(pos.get("symbol", ""))
+                pos_id       = int(pos.get("id", 0))
+                entry_price  = float(pos.get("entry_price", 0.0))
+                add_on_count = int(pos.get("add_on_count", 0) or 0)
+                quote_in     = float(pos.get("quote_in", 0.0))
+                avg_entry    = float(pos.get("avg_entry_price", 0.0) or entry_price)
+
+                if entry_price <= 0:
+                    continue
+
+                if add_on_count >= self.short_max_addons:
+                    logger.debug(f"[SHORT_DCA] ADDON_EXHAUSTED | {symbol} {add_on_count}/{self.short_max_addons}")
+                    continue
+
+                if add_on_count >= len(self.short_addon_trigger_pcts):
+                    logger.warning(
+                        f"[SHORT_DCA] ADDON_NO_TRIGGER | {symbol} "
+                        f"add_on={add_on_count} triggers={len(self.short_addon_trigger_pcts)}"
+                    )
+                    continue
+
+                # per-position cooldown
+                last_ts = self._short_addon_cooldown_map.get(pos_id, 0.0)
+                if (time.time() - last_ts) < self._short_addon_cooldown_s:
+                    continue
+
+                current_price = self._fetch_price(symbol)
+                if current_price <= 0:
+                    continue
+
+                # trigger: ქვევით (SHORT ADD-ON on DROP)
+                trigger_pct   = self.short_addon_trigger_pcts[add_on_count]
+                trigger_price = entry_price * (1.0 - trigger_pct / 100.0)
+
+                if current_price > trigger_price:
+                    logger.debug(
+                        f"[SHORT_DCA] ADDON_WAIT | {symbol} level={add_on_count+1} "
+                        f"price={current_price:.2f} trigger={trigger_price:.2f} "
+                        f"(-{trigger_pct:.1f}% from entry={entry_price:.2f})"
+                    )
+                    continue
+
+                # balance check
+                try:
+                    from execution.dca_risk_manager import get_risk_manager as _rm
+                    bal_ok, bal_reason = _rm().can_l3_operation(self.short_addon_quote)
+                    if not bal_ok:
+                        logger.warning(f"[SHORT_DCA] ADDON_BALANCE_BLOCK | {symbol} reason={bal_reason}")
+                        continue
+                except Exception as _be:
+                    logger.warning(f"[SHORT_DCA] ADDON_BALANCE_FAIL | {symbol} err={_be} → skip")
+                    continue
+
+                # ADD-ON — weighted avg (ვარდნაზე avg ეცემა)
+                total_quote = quote_in + self.short_addon_quote
+                new_avg     = (avg_entry * quote_in + current_price * self.short_addon_quote) / total_quote
+                new_tp      = round(new_avg * (1.0 - self.short_tp_pct / 100.0), 6)
+                new_qty     = round((total_quote * self.leverage) / new_avg, 6)
+
+                logger.warning(
+                    f"[SHORT_DCA] ADDON | {symbol} level={add_on_count+1} "
+                    f"trigger=-{trigger_pct:.1f}% "
+                    f"entry={entry_price:.2f} current={current_price:.2f} "
+                    f"avg={avg_entry:.2f}→{new_avg:.2f} tp={new_tp:.2f}"
+                )
+
+                from execution.db.db import get_connection
+                with get_connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE futures_positions SET
+                            add_on_count=?, add_on_quote=?, avg_entry_price=?,
+                            tp_price=?, qty=?, quote_in=?
+                        WHERE id=?
+                        """,
+                        (add_on_count + 1, self.short_addon_quote,
+                         round(new_avg, 6), new_tp, new_qty, total_quote, pos_id)
+                    )
+                    conn.commit()
+
+                self._short_addon_cooldown_map[pos_id] = time.time()
+
+                try:
+                    from execution.telegram_notifier import send_telegram_message
+                    next_t = (
+                        f"-{self.short_addon_trigger_pcts[add_on_count+1]:.1f}%"
+                        if (add_on_count + 1) < len(self.short_addon_trigger_pcts)
+                        else "MAX (FC/TP)"
+                    )
+                    send_telegram_message(
+                        f"➕ <b>SHORT DCA ADD-ON #{add_on_count+1}</b>\n\n"
+                        f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                        f"📉 <b>Drop:</b> <code>-{trigger_pct:.1f}%</code> "
+                        f"from entry <code>{entry_price:.2f}</code>\n"
+                        f"💰 <b>ADD-ON @ </b><code>{current_price:.2f}</code>\n"
+                        f"📊 <b>avg_short:</b> <code>{avg_entry:.2f} → {new_avg:.2f}</code> ↓\n"
+                        f"🎯 <b>new TP:</b> <code>{new_tp:.2f}</code>\n"
+                        f"⏭ <b>Next trigger:</b> <code>{next_t}</code>\n"
+                        f"🕒 <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                    )
+                except Exception as _tg:
+                    logger.warning(f"[SHORT_DCA] ADDON_TG_FAIL | err={_tg}")
+
+                try:
+                    from execution.db.repository import log_event
+                    log_event("SHORT_DCA_ADDON",
+                        f"sym={symbol} level={add_on_count+1} "
+                        f"trigger=-{trigger_pct:.1f}% "
+                        f"addon_price={current_price:.4f} "
+                        f"new_avg={new_avg:.4f} new_tp={new_tp:.4f}"
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                logger.error(f"[SHORT_DCA] ADDON_ERR | {pos.get('symbol')} err={e}")
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: get_summary
