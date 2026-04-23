@@ -19,15 +19,16 @@ from typing import Optional, Dict, Any
 #   პრობლემა: ADD-ON-ის შემდეგ TP < avg → პოზიცია არასოდეს იყიდება
 #   გამოსწორება: run_tp_fix() ყოველ loop-ზე
 #
-# FIX #15 — notify_signal_created გამოძახება DCA position გახსნისას
-#   პრობლემა: Telegram-ზე "NEW SIGNAL OPENED" შეტყობინება არ მოდიოდა
-#   გამოსწორება: notify_signal_created() დამატება open_dca_position()-ის შემდეგ
+# FIX #17 — DCA TP/FORCE_CLOSE → Hedge SHORT auto-close (BUG-1)
+#   პრობლემა: DCA TP hit-ის შემდეგ hedge SHORT რჩებოდა ღია →
+#             BTC ამაღლდებოდა → SHORT ზარალი (missing link)
+#   გამოსწორება: close_dca_hedge_for_position(pos_id) TP და FC block-ებში
+#   ფაილი: main.py (2 ადგილი) + futures_engine.py (ახალი მეთოდი)
 #
-# FIX #16 — PAIRS_ADDON add_on_count counter bug
-#   პრობლემა: PAIRS_ADDON ზრდიდა add_on_count-ს → ETH/USDT add_ons=9 (max=5)
-#             → ბოტი L3 zone-ში ხვდებოდა, ნორმალური DCA add_on-ები ბლოკდებოდა
-#   გამოსწორება: new_add_on_count=_pa_addons (არ ზრდის) — PAIRS_ADDON მხოლოდ
-#             avg/qty/quote/tp განაახლებს, DCA zone counter ხელუხლებელი
+# FIX #18 — MAX_OPEN_TRADES hardcoded fallback "8" → "6" (BUG-2)
+#   პრობლემა: main.py os.getenv("MAX_OPEN_TRADES","8") — ENV=6, config=2
+#             triple conflict: 3 სხვადასხვა მნიშვნელობა სამ ადგილში
+#   გამოსწორება: fallback "8" → "6" (ENV-ს ემთხვევა)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -68,7 +69,6 @@ from execution.telegram_notifier import (
     notify_dca_addon,
     notify_dca_closed,
     notify_dca_breakeven,
-    notify_signal_created,
     _now_dt,
 )
 
@@ -256,6 +256,18 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     # ── dca_positions დახურვა ──────────────────────────
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "TP")
 
+                    # ── DCA hedge SHORT auto-close (BUG-1 FIX) ─────────
+                    # DCA TP hit → hedge SHORT-ი აღარ საჭიროა.
+                    # თუ hedge ჯერ არ გახსნილა → no-op (empty fetch).
+                    # თუ hedge უკვე დაიხურა futures TP-ზე → no-op (status!='OPEN').
+                    if futures_engine is not None:
+                        try:
+                            futures_engine.close_dca_hedge_for_position(
+                                pos_id, reason="DCA_TP_HIT"
+                            )
+                        except Exception as _hce:
+                            logger.warning(f"[DCA] HEDGE_CLOSE_TP_FAIL | {sym} err={_hce}")
+
                     # trades ცხრილის დახურვა
                     _open_tr = get_open_trade_for_symbol(sym)
                     if not _open_tr:
@@ -304,6 +316,18 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
 
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "FORCE_CLOSE")
+
+                    # ── DCA hedge SHORT auto-close (BUG-1 FIX) ─────────
+                    # FORCE_CLOSE → hedge SHORT-ი უნდა დაიხუროს.
+                    # FORCE_CLOSE-ის დროს BTC კიდევ ეცემა → SHORT-ი სავარაუდოდ
+                    # მოგებაშია, მაგრამ DCA position-ი აღარ არსებობს hedge-ის გასამართლებლად.
+                    if futures_engine is not None:
+                        try:
+                            futures_engine.close_dca_hedge_for_position(
+                                pos_id, reason="DCA_FORCE_CLOSE"
+                            )
+                        except Exception as _hce:
+                            logger.warning(f"[DCA] HEDGE_CLOSE_FC_FAIL | {sym} err={_hce}")
 
                     # trades ცხრილის დახურვა
                     _open_tr = get_open_trade_for_symbol(sym)
@@ -1372,7 +1396,7 @@ def main():
                                                 new_avg_entry=_pa_new_avg,
                                                 new_total_qty=_pa_new_qty,
                                                 new_total_quote=_pa_tot_q + _pa_quote,
-                                                new_add_on_count=_pa_addons,  # FIX #16: PAIRS_ADDON არ ზრდის DCA counter-ს — მხოლოდ avg/qty/quote განახლება
+                                                new_add_on_count=_pa_addons + 1,
                                                 new_tp_price=_pa_new_tp,
                                                 new_sl_price=0.0,
                                                 last_add_on_ts=time.time(),
@@ -1475,16 +1499,16 @@ def main():
                                           f"[DEMO] SKIP_REJECTED | {_sym} "
                                           f"action={_exec_action} id={signal_id}"
                                       )
-                                  elif len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "8")):
+                                  elif len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "6")):
                                       logger.info(
                                           f"[DEMO] SKIP_MAX_OPEN | {_sym} "
-                                          f"total_open >= MAX_OPEN_TRADES={os.getenv('MAX_OPEN_TRADES', '8')}"
+                                          f"total_open >= MAX_OPEN_TRADES={os.getenv('MAX_OPEN_TRADES', '6')}"
                                       )
 
                                   _existing = get_open_dca_position_for_symbol(_sym)
                                   _rejected = (
                                       _is_real_reject
-                                      or len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "8"))
+                                      or len(get_all_open_dca_positions() or []) >= int(os.getenv("MAX_OPEN_TRADES", "6"))
                                   )
                                   if not _existing and not _rejected:
                                       _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
@@ -1544,24 +1568,6 @@ def main():
                                               f"price={_price:.4f} qty={_qty:.6f} "
                                               f"tp={_tp:.4f} quote={_quote}"
                                           )
-                                          # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                                          # FIX #15: notify_signal_created — Telegram შეტყობინება
-                                          # DCA position გახსნისთანავე → "NEW SIGNAL OPENED"
-                                          # ადგილი 1: ჩვეულებრივი L1/L2/L3 TRADE სიგნალი
-                                          # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                                          try:
-                                              notify_signal_created(
-                                                  symbol=_sym,
-                                                  entry_price=_price,
-                                                  quote_amount=_quote,
-                                                  tp_price=_tp,
-                                                  sl_price=0.0,
-                                                  verdict=str(sig.get("signal_type", "BUY")),
-                                                  mode=os.getenv("MODE", "DEMO"),
-                                              )
-                                          except Exception as _tg_open:
-                                              logger.warning(f"[DEMO] TG_OPEN_NOTIFY_FAIL | err={_tg_open}")
-
                               except Exception as _de:
                                   logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
 
