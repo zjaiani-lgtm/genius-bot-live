@@ -1566,7 +1566,7 @@ class ExecutionEngine:
         #   DCA ბოტი ყველა symbol-ს ახსნის L1-ზე, შემდეგ add-on-ებით მართავს.
         #   Refill = ახალი L1 — ეს signal_generator-ის პასუხისმგებლობაა.
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-        _max_open = int(os.getenv("MAX_OPEN_TRADES", "3"))
+        _max_open = int(os.getenv("MAX_OPEN_TRADES", "6"))
         _dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
         if _max_open > 0:
             try:
