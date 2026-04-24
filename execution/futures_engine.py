@@ -244,6 +244,13 @@ def _ensure_addon_cols() -> None:
                 # FIX-S6: hedge TP tier — stored at open, ADD-ON recalc-ზე გამოიყენება
                 # DEFAULT 3.5 → ძველი rows backward compat (bear tier)
                 ("hedge_tp_pct",          "REAL DEFAULT 3.5"),   # TP% used at open (regime-based)
+                # GENIUS MIRROR ENGINE columns
+                ("is_mirror_engine",      "INTEGER DEFAULT 0"),   # 1 = MIRROR ENGINE position
+                ("mirror_direction",      "TEXT DEFAULT ''"),      # 'DOWN' or 'UP' — ADD-ON direction
+                ("mirror_addons_down",    "INTEGER DEFAULT 0"),   # ქვევით ADD-ON count
+                ("mirror_addons_up",      "INTEGER DEFAULT 0"),   # ზევით ADD-ON count
+                ("mirror_long_ref_price", "REAL DEFAULT 0.0"),    # LONG L1 entry reference
+                ("last_mirror_addon_ts",  "REAL DEFAULT 0.0"),    # cooldown timestamp
             ]
             for col, col_def in migrations:
                 if col not in cols:
@@ -354,6 +361,27 @@ class FuturesEngine:
         self._short_addon_cooldown_map: Dict[int, float] = {}
         self._short_addon_cooldown_s = 300  # 5 წუთი ADD-ON-ებს შორის
 
+        # ── GENIUS MIRROR ENGINE ──────────────────────────────
+        # bilateral DCA: L2/L3 midpoint-ზე იხსნება SHORT
+        # ADD-ONs ქვევით (ვარდნა): avg↓ TP↓ → bounce ნაკლები სჭირდება
+        # ADD-ONs ზევით (bounce):  avg↑ TP ახლოვდება
+        # TP:  avg × (1 - mirror_tp_pct%)  — 0.55% scalp
+        # FC:  drawdown only — time FC გაუქმებულია
+        self.mirror_enabled            = _eb("MIRROR_ENGINE_ENABLED",    False)
+        self.mirror_trigger_pct        = _ef("MIRROR_TRIGGER_PCT",        8.59)
+        self.mirror_l1_quote           = _ef("MIRROR_L1_QUOTE",           25.0)
+        self.mirror_addon_quote        = _ef("MIRROR_ADDON_QUOTE",        25.0)
+        self.mirror_leverage           = _ei("MIRROR_LEVERAGE",            2)
+        self.mirror_addon_trigger_pcts = _parse_list_float(
+            "MIRROR_ADDON_TRIGGER_PCTS", [1.0, 2.2, 3.5, 5.0, 6.5]
+        )
+        self.mirror_max_addons_down    = _ei("MIRROR_MAX_ADDONS_DOWN",    5)
+        self.mirror_max_addons_up      = _ei("MIRROR_MAX_ADDONS_UP",      5)
+        self.mirror_tp_pct             = _ef("MIRROR_TP_PCT",             0.55)
+        self.mirror_fc_drawdown_pct    = _ef("MIRROR_FC_DRAWDOWN_PCT",   15.0)
+        self._mirror_addon_cooldown_map: Dict[int, float] = {}
+        self._mirror_addon_cooldown_s  = _ei("MIRROR_ADDON_COOLDOWN_S",  300)
+
         # DB init
         _init_futures_table()
         _ensure_exit_price_col()
@@ -384,6 +412,19 @@ class FuturesEngine:
             f"tp={self.short_tp_pct}% "
             f"fc_days={self.short_fc_max_days}d "
             f"fc_drawdown={self.short_fc_drawdown_pct}%"
+        )
+        logger.info(
+            f"[MIRROR_ENGINE] GENIUS MIRROR ENGINE | "
+            f"enabled={self.mirror_enabled} "
+            f"trigger={self.mirror_trigger_pct}% from LONG L1 | "
+            f"l1_quote={self.mirror_l1_quote} lev={self.mirror_leverage}x | "
+            f"addon_triggers={self.mirror_addon_trigger_pcts} "
+            f"addon_quote={self.mirror_addon_quote} | "
+            f"max_down={self.mirror_max_addons_down} "
+            f"max_up={self.mirror_max_addons_up} | "
+            f"tp={self.mirror_tp_pct}% "
+            f"fc_drawdown={self.mirror_fc_drawdown_pct}% "
+            f"fc_time=DISABLED"
         )
 
     def _fetch_price(self, symbol: str) -> float:
@@ -1782,6 +1823,481 @@ class FuturesEngine:
             "total_quote": total_quote,
             "symbols":     [p.get("symbol") for p in open_shorts],
         }
+
+
+    # ════════════════════════════════════════════════════════════
+    # GENIUS MIRROR ENGINE — PUBLIC API
+    # ════════════════════════════════════════════════════════════
+
+    def open_mirror_short(
+        self,
+        symbol: str,
+        long_l1_price: float,
+        long_pos_id: int,
+    ) -> bool:
+        """
+        GENIUS MIRROR ENGINE — SHORT გახსნა L2/L3 midpoint-ზე.
+
+        trigger: current_price <= long_l1_price × (1 - mirror_trigger_pct%)
+        entry:   ≈ -8.59% LONG L1-დან (ADD-ON#4 და #5 შუა)
+
+        DB flags:
+          is_mirror_engine=1
+          mirror_direction='DOWN'   ← ველოდები ვარდნის გაგრძელებას
+          mirror_long_ref_price=long_l1_price
+        """
+        if not self.enabled or not self.mirror_enabled:
+            return False
+
+        # duplicate guard — 1 MIRROR position per symbol
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM futures_positions "
+                    "WHERE symbol=? AND is_mirror_engine=1 AND status='OPEN'",
+                    (symbol,)
+                ).fetchone()
+                if row and row[0] > 0:
+                    logger.debug(f"[MIRROR] SKIP_DUP | {symbol} already open")
+                    return False
+        except Exception as e:
+            logger.warning(f"[MIRROR] DUP_CHECK_FAIL | {symbol} err={e}")
+            return False
+
+        current_price = self._fetch_price(symbol)
+        if current_price <= 0:
+            return False
+
+        trigger_price = long_l1_price * (1.0 - self.mirror_trigger_pct / 100.0)
+        if current_price > trigger_price:
+            logger.debug(
+                f"[MIRROR] WAIT | {symbol} price={current_price:.2f} "
+                f"trigger={trigger_price:.2f} "
+                f"(-{self.mirror_trigger_pct:.2f}% from L1={long_l1_price:.2f})"
+            )
+            return False
+
+        qty      = round((self.mirror_l1_quote * self.mirror_leverage) / current_price, 6)
+        tp_price = round(current_price * (1.0 - self.mirror_tp_pct / 100.0), 6)
+        sig_id   = f"MIRROR_{uuid.uuid4().hex[:10].upper()}"
+
+        try:
+            from execution.db.db import get_connection
+            now = datetime.now(timezone.utc).isoformat()
+            with get_connection() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO futures_positions
+                      (signal_id, symbol, direction, entry_price, qty,
+                       quote_in, leverage, tp_price, sl_price, status,
+                       opened_at, mode, is_mirror_engine, mirror_direction,
+                       mirror_addons_down, mirror_addons_up,
+                       mirror_long_ref_price, avg_entry_price,
+                       last_mirror_addon_ts)
+                    VALUES (?,?,  'SHORT', ?,?,   ?,?,?,0,'OPEN', ?,?,1,  'DOWN',  0,0,  ?,?,  0)
+                    """,
+                    (sig_id, symbol, current_price, qty,
+                     self.mirror_l1_quote, self.mirror_leverage,
+                     tp_price, now, self.mode,
+                     long_l1_price, current_price)
+                )
+                conn.commit()
+                pos_id = cur.lastrowid
+
+            logger.warning(
+                f"[MIRROR] OPENED | {symbol} @ {current_price:.4f} "
+                f"qty={qty:.6f} tp={tp_price:.4f} "
+                f"(-{self.mirror_trigger_pct:.2f}% from L1={long_l1_price:.2f}) "
+                f"pos_id={pos_id}"
+            )
+
+            try:
+                from execution.telegram_notifier import send_telegram_message
+                send_telegram_message(
+                    f"🪞 <b>GENIUS MIRROR ENGINE</b>\n\n"
+                    f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                    f"📉 <b>Entry:</b> <code>{current_price:.2f}</code> "
+                    f"(<code>-{self.mirror_trigger_pct:.2f}%</code> from L1)\n"
+                    f"🎯 <b>TP:</b> <code>{tp_price:.2f}</code> "
+                    f"(<code>-{self.mirror_tp_pct:.2f}%</code>)\n"
+                    f"📊 <b>Direction:</b> DOWN (ვარდნაზე ADD-ONs)\n"
+                    f"💰 <b>Quote:</b> <code>${self.mirror_l1_quote}</code> "
+                    f"lev=<code>{self.mirror_leverage}x</code>\n"
+                    f"🔗 <b>LONG L1 ref:</b> <code>{long_l1_price:.2f}</code>"
+                )
+            except Exception as _tg:
+                logger.warning(f"[MIRROR] TG_FAIL | err={_tg}")
+
+            return True
+
+        except Exception as e:
+            logger.error(f"[MIRROR] OPEN_FAIL | {symbol} err={e}")
+            return False
+
+    def check_mirror_addons(self) -> None:
+        """
+        GENIUS MIRROR ENGINE — ADD-ON check ყოველ 120s-ზე.
+
+        direction=DOWN: BTC კვლავ ეცემა → ADD-ON ქვევით
+          trigger: entry_price × (1 - trigger_pcts[n]%)
+          avg ↓ → TP ↓ → bounce ნაკლები სჭირდება
+
+        direction=UP: BTC bounce-ს იწყებს → ADD-ON ზევით
+          trigger: entry_price × (1 + trigger_pcts[n]%)
+          avg_short ↑ → TP ახლოვდება
+
+        direction switch:
+          DOWN→UP: BTC TP-ს გადასცდა ქვევით (bounce დაიწყო)
+          UP→DOWN: BTC კვლავ ეცემა bounce-ის შემდეგ
+        """
+        if not self.enabled or not self.mirror_enabled:
+            return
+
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                positions = conn.execute(
+                    "SELECT * FROM futures_positions "
+                    "WHERE is_mirror_engine=1 AND status='OPEN'",
+                ).fetchall()
+                cols = [d[0] for d in conn.execute(
+                    "SELECT * FROM futures_positions LIMIT 0"
+                ).description]
+        except Exception as e:
+            logger.warning(f"[MIRROR] ADDON_FETCH_FAIL | err={e}")
+            return
+
+        for row in positions:
+            pos = dict(zip(cols, row))
+            symbol        = pos["symbol"]
+            pos_id        = pos["id"]
+            entry_price   = float(pos["entry_price"]    or 0)
+            avg_entry     = float(pos["avg_entry_price"] or entry_price)
+            qty           = float(pos["qty"]             or 0)
+            quote_in      = float(pos["quote_in"]        or 0)
+            direction     = str(pos.get("mirror_direction") or "DOWN")
+            addons_down   = int(pos.get("mirror_addons_down") or 0)
+            addons_up     = int(pos.get("mirror_addons_up")   or 0)
+            last_addon_ts = float(pos.get("last_mirror_addon_ts") or 0)
+
+            # cooldown check
+            now_ts = time.time()
+            if now_ts - last_addon_ts < self._mirror_addon_cooldown_s:
+                continue
+
+            current_price = self._fetch_price(symbol)
+            if current_price <= 0:
+                continue
+
+            # ── direction=DOWN: ADD-ON ქვევით ──────────────────
+            if direction == "DOWN":
+                if addons_down >= self.mirror_max_addons_down:
+                    # max DOWN ADD-ONs ამოიწურა →
+                    # TP-ს ვერ ვჭრით ქვევით → direction UP-ზე გადავდივართ
+                    logger.info(
+                        f"[MIRROR] DOWN_EXHAUSTED | {symbol} "
+                        f"addons_down={addons_down}/{self.mirror_max_addons_down} "
+                        f"→ switching to UP mode"
+                    )
+                    try:
+                        from execution.db.db import get_connection
+                        with get_connection() as conn:
+                            conn.execute(
+                                "UPDATE futures_positions "
+                                "SET mirror_direction='UP' WHERE id=?",
+                                (pos_id,)
+                            )
+                            conn.commit()
+                    except Exception as e:
+                        logger.warning(f"[MIRROR] DIR_SWITCH_FAIL | err={e}")
+                    continue
+
+                trigger_pct   = self.mirror_addon_trigger_pcts[addons_down]
+                trigger_price = entry_price * (1.0 - trigger_pct / 100.0)
+
+                if current_price > trigger_price:
+                    logger.debug(
+                        f"[MIRROR] DOWN_WAIT | {symbol} level={addons_down+1} "
+                        f"price={current_price:.2f} trigger={trigger_price:.2f} "
+                        f"(-{trigger_pct:.1f}%)"
+                    )
+                    continue
+
+                # ADD-ON ქვევით
+                addon_qty  = round(
+                    (self.mirror_addon_quote * self.mirror_leverage) / current_price, 6
+                )
+                new_qty    = qty + addon_qty
+                new_quote  = quote_in + self.mirror_addon_quote
+                new_avg    = round(
+                    (avg_entry * qty + current_price * addon_qty) / new_qty, 6
+                )
+                new_tp     = round(new_avg * (1.0 - self.mirror_tp_pct / 100.0), 6)
+
+                try:
+                    from execution.db.db import get_connection
+                    with get_connection() as conn:
+                        conn.execute(
+                            """UPDATE futures_positions SET
+                               qty=?, quote_in=?, avg_entry_price=?,
+                               tp_price=?, mirror_addons_down=?,
+                               last_mirror_addon_ts=?
+                               WHERE id=?""",
+                            (new_qty, new_quote, new_avg,
+                             new_tp, addons_down + 1,
+                             now_ts, pos_id)
+                        )
+                        conn.commit()
+
+                    logger.warning(
+                        f"[MIRROR] ADDON_DOWN | {symbol} #{addons_down+1} "
+                        f"@ {current_price:.2f} (-{trigger_pct:.1f}%) | "
+                        f"avg: {avg_entry:.2f}→{new_avg:.2f} tp={new_tp:.2f}"
+                    )
+
+                    try:
+                        from execution.telegram_notifier import send_telegram_message
+                        send_telegram_message(
+                            f"🪞 <b>MIRROR ADD-ON ↓</b>\n"
+                            f"🪙 <code>{symbol}</code> #{addons_down+1} "
+                            f"@ <code>{current_price:.2f}</code>\n"
+                            f"📊 avg: <code>{avg_entry:.2f}→{new_avg:.2f}</code>\n"
+                            f"🎯 TP: <code>{new_tp:.2f}</code>"
+                        )
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    logger.error(f"[MIRROR] ADDON_DOWN_FAIL | {symbol} err={e}")
+
+            # ── direction=UP: ADD-ON ზევით (bounce) ────────────
+            elif direction == "UP":
+                if addons_up >= self.mirror_max_addons_up:
+                    logger.info(
+                        f"[MIRROR] UP_EXHAUSTED | {symbol} "
+                        f"addons_up={addons_up}/{self.mirror_max_addons_up} "
+                        f"→ TP ლოდინი"
+                    )
+                    continue
+
+                trigger_pct   = self.mirror_addon_trigger_pcts[addons_up]
+                trigger_price = entry_price * (1.0 + trigger_pct / 100.0)
+
+                if current_price < trigger_price:
+                    logger.debug(
+                        f"[MIRROR] UP_WAIT | {symbol} level={addons_up+1} "
+                        f"price={current_price:.2f} trigger={trigger_price:.2f} "
+                        f"(+{trigger_pct:.1f}%)"
+                    )
+                    continue
+
+                # ADD-ON ზევით — SHORT avg ამაღლდება
+                addon_qty  = round(
+                    (self.mirror_addon_quote * self.mirror_leverage) / current_price, 6
+                )
+                new_qty    = qty + addon_qty
+                new_quote  = quote_in + self.mirror_addon_quote
+                new_avg    = round(
+                    (avg_entry * qty + current_price * addon_qty) / new_qty, 6
+                )
+                new_tp     = round(new_avg * (1.0 - self.mirror_tp_pct / 100.0), 6)
+
+                try:
+                    from execution.db.db import get_connection
+                    with get_connection() as conn:
+                        conn.execute(
+                            """UPDATE futures_positions SET
+                               qty=?, quote_in=?, avg_entry_price=?,
+                               tp_price=?, mirror_addons_up=?,
+                               last_mirror_addon_ts=?
+                               WHERE id=?""",
+                            (new_qty, new_quote, new_avg,
+                             new_tp, addons_up + 1,
+                             now_ts, pos_id)
+                        )
+                        conn.commit()
+
+                    logger.warning(
+                        f"[MIRROR] ADDON_UP | {symbol} #{addons_up+1} "
+                        f"@ {current_price:.2f} (+{trigger_pct:.1f}%) | "
+                        f"avg_short: {avg_entry:.2f}→{new_avg:.2f} tp={new_tp:.2f}"
+                    )
+
+                    try:
+                        from execution.telegram_notifier import send_telegram_message
+                        send_telegram_message(
+                            f"🪞 <b>MIRROR ADD-ON ↑</b>\n"
+                            f"🪙 <code>{symbol}</code> #{addons_up+1} "
+                            f"@ <code>{current_price:.2f}</code>\n"
+                            f"📊 avg_short: <code>{avg_entry:.2f}→{new_avg:.2f}</code>\n"
+                            f"🎯 TP: <code>{new_tp:.2f}</code>"
+                        )
+                    except Exception:
+                        pass
+
+                except Exception as e:
+                    logger.error(f"[MIRROR] ADDON_UP_FAIL | {symbol} err={e}")
+
+    def check_mirror_tp_sl(self) -> None:
+        """
+        GENIUS MIRROR ENGINE — TP + FC check ყოველ 120s-ზე.
+
+        TP:  current_price <= tp_price → CLOSE (SHORT მოგება)
+        FC:  (current_price - avg_entry) / avg_entry >= mirror_fc_drawdown_pct%
+             → CLOSE (BTC ზევით = SHORT ზარალი)
+        FC by time: გაუქმებულია — GENIUS MIRROR ENGINE design decision
+        """
+        if not self.enabled or not self.mirror_enabled:
+            return
+
+        try:
+            from execution.db.db import get_connection
+            with get_connection() as conn:
+                positions = conn.execute(
+                    "SELECT * FROM futures_positions "
+                    "WHERE is_mirror_engine=1 AND status='OPEN'"
+                ).fetchall()
+                cols = [d[0] for d in conn.execute(
+                    "SELECT * FROM futures_positions LIMIT 0"
+                ).description]
+        except Exception as e:
+            logger.warning(f"[MIRROR] TP_FETCH_FAIL | err={e}")
+            return
+
+        for row in positions:
+            pos       = dict(zip(cols, row))
+            symbol    = pos["symbol"]
+            pos_id    = pos["id"]
+            tp_price  = float(pos["tp_price"]        or 0)
+            avg_entry = float(pos["avg_entry_price"]  or 0)
+            qty       = float(pos["qty"]              or 0)
+            quote_in  = float(pos["quote_in"]         or 0)
+
+            current_price = self._fetch_price(symbol)
+            if current_price <= 0:
+                continue
+
+            # ── TP check ────────────────────────────────────────
+            if tp_price > 0 and current_price <= tp_price:
+                pnl = round((avg_entry - current_price) * qty * (1 - 0.001), 4)
+                pnl_pct = round((avg_entry - current_price) / avg_entry * 100, 4)
+                self._close_mirror(pos_id, symbol, current_price,
+                                   qty, quote_in, pnl, pnl_pct, "TP")
+                continue
+
+            # ── FC check (drawdown only — time გაუქმებულია) ────
+            if avg_entry > 0:
+                upside_pct = (current_price - avg_entry) / avg_entry * 100.0
+                if upside_pct >= self.mirror_fc_drawdown_pct:
+                    pnl = round((avg_entry - current_price) * qty * (1 - 0.001), 4)
+                    pnl_pct = round(-upside_pct, 4)
+                    logger.warning(
+                        f"[MIRROR] FC_DRAWDOWN | {symbol} "
+                        f"upside={upside_pct:.2f}% >= {self.mirror_fc_drawdown_pct}%"
+                    )
+                    self._close_mirror(pos_id, symbol, current_price,
+                                       qty, quote_in, pnl, pnl_pct, "FC_DRAWDOWN")
+
+    def _close_mirror(
+        self,
+        pos_id: int,
+        symbol: str,
+        exit_price: float,
+        qty: float,
+        quote_in: float,
+        pnl: float,
+        pnl_pct: float,
+        reason: str,
+    ) -> None:
+        """GENIUS MIRROR ENGINE position-ის დახურვა."""
+        try:
+            from execution.db.db import get_connection
+            now = datetime.now(timezone.utc).isoformat()
+            with get_connection() as conn:
+                conn.execute(
+                    """UPDATE futures_positions SET
+                       status='CLOSED', closed_at=?,
+                       exit_price=?, pnl_quote=?, pnl_pct=?,
+                       close_reason=?
+                       WHERE id=?""",
+                    (now, exit_price, pnl, pnl_pct, reason, pos_id)
+                )
+                conn.commit()
+
+            emoji = "✅" if pnl >= 0 else "❌"
+            logger.warning(
+                f"[MIRROR] CLOSED | {symbol} reason={reason} "
+                f"exit={exit_price:.4f} pnl={pnl:+.4f} ({pnl_pct:+.3f}%) {emoji}"
+            )
+
+            try:
+                from execution.db.repository import log_event
+                log_event(
+                    "MIRROR_CLOSED",
+                    f"sym={symbol} reason={reason} exit={exit_price:.4f} "
+                    f"pnl={pnl:+.4f} pct={pnl_pct:+.3f}%"
+                )
+            except Exception:
+                pass
+
+            try:
+                from execution.telegram_notifier import send_telegram_message
+                send_telegram_message(
+                    f"{emoji} <b>MIRROR ENGINE CLOSED</b>\n\n"
+                    f"🪙 <b>Symbol:</b> <code>{symbol}</code>\n"
+                    f"📤 <b>Exit:</b> <code>{exit_price:.2f}</code>\n"
+                    f"💰 <b>PnL:</b> <code>{pnl:+.4f} USDT</code> "
+                    f"(<code>{pnl_pct:+.3f}%</code>)\n"
+                    f"📋 <b>Reason:</b> <code>{reason}</code>"
+                )
+            except Exception as _tg:
+                logger.warning(f"[MIRROR] TG_CLOSE_FAIL | err={_tg}")
+
+        except Exception as e:
+            logger.error(f"[MIRROR] CLOSE_FAIL | {symbol} id={pos_id} err={e}")
+
+    def check_mirror_engine_open(self) -> None:
+        """
+        GENIUS MIRROR ENGINE — trigger check ყოველ 120s-ზე.
+
+        ყოველ OPEN LONG position-ზე:
+          trigger_price = initial_entry_price × (1 - mirror_trigger_pct%)
+          current_price <= trigger_price → open_mirror_short()
+        """
+        if not self.enabled or not self.mirror_enabled:
+            return
+
+        try:
+            from execution.db.repository import get_all_open_dca_positions
+            long_positions = get_all_open_dca_positions()
+        except Exception as e:
+            logger.warning(f"[MIRROR] LONG_FETCH_FAIL | err={e}")
+            return
+
+        for pos in long_positions:
+            symbol      = str(pos.get("symbol", ""))
+            import re as _re
+            exchange_sym = _re.sub(r'_L\d+$', '', symbol)
+
+            if exchange_sym not in self.symbols:
+                continue
+
+            # მხოლოდ L1 positions (initial entry — no _L2/_L3 suffix)
+            if _re.search(r'_L\d+$', symbol):
+                continue
+
+            long_l1_price = float(pos.get("initial_entry_price") or 0)
+            long_pos_id   = int(pos.get("id") or 0)
+
+            if long_l1_price <= 0:
+                continue
+
+            self.open_mirror_short(
+                symbol=exchange_sym,
+                long_l1_price=long_l1_price,
+                long_pos_id=long_pos_id,
+            )
 
 
 # ─── module-level singleton ─────────────────────────────────
