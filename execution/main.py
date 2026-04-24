@@ -1293,6 +1293,23 @@ def main():
                 except Exception as _se:
                     logger.warning(f"SHORT_DCA_LOOP_WARN | err={_se}")
 
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # GENIUS MIRROR ENGINE — bilateral DCA (FIX-S7)
+            # L2/L3 midpoint (-8.59% L1-დან) → SHORT იხსნება
+            # ADD-ONs DOWN: ვარდნა გრძელდება → avg↓ TP↓
+            # ADD-ONs UP:   bounce → avg_short↑ TP ახლოვდება
+            # TP:  0.55% — scalp hybrid
+            # FC:  drawdown only (-15%) — time FC გაუქმებულია
+            # MIRROR_ENGINE_ENABLED=true ENV-ით ჩართვა
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if _dca_enabled and futures_engine.enabled and futures_engine.mirror_enabled:
+                try:
+                    futures_engine.check_mirror_tp_sl()
+                    futures_engine.check_mirror_engine_open()
+                    futures_engine.check_mirror_addons()
+                except Exception as _me:
+                    logger.warning(f"MIRROR_ENGINE_LOOP_WARN | err={_me}")
+
             if generate_once is not None:
                 try:
                     created = generate_once(outbox_path)
