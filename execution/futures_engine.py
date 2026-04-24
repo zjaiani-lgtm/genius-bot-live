@@ -162,6 +162,7 @@ def _open_short_db(
     mode: str,
     is_dca_hedge: int = 0,
     dca_pos_id: int = 0,
+    hedge_tp_pct: float = 3.5,  # FIX-S6: stored at open for ADD-ON TP recalc consistency
 ) -> int:
     from execution.db.db import get_connection
     now = datetime.now(timezone.utc).isoformat()
@@ -171,12 +172,12 @@ def _open_short_db(
             INSERT INTO futures_positions
               (signal_id, symbol, direction, entry_price, qty, quote_in,
                leverage, tp_price, sl_price, status, opened_at, mode,
-               is_dca_hedge, dca_pos_id, avg_entry_price)
-            VALUES (?, ?, 'SHORT', ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)
+               is_dca_hedge, dca_pos_id, avg_entry_price, hedge_tp_pct)
+            VALUES (?, ?, 'SHORT', ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?, ?)
             """,
             (signal_id, symbol, entry_price, qty, quote_in,
              leverage, tp_price, sl_price, now, mode,
-             is_dca_hedge, dca_pos_id, entry_price)
+             is_dca_hedge, dca_pos_id, entry_price, hedge_tp_pct)
         )
         conn.commit()
         return cur.lastrowid
@@ -240,6 +241,9 @@ def _ensure_addon_cols() -> None:
                 # FIX BUG-3: ADD-ON cooldown DB-ში (restart-safe)
                 # in-memory _short_addon_cooldown_map → Render restart-ზე იკარგება
                 ("last_short_addon_ts",   "REAL DEFAULT 0.0"),   # unix timestamp last addon
+                # FIX-S6: hedge TP tier — stored at open, ADD-ON recalc-ზე გამოიყენება
+                # DEFAULT 3.5 → ძველი rows backward compat (bear tier)
+                ("hedge_tp_pct",          "REAL DEFAULT 3.5"),   # TP% used at open (regime-based)
             ]
             for col, col_def in migrations:
                 if col not in cols:
@@ -296,7 +300,18 @@ class FuturesEngine:
         # ── DCA HEDGE SHORT CASCADE პარამეტრები ──────────────
         # ყველა პარამეტრი ENV-კონტროლირებადია
         self.dca_hedge_quote      = _ef("FUTURES_DCA_HEDGE_QUOTE",    20.0)
-        self.dca_hedge_tp_pct     = _ef("FUTURES_DCA_HEDGE_TP_PCT",    3.5)
+        # FIX-S6: DUAL-REGIME HEDGE TP
+        # BULL market: hedge იხსნება LONG TP-ს მახლობლად → 0.7% სწრაფი close
+        # BEAR market: hedge LONG-ის სრული DCA cycle-ს მიჰყვება → 3.5% protection
+        # ძველი FUTURES_DCA_HEDGE_TP_PCT → BEAR tier-ის default (backward compat)
+        self.dca_hedge_tp_pct_bull = _ef("FUTURES_DCA_HEDGE_TP_PCT_BULL", 0.7)
+        self.dca_hedge_tp_pct_bear = _ef("FUTURES_DCA_HEDGE_TP_PCT_BEAR", 3.5)
+        # legacy fallback: თუ მხოლოდ FUTURES_DCA_HEDGE_TP_PCT მითითებულია
+        _legacy_tp = _ef("FUTURES_DCA_HEDGE_TP_PCT", 0.0)
+        if _legacy_tp > 0:
+            # legacy ENV → bear tier-ად ჩაიწერება, bull tier default 0.7%
+            self.dca_hedge_tp_pct_bear = _legacy_tp
+        self.dca_hedge_tp_pct     = self.dca_hedge_tp_pct_bear  # backward compat alias
         self.dca_hedge_max_addons = _ei("FUTURES_DCA_MAX_ADDONS",        5)
         self.dca_hedge_l3_trigger_pct = _ef("FUTURES_DCA_L3_TRIGGER_PCT", 1.5)
 
@@ -351,7 +366,8 @@ class FuturesEngine:
         )
         logger.info(
             f"[FUTURES] DCA HEDGE CASCADE | "
-            f"quote={self.dca_hedge_quote} tp={self.dca_hedge_tp_pct}% "
+            f"quote={self.dca_hedge_quote} "
+            f"tp_bull={self.dca_hedge_tp_pct_bull}% tp_bear={self.dca_hedge_tp_pct_bear}% "
             f"addon_triggers={self.dca_hedge_addon_trigger_pcts} "
             f"addon_quote={self.dca_hedge_addon_quote} "
             f"max_addons={self.dca_hedge_max_addons} "
@@ -396,6 +412,34 @@ class FuturesEngine:
         except Exception as e:
             logger.warning(f"[FUTURES] BTC_CHANGE_FAIL | err={e}")
             return 0.0
+
+    # ────────────────────────────────────────────────────────
+    # INTERNAL: _get_hedge_tp_pct  [FIX-S6 — dual-regime TP]
+    # BULL: 0.7% — LONG TP (0.55%)-ზე ოდნავ მეტი → hedge TP ადრე ჭრება
+    # BEAR: 3.5% — სრული DCA protection lifecycle
+    # NEUTRAL: bear tier (conservative)
+    # ────────────────────────────────────────────────────────
+    def _get_hedge_tp_pct(self, market_regime: str = "NEUTRAL") -> float:
+        """
+        regime-based hedge TP %.
+
+        BULL:    FUTURES_DCA_HEDGE_TP_PCT_BULL (default 0.7%)
+                 ლოგიკა: BULL-ზე LONG TP=0.55% სწრაფად ჭრება.
+                 hedge-ი 0.7%-ზე LONG TP-ს მახლობლად იხურება profit-ში.
+                 LONG FC-ზე hedge-ი close_dca_hedge_for_position()-ით
+                 ნებისმიერ შემთხვევაში დაიხურება.
+
+        BEAR:    FUTURES_DCA_HEDGE_TP_PCT_BEAR (default 3.5%)
+                 ლოგიკა: BEAR-ზე BTC ღრმად ეცემა.
+                 hedge-ი 3.5% TP-ზე მოგებაში გამოდის LONG ADD-ON-ების
+                 ზარალს ანაზღაურებს.
+
+        NEUTRAL: bear tier (conservative default)
+        """
+        regime = str(market_regime).upper()
+        if regime == "BULL":
+            return self.dca_hedge_tp_pct_bull
+        return self.dca_hedge_tp_pct_bear  # BEAR + NEUTRAL
 
     # ────────────────────────────────────────────────────────
     # INTERNAL: _close_short  [FIX-S2]
@@ -823,10 +867,15 @@ class FuturesEngine:
         symbol: str,
         current_price: float,
         dca_pos_id: int,
+        market_regime: str = "NEUTRAL",
     ) -> bool:
         """
         DCA L2/L3 boundary → SHORT hedge გახსნა.
         trigger: add_on_count == max_add_ons
+
+        FIX-S6: market_regime → dual TP tier
+          BULL: tp=0.7% (სწრაფი close LONG TP-სთან)
+          BEAR: tp=3.5% (სრული protection)
         """
         if not self.enabled:
             return False
@@ -873,7 +922,9 @@ class FuturesEngine:
             logger.warning(f"[HEDGE] BALANCE_CHECK_FAIL | err={e} → blocking hedge (safe)")
             return False  # balance check-ის შეცდომა → safe-side: hedge არ გაიხსნება
 
-        tp_price = round(current_price * (1.0 - self.dca_hedge_tp_pct / 100.0), 6)
+        # FIX-S6: regime-based TP
+        _hedge_tp_pct = self._get_hedge_tp_pct(market_regime)
+        tp_price = round(current_price * (1.0 - _hedge_tp_pct / 100.0), 6)
         qty      = round((hedge_quote * self.leverage) / current_price, 6)
         sig_id   = f"HEDGE-{symbol.replace('/', '')}-{uuid.uuid4().hex[:8]}"
 
@@ -882,6 +933,7 @@ class FuturesEngine:
             entry_price=current_price, qty=qty, quote_in=hedge_quote,
             leverage=self.leverage, tp_price=tp_price, sl_price=0.0,
             mode=self.mode, is_dca_hedge=1, dca_pos_id=dca_pos_id,
+            hedge_tp_pct=_hedge_tp_pct,
         )
 
         logger.warning(
@@ -900,7 +952,7 @@ class FuturesEngine:
                 f"📉 <b>DCA L2 exhausted — CASCADE active</b>\n"
                 f"💰 <b>Entry:</b> <code>{current_price:.2f}</code>\n"
                 f"🎯 <b>TP:</b> <code>{tp_price:.2f}</code> "
-                f"(<code>-{self.dca_hedge_tp_pct:.1f}%</code>)\n"
+                f"(<code>-{_hedge_tp_pct:.1f}%</code> {market_regime})\n"
                 f"📊 <b>ADD-ON triggers:</b> "
                 f"<code>{self.dca_hedge_addon_trigger_pcts}</code>\n"
                 f"💼 <b>Quote:</b> <code>${hedge_quote:.0f}</code> "
@@ -914,7 +966,8 @@ class FuturesEngine:
             from execution.db.repository import log_event
             log_event("DCA_HEDGE_OPENED",
                 f"sym={symbol} entry={current_price:.4f} "
-                f"tp={tp_price:.4f} quote={hedge_quote} "
+                f"tp={tp_price:.4f} tp_pct={_hedge_tp_pct:.1f}% "
+                f"regime={market_regime} quote={hedge_quote} "
                 f"dca_pos_id={dca_pos_id} pos_id={pos_id}"
             )
         except Exception:
@@ -1017,7 +1070,11 @@ class FuturesEngine:
                 # ADD-ON — weighted avg გათვლა
                 total_quote = quote_in + self.dca_hedge_addon_quote
                 new_avg     = (avg_entry * quote_in + current_price * self.dca_hedge_addon_quote) / total_quote
-                new_tp      = round(new_avg * (1.0 - self.dca_hedge_tp_pct / 100.0), 6)
+                # FIX-S6: hedge_tp_pct per-position (stored at open) — not global self.dca_hedge_tp_pct
+                # BULL-opened hedge: 0.7%, BEAR-opened hedge: 3.5%
+                # DEFAULT 3.5 for old rows that pre-date FIX-S6 (backward compat via column DEFAULT)
+                _pos_hedge_tp_pct = float(pos.get("hedge_tp_pct") or self.dca_hedge_tp_pct_bear)
+                new_tp      = round(new_avg * (1.0 - _pos_hedge_tp_pct / 100.0), 6)
                 new_qty     = round((total_quote * self.leverage) / new_avg, 6)
 
                 logger.warning(
@@ -1214,7 +1271,9 @@ class FuturesEngine:
                 new_avg   = round(new_value / new_qty, 6) if new_qty > 0 else avg_entry
 
                 # TP = new_avg × (1 - tp_pct%)
-                new_tp = round(new_avg * (1.0 - self.dca_hedge_tp_pct / 100.0), 6)
+                # FIX-S6: hedge_tp_pct per-position (stored at open) — not global
+                _pos_hedge_tp_pct_l3 = float(pos.get("hedge_tp_pct") or self.dca_hedge_tp_pct_bear)
+                new_tp = round(new_avg * (1.0 - _pos_hedge_tp_pct_l3 / 100.0), 6)
 
                 # total_quote update
                 new_total_quote = total_quote - lifo_quote + net_proceeds
