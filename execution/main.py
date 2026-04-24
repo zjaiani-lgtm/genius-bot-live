@@ -264,9 +264,11 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "TP")
 
                     # ── DCA hedge SHORT auto-close (BUG-1 FIX) ─────────
-                    # DCA TP hit → hedge SHORT-ი აღარ საჭიროა.
+                    # DCA TP hit → is_dca_hedge=1 SHORT-ი აღარ საჭიროა.
                     # თუ hedge ჯერ არ გახსნილა → no-op (empty fetch).
                     # თუ hedge უკვე დაიხურა futures TP-ზე → no-op (status!='OPEN').
+                    # ᲛᲜᲘᲨᲕᲜᲔᲚᲝᲕᲐᲜᲘ: Independent SHORT (is_independent_short=1) აქ
+                    # არ იხურება — მას საკუთარი TP/FC lifecycle აქვს futures_engine-ში.
                     if futures_engine is not None:
                         try:
                             futures_engine.close_dca_hedge_for_position(
@@ -321,13 +323,20 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                         exit_price = float(sell.get("average") or sell.get("price") or current_price)
                     pnl_quote = (exit_price - avg_entry) * total_qty
                     pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
+                    # pnl_quote-ის ნიშანი FC reason-ზეა დამოკიდებული:
+                    #   FC by drawdown (-15%): exit < avg_entry → pnl_quote უარყოფითია (ზარალი)
+                    #   FC by time (10d):      exit შეიძლება avg-ზე მაღლა იყოს bounce-ის შემდეგ
+                    #                          → pnl_quote დადებითი (მოგება) — არ არის გარანტირებული ზარალი
 
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "FORCE_CLOSE")
 
                     # ── DCA hedge SHORT auto-close (BUG-1 FIX) ─────────
-                    # FORCE_CLOSE → hedge SHORT-ი უნდა დაიხუროს.
-                    # FORCE_CLOSE-ის დროს BTC კიდევ ეცემა → SHORT-ი სავარაუდოდ
+                    # FORCE_CLOSE → is_dca_hedge=1 SHORT-ი უნდა დაიხუროს.
+                    # FORCE_CLOSE-ის დროს BTC კიდევ ეცემა → hedge SHORT სავარაუდოდ
                     # მოგებაშია, მაგრამ DCA position-ი აღარ არსებობს hedge-ის გასამართლებლად.
+                    # ᲛᲜᲘᲨᲕᲜᲔᲚᲝᲕᲐᲜᲘ: close_dca_hedge_for_position() მხოლოდ is_dca_hedge=1-ს
+                    # ხურავს (dca_pos_id match). Independent SHORT (is_independent_short=1)
+                    # საკუთარი TP/FC lifecycle-ით იხურება — LONG FC-ზე არ იხურება.
                     if futures_engine is not None:
                         try:
                             futures_engine.close_dca_hedge_for_position(
