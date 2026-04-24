@@ -547,6 +547,7 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                             symbol=exchange_sym,
                             current_price=buy_price,
                             dca_pos_id=pos_id,
+                            market_regime=market_regime,
                         )
                         if _triggered:
                             logger.warning(
