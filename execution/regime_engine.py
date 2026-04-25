@@ -101,8 +101,12 @@ _MAX_TP = 4.0
 _MAX_SL = 1.8
 
 # Fixed fallback (ATR=0 სიტუაცია)
-# FIX-RE-3: ENV=TP_PCT=1.5 (was default 1.0)
-_TP_PCT_FIXED = _ef("TP_PCT", 1.5)
+# FIX-RE-3: ENV=TP_PCT=0.55 (scalp hybrid — DCA_TP_PCT-თან სინქრონიზაცია)
+# was 1.5 → blocked signals when ATR < 0.12% (low volatility sideways market)
+# ATR sanity: min_atr = TP_PCT × ATR_TO_TP_SANITY_FACTOR (0.08)
+# 1.5 × 0.08 = 0.12% → BTC/ETH/BNB sideways ATR (0.08-0.11%) → BLOCKED
+# 0.55 × 0.08 = 0.044% → almost never blocks
+_TP_PCT_FIXED = _ef("TP_PCT", 0.55)
 # FIX-RE-4: ENV=SL_PCT=0.80 (was default 0.70)
 _SL_PCT_FIXED = _ef("SL_PCT", 0.80)
 
