@@ -1247,8 +1247,23 @@ def main():
             # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 from execution.signal_generator import _detect_market_regime_24h
+                _prev_regime = _market_regime
                 _market_regime = _detect_market_regime_24h()
                 futures_engine.check_tp_sl()
+
+                # REGIME LOG — audit_log-ში ჩაწერა regime ცვლილებისას
+                # ან ყოველ 10 loop-ზე (debug-ისთვის)
+                if _market_regime != _prev_regime:
+                    try:
+                        log_event(
+                            "MARKET_REGIME_CHANGE",
+                            f"regime={_market_regime} prev={_prev_regime}"
+                        )
+                        logger.info(
+                            f"MARKET_REGIME_CHANGE | {_prev_regime} → {_market_regime}"
+                        )
+                    except Exception:
+                        pass
 
             except Exception as _fe:
                 logger.warning(f"FUTURES_LOOP_WARN | err={_fe}")
