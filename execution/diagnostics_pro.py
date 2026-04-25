@@ -856,7 +856,7 @@ def check_regime_engine(rep: Report):
         # TP/SL sanity
         if tp and sl:
             rr = tp / sl
-            tp_env = _safe_float(os.getenv("TP_PCT", "1.5"))
+            tp_env = _safe_float(os.getenv("TP_PCT", "0.55"))
             sl_env = _safe_float(os.getenv("SL_PCT", "0.80"))
             rr_ok  = rr >= 1.5
             rep.add("Regime/RR_ratio", rr_ok,
