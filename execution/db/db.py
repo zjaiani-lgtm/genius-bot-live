@@ -280,6 +280,10 @@ def init_db() -> None:
     _migrate_dca_rotation_columns(cur)
     conn.commit()
 
+    # FUTURES ENGINE migration — is_mirror + ყველა missing column
+    _migrate_futures_columns(cur)
+    conn.commit()
+
 
 def _migrate_dca_rotation_columns(cur) -> None:
     """
@@ -318,6 +322,51 @@ def _migrate_dca_rotation_columns(cur) -> None:
 
     except Exception as e:
         logger.warning(f"[DB_MIGRATE] dca_rotation_columns fail | err={e}")
+
+
+def _migrate_futures_columns(cur) -> None:
+    """
+    futures_positions ცხრილში ყველა missing column-ის დამატება.
+    იდემპოტენტურია — ყველა ALTER TABLE idempotent pattern.
+
+    FIX: is_mirror_engine column — Mirror Engine crash-ის თავიდანაცილება.
+    FIX: close_reason column — _close_mirror() UPDATE crash-ის თავიდანაცილება.
+    სრული სია — FuturesEngine._ensure_addon_cols() + _close_mirror() columns.
+    """
+    try:
+        cur.execute("PRAGMA table_info(futures_positions)")
+        existing = {row[1] for row in cur.fetchall()}
+
+        migrations = [
+            ("add_on_count",          "INTEGER DEFAULT 0"),
+            ("add_on_quote",          "REAL DEFAULT 0.0"),
+            ("avg_entry_price",       "REAL DEFAULT 0.0"),
+            ("sl_price_addon",        "REAL DEFAULT 0.0"),
+            ("is_dca_hedge",          "INTEGER DEFAULT 0"),
+            ("dca_pos_id",            "INTEGER DEFAULT 0"),
+            ("is_independent_short",  "INTEGER DEFAULT 0"),
+            ("long_ref_price",        "REAL DEFAULT 0.0"),
+            ("last_short_addon_ts",   "REAL DEFAULT 0.0"),
+            ("hedge_tp_pct",          "REAL DEFAULT 3.5"),
+            ("exit_price",            "REAL DEFAULT 0.0"),
+            ("is_mirror_engine",      "INTEGER DEFAULT 0"),
+            ("mirror_direction",      "TEXT DEFAULT ''"),
+            ("mirror_addons_down",    "INTEGER DEFAULT 0"),
+            ("mirror_addons_up",      "INTEGER DEFAULT 0"),
+            ("mirror_long_ref_price", "REAL DEFAULT 0.0"),
+            ("last_mirror_addon_ts",  "REAL DEFAULT 0.0"),
+            ("close_reason",          "TEXT DEFAULT ''"),
+        ]
+
+        for col, col_def in migrations:
+            if col not in existing:
+                cur.execute(
+                    f"ALTER TABLE futures_positions ADD COLUMN {col} {col_def}"
+                )
+                logger.info(f"[DB_MIGRATE] futures_positions.{col} column added")
+
+    except Exception as e:
+        logger.warning(f"[DB_MIGRATE] futures_columns fail | err={e}")
 
 
 def _migrate_sl_cooldown_columns(cur) -> None:
