@@ -49,7 +49,7 @@ MAX_QUOTE_PER_TRADE = float(os.getenv("MAX_QUOTE_PER_TRADE", "10"))   # ENV=10
 MIN_MOVE_PCT = float(os.getenv("MIN_MOVE_PCT", "0.02"))  # DCA: 0.22→0.02 (BTC/BNB always passes)
 ESTIMATED_ROUNDTRIP_FEE_PCT = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT", "0.14"))  # ENV=0.14
 ESTIMATED_SLIPPAGE_PCT = float(os.getenv("ESTIMATED_SLIPPAGE_PCT", "0.0"))
-TP_PCT = float(os.getenv("TP_PCT", "1.5"))                                               # ENV=1.5%
+TP_PCT = float(os.getenv("TP_PCT", "0.55"))                                               # ENV=0.55%
 MIN_NET_PROFIT_PCT = float(os.getenv("MIN_NET_PROFIT_PCT", "0.25"))                     # ENV=0.25
 
 # ATR sanity
