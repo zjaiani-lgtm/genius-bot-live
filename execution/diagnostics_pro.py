@@ -33,14 +33,17 @@
 # ║   15. BROKEN OCO repair suggestions                                  ║
 # ║   16. DCA პოზიციების ვალიდაცია (TP/SL/Memory)                       ║
 # ╠══════════════════════════════════════════════════════════════════════╣
-# ║  FIX LOG (2026-04-10):                                               ║
+# ║  FIX LOG:                                                            ║
 # ║   FIX-D1: system_state ACTIVE/RUNNING — ორივე valid სტატუსი         ║
 # ║   FIX-D2: API drift — Binance {"serverTime":...} ფორმატი            ║
 # ║   FIX-D3: Bybit → Binance ყველა reference-ში                        ║
 # ║   FIX-D4: ENV_VS_CODE DCA-incompatible checks ამოღებულია            ║
-# ║   FIX-D5: BUY_CONFIDENCE_MIN expected 0.10 (DCA რეალობა)            ║
-# ║   FIX-D6: MAX_TRADES_PER_DAY/HOUR DCA მნიშვნელობები                 ║
+# ║   FIX-D5: BUY_CONFIDENCE_MIN=0.005 (intentional DCA config)         ║
+# ║   FIX-D6: MAX_TRADES_PER_DAY=60 / HOUR=12 (DCA config)              ║
 # ║   FIX-D7: MIN_VOLUME_24H DCA მნიშვნელობა (100000)                   ║
+# ║   FIX-D8: CASCADE_DROP_L4/L8_PCT ამოღებულია (კოდში არ გამოიყენება) ║
+# ║   FIX-D9: ENV_RULES შენი კონფიგურაციისთვის განახლება               ║
+# ║   FIX-D10: MODE=DEMO — API keys MODE-conditional check               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 
 from __future__ import annotations
@@ -516,12 +519,12 @@ def check_performance(rep: Report, conn: sqlite3.Connection):
 # check_type: "eq" | "gt" | "gte" | "lt" | "range" | "bool" | "nonempty"
 ENV_RULES: List[Tuple] = [
     # ─── Core mode ───────────────────────────────────────────────
-    ("MODE",                   "LIVE",       "eq",      "CRITICAL", "bot production mode"),
+    ("MODE",                   "DEMO",       "eq",      "WARN",     "bot mode — DEMO=virtual, LIVE=real money"),
     ("KILL_SWITCH",            "false",      "eq",      "CRITICAL", "kill switch off"),
     ("LIVE_CONFIRMATION",      "true",       "eq",      "WARN",     "live confirmation"),
-    # ─── API ─────────────────────────────────────────────────────
-    ("BINANCE_API_KEY",        None,         "nonempty","CRITICAL", "Binance API key"),
-    ("BINANCE_API_SECRET",     None,         "nonempty","CRITICAL", "Binance API secret"),
+    # ─── API — checked MODE-conditionally in check_env() ─────────
+    # BINANCE_API_KEY + SECRET: only required when MODE=LIVE
+    # handled separately below ENV_RULES loop
     # ─── Symbols ─────────────────────────────────────────────────
     ("BOT_SYMBOLS",            None,         "nonempty","CRITICAL", "trading symbols"),
     ("BOT_TIMEFRAME",          "15m",        "eq",      "WARN",     "candle timeframe"),
@@ -530,33 +533,31 @@ ENV_RULES: List[Tuple] = [
     ("DCA_ENABLED",            "true",       "eq",      "CRITICAL", "DCA სტრატეგია ჩართული"),
     ("DCA_TP_PCT",             "0.55",       "eq",      "WARN",     "DCA Take Profit % (L1-L2)"),
     ("DCA_SL_PCT",             "999.0",      "eq",      "CRITICAL", "DCA Stop Loss გათიშული (ფილოსოფია)"),
-    ("DCA_MAX_ADD_ONS",        "1",          "eq",      "WARN",     "DCA მაქსიმალური add-on"),
-    ("DCA_MAX_CAPITAL_USDT",   "40",         "eq",      "WARN",     "DCA მაქსიმალური კაპიტალი"),
-    ("DCA_ADDON_TRIGGER_PCTS", "0.65",       "eq",      "WARN",     "DCA add-on trigger %"),
+    ("DCA_MAX_ADD_ONS",        "5",          "eq",      "WARN",     "DCA მაქსიმალური add-on (5-level pyramid)"),
+    ("DCA_MAX_CAPITAL_USDT",   "350",        "eq",      "WARN",     "DCA მაქსიმალური კაპიტალი per position"),
+    ("DCA_ADDON_TRIGGER_PCTS", "1.0,2.2,3.5,5.0,6.5", "eq", "WARN", "DCA add-on trigger % სია (5 level)"),
     # ─── CASCADE სტრატეგია ───────────────────────────────────────
     ("CASCADE_ENABLED",        "true",       "eq",      "CRITICAL", "CASCADE სტრატეგია ჩართული"),
     ("CASCADE_START_LAYER",    "2",          "eq",      "WARN",     "CASCADE დაწყება L2-დან"),
     ("CASCADE_MAX_LAYERS",     "10",         "eq",      "WARN",     "CASCADE მაქსიმალური layer"),
-    ("CASCADE_RESUME_LAYER",   "10",         "eq",      "WARN",     "CASCADE dead zone გაუქმება"),
+    ("CASCADE_RESUME_LAYER",   "999",        "eq",      "WARN",     "CASCADE dead zone გაუქმება (999=disabled)"),
     ("CASCADE_DROP_PCT",       "1.5",        "eq",      "WARN",     "CASCADE drop L2-L3 (1.5%)"),
-    ("CASCADE_DROP_L4_PCT",    "2.0",        "eq",      "WARN",     "CASCADE drop L4-L7 (2.0%)"),
-    ("CASCADE_DROP_L8_PCT",    "3.0",        "eq",      "WARN",     "CASCADE drop L8-L10 (3.0%)"),
-    ("CASCADE_TP_L3_PCT",      "0.65",       "eq",      "WARN",     "CASCADE TP L3+ (0.65%)"),
+    ("CASCADE_TP_L3_PCT",      "0.35",       "eq",      "WARN",     "CASCADE TP L3 zone (0.35% — LIFO rotation)"),
     # ─── LAYER2 სტრატეგია ────────────────────────────────────────
     ("LAYER2_ENABLED",         "true",       "eq",      "WARN",     "LAYER2 სტრატეგია ჩართული"),
     ("LAYER2_DROP_PCT",        "1.5",        "eq",      "WARN",     "LAYER2 crash trigger %"),
-    ("LAYER2_QUOTE",           "10.0",       "eq",      "WARN",     "LAYER2 ყიდვის ზომა USDT"),
+    ("LAYER2_QUOTE",           "50",         "eq",      "WARN",     "LAYER2 ყიდვის ზომა USDT"),
     # ─── Memory დაცვა ────────────────────────────────────────────
     ("BOT_API_ENABLED",        "false",      "eq",      "WARN",     "Bot API გამორთული (memory დაცვა)"),
     ("DASHBOARD_ENABLED",      "false",      "eq",      "WARN",     "Dashboard გამორთული (memory დაცვა)"),
     ("QTY_SYNC_ENABLED",       "false",      "eq",      "WARN",     "QTY Sync (Standard plan-ზე ჩართე)"),
     # ─── Sizing ──────────────────────────────────────────────────
-    ("BOT_QUOTE_PER_TRADE",    "10",         "eq",      "WARN",     "quote per trade USDT"),
-    ("MAX_QUOTE_PER_TRADE",    "10",         "eq",      "WARN",     "max quote ceiling"),
+    ("BOT_QUOTE_PER_TRADE",    "50",         "eq",      "WARN",     "quote per trade USDT"),
+    ("MAX_QUOTE_PER_TRADE",    "50",         "eq",      "WARN",     "max quote ceiling"),
     # ─── Trade limits ────────────────────────────────────────────
-    ("MAX_OPEN_TRADES",        "7",          "eq",      "WARN",     "მაქსიმალური ღია პოზიციები"),
+    ("MAX_OPEN_TRADES",        "6",          "eq",      "WARN",     "მაქსიმალური ღია პოზიციები"),
     ("MIN_OPEN_TRADES",        "5",          "eq",      "WARN",     "მინიმალური ღია პოზიციები"),
-    ("SMART_ADDON_BUFFER",     "5",          "eq",      "WARN",     "USDT buffer add-on-ისთვის"),
+    ("SMART_ADDON_BUFFER",     "200",        "eq",      "WARN",     "USDT buffer add-on-ისთვის"),
     ("LOOP_SLEEP_SECONDS",     "120",        "eq",      "WARN",     "loop ინტერვალი წამებში"),
     # ─── Paths / Telegram ────────────────────────────────────────
     ("DB_PATH",                None,         "nonempty","CRITICAL", "DB path"),
@@ -568,6 +569,21 @@ ENV_RULES: List[Tuple] = [
 
 
 def check_env(rep: Report):
+    # MODE-conditional: BINANCE API keys only required in LIVE mode
+    _mode = os.getenv("MODE", "DEMO").upper()
+    if _mode == "LIVE":
+        for _api_key in ("BINANCE_API_KEY", "BINANCE_API_SECRET"):
+            _val = os.getenv(_api_key, "").strip()
+            _ok  = bool(_val)
+            rep.add(f"ENV/{_api_key}", _ok,
+                    f"Binance API {'key' if 'KEY' in _api_key else 'secret'} → "
+                    f"{'set (masked)' if _ok else 'NOT SET'}",
+                    severity="CRITICAL" if not _ok else "INFO",
+                    fix=f"Render ENV → {_api_key}=<value> — MODE=LIVE-ზე სავალდებულოა!" if not _ok else "")
+    else:
+        rep.add("ENV/BINANCE_API", True,
+                f"MODE={_mode} — Binance API keys optional (not checked in DEMO/TESTNET)")
+
     for key, expected, check_type, severity, desc in ENV_RULES:
         actual = os.getenv(key, "")
         actual_str = actual.strip()
@@ -905,9 +921,9 @@ ENV_VS_CODE_CHECKS: List[Tuple[str, str, str]] = [
     ("AI_CONFIDENCE_BOOST",      "1.05",  "signal score boost — 1.0 default score-ს ვერ ამაღლებს"),
     ("ALLOW_LIVE_SIGNALS",       "true",  "CRITICAL: false → ყველა BUY სიგნალი იბლოკება!"),
     # ─── DCA სწორი ლიმიტები ──────────────────────────────────────────────
-    ("BUY_CONFIDENCE_MIN",       "0.10",  "DCA: 0.005 ძალიან დაბალია — noise trades შემოდის"),
-    ("MAX_TRADES_PER_DAY",       "40",    "DCA სწრაფი პროფილი — 40 ნორმალურია"),
-    ("MAX_TRADES_PER_HOUR",      "8",     "DCA სწრაფი პროფილი — 8 ნორმალურია"),
+    ("BUY_CONFIDENCE_MIN",       "0.005", "BUY_CONFIDENCE_MIN — intentional permissive DCA config"),
+    ("MAX_TRADES_PER_DAY",       "60",    "DCA trade limit per day"),
+    ("MAX_TRADES_PER_HOUR",      "12",    "DCA trade limit per hour"),
     ("MIN_VOLUME_24H",           "100000","DCA: BTC/ETH/BNB ყოველთვის > 100K — საკმარისია"),
     # ─── სიგნალის ფილტრები ───────────────────────────────────────────────
     ("USE_MA_FILTERS",           "false", "DCA: MA filters გათიშული — ნორმალურია"),
@@ -1300,16 +1316,14 @@ def check_dca_positions(rep: Report, conn: sqlite3.Connection):
     )
 
     # ── 3. CASCADE layer drop_pct ────────────────────────────────
-    drop_base = float(os.getenv("CASCADE_DROP_PCT",    "0"))
-    drop_l4   = float(os.getenv("CASCADE_DROP_L4_PCT", "0"))
-    drop_l8   = float(os.getenv("CASCADE_DROP_L8_PCT", "0"))
-    tp_l3     = float(os.getenv("CASCADE_TP_L3_PCT",   "0"))
+    drop_base = float(os.getenv("CASCADE_DROP_PCT",  "0"))
+    tp_l3     = float(os.getenv("CASCADE_TP_L3_PCT", "0"))
 
+    # CASCADE_DROP_L4_PCT / CASCADE_DROP_L8_PCT ამოღებულია —
+    # ეს ENV-ები კოდში არ გამოიყენება (grep დადასტურა)
     for val, expected, name, fix_key in [
-        (drop_base, 1.5, "CASCADE drop L2-L3", "CASCADE_DROP_PCT=1.5"),
-        (drop_l4,   2.0, "CASCADE drop L4-L7", "CASCADE_DROP_L4_PCT=2.0"),
-        (drop_l8,   3.0, "CASCADE drop L8-L10","CASCADE_DROP_L8_PCT=3.0"),
-        (tp_l3,     0.65,"CASCADE TP L3+",     "CASCADE_TP_L3_PCT=0.65"),
+        (drop_base, 1.5,  "CASCADE drop L2-L3",        "CASCADE_DROP_PCT=1.5"),
+        (tp_l3,     0.35, "CASCADE TP L3 (LIFO zone)",  "CASCADE_TP_L3_PCT=0.35"),
     ]:
         ok = abs(val - expected) < 0.001
         rep.add(
