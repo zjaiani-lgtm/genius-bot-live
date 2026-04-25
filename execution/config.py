@@ -73,8 +73,8 @@ BOT_CANDLE_LIMIT = _env_int("BOT_CANDLE_LIMIT", 300)
 # ─────────────────────────────────────────────
 
 # SYNC: was 15.0 in config.py — signal_generator.py uses 10 → ENV=10 → aligned to 10
-BOT_QUOTE_PER_TRADE  = _env_float("BOT_QUOTE_PER_TRADE",  10.0)   # SYNC: 15→10
-MAX_QUOTE_PER_TRADE  = _env_float("MAX_QUOTE_PER_TRADE",  10.0)   # SYNC: 15→10
+BOT_QUOTE_PER_TRADE  = _env_float("BOT_QUOTE_PER_TRADE",  50.0)   # SYNC: aligned to .env=50
+MAX_QUOTE_PER_TRADE  = _env_float("MAX_QUOTE_PER_TRADE",  50.0)   # SYNC: aligned to .env=50
 BOT_POSITION_SIZE    = _env_float("BOT_POSITION_SIZE",     0.0)
 
 CAPITAL_USAGE_MAX      = _env_float("CAPITAL_USAGE_MAX",      0.80)
@@ -97,11 +97,11 @@ VIRTUAL_START_BALANCE = _env_float("VIRTUAL_START_BALANCE", 100000.0)
 # RISK MANAGEMENT
 # ─────────────────────────────────────────────
 
-MAX_OPEN_TRADES          = _env_int("MAX_OPEN_TRADES",          2)    # ENV=2
+MAX_OPEN_TRADES          = _env_int("MAX_OPEN_TRADES",          6)    # SYNC: aligned to .env=6
 MAX_POSITIONS_PER_SYMBOL = _env_int("MAX_POSITIONS_PER_SYMBOL", 1)
 # SYNC: was 25/8 in config.py — signal_generator.py uses 10/3 → align
-MAX_TRADES_PER_DAY       = _env_int("MAX_TRADES_PER_DAY",      10)   # SYNC: 25→10
-MAX_TRADES_PER_HOUR      = _env_int("MAX_TRADES_PER_HOUR",      3)   # SYNC: 8→3
+MAX_TRADES_PER_DAY       = _env_int("MAX_TRADES_PER_DAY",      60)   # SYNC: aligned to .env=60
+MAX_TRADES_PER_HOUR      = _env_int("MAX_TRADES_PER_HOUR",     12)   # SYNC: aligned to .env=12
 MAX_CONSECUTIVE_LOSSES   = _env_int("MAX_CONSECUTIVE_LOSSES",   5)   # SYNC: 3→5
 MAX_DAILY_LOSS           = _env_float("MAX_DAILY_LOSS",         3.0)  # SYNC: 2.0→3.0
 
@@ -110,7 +110,7 @@ MAX_DAILY_LOSS           = _env_float("MAX_DAILY_LOSS",         3.0)  # SYNC: 2.
 # ─────────────────────────────────────────────
 
 # SYNC: config.py had 1.0 — signal_generator.py uses 1.5 → align to 1.5
-TP_PCT = _env_float("TP_PCT", 1.5)   # SYNC: 1.0→1.5
+TP_PCT = _env_float("TP_PCT", 0.55)   # SYNC: 1.5→0.55 scalp hybrid — DCA_TP_PCT-თან სინქრონიზაცია
 SL_PCT = _env_float("SL_PCT", 999.0)   # ENV=0.80
 
 ATR_MULT_TP_BULL = _env_float("ATR_MULT_TP_BULL", 4.0)   # SYNC: 3.0→4.0
@@ -264,7 +264,7 @@ SELL_RETRY_BUFFER = _env_float("SELL_RETRY_BUFFER", 0.998)
 BLOCK_SIGNALS_WHEN_ACTIVE_OCO = _env_bool("BLOCK_SIGNALS_WHEN_ACTIVE_OCO", "true")
 DEDUPE_ONLY_WHEN_ACTIVE_OCO   = _env_bool("DEDUPE_ONLY_WHEN_ACTIVE_OCO",   "false")
 
-LOOP_SLEEP_SECONDS          = _env_int("LOOP_SLEEP_SECONDS",           20)
+LOOP_SLEEP_SECONDS          = _env_int("LOOP_SLEEP_SECONDS",          120)  # SYNC: aligned to .env=120
 BOT_SIGNAL_COOLDOWN_SECONDS = _env_int("BOT_SIGNAL_COOLDOWN_SECONDS",  120)
 
 USE_KELLY_SIZING      = _env_bool("USE_KELLY_SIZING",      "false")  # SYNC: not in old config → add
@@ -297,31 +297,31 @@ GEN_TEST_SIGNAL = _env_bool("GEN_TEST_SIGNAL", "false")
 # DCA — Dollar Cost Averaging
 # ─────────────────────────────────────────────
 
-DCA_ENABLED              = _env_bool("DCA_ENABLED",              "false")
-DCA_MAX_ADD_ONS          = _env_int("DCA_MAX_ADD_ONS",           3)
-DCA_MAX_CAPITAL_USDT     = _env_float("DCA_MAX_CAPITAL_USDT",    40.0)
-DCA_MAX_TOTAL_USDT       = _env_float("DCA_MAX_TOTAL_USDT",      60.0)
+DCA_ENABLED              = _env_bool("DCA_ENABLED",              "true")   # SYNC: aligned to .env=true
+DCA_MAX_ADD_ONS          = _env_int("DCA_MAX_ADD_ONS",           5)    # SYNC: aligned to .env=5
+DCA_MAX_CAPITAL_USDT     = _env_float("DCA_MAX_CAPITAL_USDT",   350.0)  # SYNC: aligned to .env=350
+DCA_MAX_TOTAL_USDT       = _env_float("DCA_MAX_TOTAL_USDT",    2200.0)  # SYNC: aligned to .env=2200
 DCA_MAX_DRAWDOWN_PCT     = _env_float("DCA_MAX_DRAWDOWN_PCT",    999.0)
 DCA_MIN_NOTIONAL         = _env_float("DCA_MIN_NOTIONAL",        10.0)
 
 # trigger drawdowns per add-on (%) — comma-separated
-DCA_ADDON_TRIGGER_PCTS   = _env_str("DCA_ADDON_TRIGGER_PCTS",   "2.0,3.5,5.5")
+DCA_ADDON_TRIGGER_PCTS   = _env_str("DCA_ADDON_TRIGGER_PCTS",   "1.0,2.2,3.5,5.0,6.5")  # SYNC: aligned to .env
 
 # add-on sizes (USDT) — comma-separated
-DCA_ADDON_SIZES          = _env_str("DCA_ADDON_SIZES",           "10,10,10")
+DCA_ADDON_SIZES          = _env_str("DCA_ADDON_SIZES",           "50,65,75,65,40")  # SYNC: aligned to .env
 
 # TP/SL (DCA-ზე SL ბევრად დიდია — averaging სჭირდება სივრცეს)
-DCA_TP_PCT               = _env_float("DCA_TP_PCT",              2.0)
+DCA_TP_PCT               = _env_float("DCA_TP_PCT",              0.55)  # SYNC: aligned to .env=0.55
 DCA_SL_PCT               = _env_float("DCA_SL_PCT",              999.0)
 
 # SL confirmation candles (noise filter)
 DCA_SL_CONFIRM_CANDLES   = _env_int("DCA_SL_CONFIRM_CANDLES",    2)
 
 # breakeven trigger (% above avg_entry)
-DCA_BREAKEVEN_TRIGGER_PCT = _env_float("DCA_BREAKEVEN_TRIGGER_PCT", 0.5)
+DCA_BREAKEVEN_TRIGGER_PCT = _env_float("DCA_BREAKEVEN_TRIGGER_PCT", 999.0)  # SYNC: disabled per .env
 
 # cooldown between add-ons (seconds)
-DCA_ADDON_COOLDOWN_SECONDS = _env_int("DCA_ADDON_COOLDOWN_SECONDS", 900)
+DCA_ADDON_COOLDOWN_SECONDS = _env_int("DCA_ADDON_COOLDOWN_SECONDS", 300)  # SYNC: aligned to .env=300
 
 # minimum recovery score (out of 5)
-DCA_MIN_RECOVERY_SCORE   = _env_int("DCA_MIN_RECOVERY_SCORE",    3)
+DCA_MIN_RECOVERY_SCORE   = _env_int("DCA_MIN_RECOVERY_SCORE",    1)    # SYNC: aligned to .env=1
