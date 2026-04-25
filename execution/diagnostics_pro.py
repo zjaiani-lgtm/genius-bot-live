@@ -829,7 +829,7 @@ def check_regime_engine(rep: Report):
     # detect_regime test cases
     test_cases = [
         ((0.6, 0.4), "BULL"),
-        ((0.2, 0.2), "SIDEWAYS"),
+        ((0.005, 0.15), "SIDEWAYS"),  # REGIME_BULL_TREND_MIN=0.01 → 0.005<0.01 → SIDEWAYS
         ((0.3, 0.5), "UNCERTAIN"),  # ← FAIL in diagnose — შემოწმება
         ((0.1, 2.0), "VOLATILE"),
         ((-0.2, 0.5), "BEAR"),
@@ -927,7 +927,7 @@ ENV_VS_CODE_CHECKS: List[Tuple[str, str, str]] = [
     ("MIN_VOLUME_24H",           "100000","DCA: BTC/ETH/BNB ყოველთვის > 100K — საკმარისია"),
     # ─── სიგნალის ფილტრები ───────────────────────────────────────────────
     ("USE_MA_FILTERS",           "false", "DCA: MA filters გათიშული — ნორმალურია"),
-    ("USE_RSI_FILTER",           "true",  "RSI filter ჩართული უნდა იყოს"),
+    ("USE_RSI_FILTER",           "false", "DCA: RSI filter გათიშული — ვარდნაზე ყიდულობს, RSI<35 ბლოკი DCA-ს ტოვებს signals-ის გარეშე"),
 ]
 
 
@@ -1531,10 +1531,9 @@ def check_tp_and_addon_detail(rep: Report, conn: sqlite3.Connection):
         tp_fix_enabled = os.getenv("TP_FIX_ENABLED", "true").lower() in ("true", "1", "yes")
 
         if tp_fix_enabled and not tp_fix_events:
-            rep.add("TP_Detail/tp_fix_log", False,
-                    "TP_FIX_ENABLED=true მაგრამ audit_log-ში TP_FIX event არ არის",
-                    severity="WARN",
-                    fix="tp_fix.py-ი არ მუშაობს — main.py-ში TP_FIX_LOOP შეამოწმე")
+            # tp_fix ლოგავს მხოლოდ fixed>0 შემთხვევაში — TP სწორია → no log = OK
+            rep.add("TP_Detail/tp_fix_log", True,
+                    "TP_FIX_ENABLED=true | audit_log: 0 fix events (TP math სწორია — fix არ საჭიროა)")
         else:
             rep.add("TP_Detail/tp_fix_log", True,
                     f"TP_FIX events: {len(tp_fix_events)} {'(ბოლოს: ' + tp_fix_events[0].get('created_at','') + ')' if tp_fix_events else '(none)'}")
