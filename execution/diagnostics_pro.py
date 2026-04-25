@@ -1346,6 +1346,598 @@ def check_dca_positions(rep: Report, conn: sqlite3.Connection):
         )
 
 
+# =============================================================================
+# SECTION 17: ENTRY LOGIC — executed_signals + REJECT events
+# (shell audit section 1 — not in original diagnostics_pro)
+# =============================================================================
+
+def check_entry_logic(rep: Report, conn: sqlite3.Connection):
+    """
+    შემოწმება:
+      - ბოლო 20 executed signal
+      - REJECT events (რატომ არ ყიდულობს)
+      - MAX_OPEN_TRADES blocks
+      - დღევანდელი trade count
+    """
+    # ── ბოლო 20 executed signal ──────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT signal_id, action, symbol, executed_at "
+            "FROM executed_signals ORDER BY executed_at DESC LIMIT 20"
+        ).fetchall()
+        signals = [dict(r) for r in rows]
+
+        demo_count = sum(1 for s in signals if "DEMO" in str(s.get("action", "")))
+        live_count = sum(1 for s in signals if "LIVE" in str(s.get("action", "")))
+        reject_count = sum(1 for s in signals if "REJECT" in str(s.get("action", "")))
+
+        rep.add("Entry/executed_signals", True,
+                f"ბოლო 20 signal: demo={demo_count} live={live_count} reject={reject_count}")
+
+        if reject_count > 0:
+            rejects = [s for s in signals if "REJECT" in str(s.get("action", ""))]
+            for r in rejects[:3]:
+                rep.add("Entry/REJECT_signal", False,
+                        f"[{r.get('executed_at','')}] action={r.get('action','')} sym={r.get('symbol','')}",
+                        severity="WARN",
+                        fix="REJECT actions — execution_engine-ში reason შეამოწმე audit_log-ში")
+    except Exception as e:
+        rep.add("Entry/executed_signals", False, str(e), "WARN",
+                fix="executed_signals ცხრილი ვერ წაიკითხა")
+
+    # ── REJECT events audit_log-დან ───────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT event_type, message, created_at FROM audit_log "
+            "WHERE event_type LIKE '%REJECT%' "
+            "ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        rejects = [dict(r) for r in rows]
+        rep.add("Entry/reject_events", len(rejects) == 0,
+                f"REJECT events audit_log-ში: {len(rejects)}",
+                severity="WARN" if rejects else "INFO",
+                fix="REJECT events ნაპოვნია — audit_log details შეამოწმე" if rejects else "")
+        for r in rejects[:3]:
+            rep.add("Entry/reject_detail", False,
+                    f"[{r.get('created_at','')}] {r.get('event_type','')} | {str(r.get('message',''))[:100]}",
+                    severity="WARN")
+    except Exception as e:
+        rep.add("Entry/reject_events", False, str(e), "WARN")
+
+    # ── MAX_OPEN_TRADES blocks ────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(*) as cnt FROM audit_log "
+            "WHERE event_type='EXEC_REJECT_MAX_OPEN_TRADES'"
+        ).fetchone()
+        cnt = dict(rows)["cnt"] if rows else 0
+        ok = cnt == 0
+        rep.add("Entry/max_open_blocks", ok,
+                f"MAX_OPEN_TRADES blocks: {cnt}",
+                severity="WARN" if cnt > 5 else "INFO",
+                fix=f"MAX_OPEN_TRADES ბლოკი {cnt}-ჯერ — MAX_OPEN_TRADES ENV გაზარდე ან positions გაახსნე" if cnt > 0 else "")
+    except Exception as e:
+        rep.add("Entry/max_open_blocks", False, str(e), "WARN")
+
+    # ── დღევანდელი trades ────────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN opened_at >= date('now') THEN 1 ELSE 0 END) as today "
+            "FROM trades"
+        ).fetchone()
+        d = dict(rows) if rows else {}
+        rep.add("Entry/trade_count", True,
+                f"სულ trades={d.get('total',0)} | დღეს={d.get('today',0)}")
+    except Exception as e:
+        rep.add("Entry/trade_count", False, str(e), "WARN")
+
+
+# =============================================================================
+# SECTION 18: TP DETAIL — NULL TP, math, TP fix log, add-on cooldown
+# (shell audit sections 2+3 — partial overlap with check_dca_positions)
+# =============================================================================
+
+def check_tp_and_addon_detail(rep: Report, conn: sqlite3.Connection):
+    """
+    შემოწმება (check_dca_positions-ს ავსებს, არ მეორებს):
+      - NULL current_tp_price positions
+      - TP % actual (tp/avg - 1) × 100
+      - TP_FIX audit events
+      - add-on orders per position
+      - last_add_on_ts cooldown status
+      - days open per position
+    """
+    # ── NULL TP შემოწმება ─────────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT id, symbol, current_tp_price, avg_entry_price "
+            "FROM dca_positions "
+            "WHERE status='OPEN' AND (current_tp_price IS NULL OR current_tp_price=0)"
+        ).fetchall()
+        null_tp = [dict(r) for r in rows]
+        ok = len(null_tp) == 0
+        rep.add("TP_Detail/null_tp", ok,
+                f"NULL/0 TP positions: {len(null_tp)}",
+                severity="CRITICAL" if not ok else "INFO",
+                fix=(
+                    "NULL TP positions ნაპოვნია! TP_FIX_ENABLED=true შეამოწმე.\n"
+                    "Manual fix: sqlite3 $DB " +
+                    " && ".join(
+                        f"\"UPDATE dca_positions SET current_tp_price=round({float(r.get('avg_entry_price') or 0)*1.0055},6) WHERE id={r.get('id')};\""
+                        for r in null_tp[:3]
+                    )
+                ) if not ok else "")
+    except Exception as e:
+        rep.add("TP_Detail/null_tp", False, str(e), "CRITICAL")
+
+    # ── TP % actual math ─────────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT id, symbol, avg_entry_price, current_tp_price, add_on_count "
+            "FROM dca_positions WHERE status='OPEN'"
+        ).fetchall()
+
+        tp_pct_env = float(os.getenv("DCA_TP_PCT", "0.55"))
+        l3_pct_env = float(os.getenv("CASCADE_TP_L3_PCT", "0.35"))
+        max_addons = int(os.getenv("DCA_MAX_ADD_ONS", "5"))
+        tolerance  = 0.1  # 0.1% tolerance
+
+        for row in rows:
+            d = dict(row)
+            sym  = d["symbol"]
+            avg  = float(d["avg_entry_price"] or 0)
+            tp   = float(d["current_tp_price"] or 0)
+            n    = int(d["add_on_count"] or 0)
+
+            if avg <= 0 or tp <= 0:
+                continue
+
+            actual_pct = (tp / avg - 1.0) * 100.0
+            expected   = l3_pct_env if n >= max_addons else tp_pct_env
+            diff       = abs(actual_pct - expected)
+            ok         = diff < tolerance
+
+            rep.add(f"TP_Detail/math/{sym}",
+                    ok,
+                    f"zone={'L3' if n>=max_addons else 'L2'} "
+                    f"actual={actual_pct:.3f}% expected={expected}% diff={diff:.4f}%",
+                    severity="WARN" if not ok else "INFO",
+                    fix=f"TP_FIX_ENABLED=true ENV-ში — tp_fix.py-ი ასწორებს ყოველ loop-ზე" if not ok else "")
+    except Exception as e:
+        rep.add("TP_Detail/math", False, str(e), "WARN")
+
+    # ── TP_FIX log ───────────────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT event_type, message, created_at FROM audit_log "
+            "WHERE event_type LIKE '%TP_FIX%' ORDER BY id DESC LIMIT 5"
+        ).fetchall()
+        tp_fix_events = [dict(r) for r in rows]
+        tp_fix_enabled = os.getenv("TP_FIX_ENABLED", "true").lower() in ("true", "1", "yes")
+
+        if tp_fix_enabled and not tp_fix_events:
+            rep.add("TP_Detail/tp_fix_log", False,
+                    "TP_FIX_ENABLED=true მაგრამ audit_log-ში TP_FIX event არ არის",
+                    severity="WARN",
+                    fix="tp_fix.py-ი არ მუშაობს — main.py-ში TP_FIX_LOOP შეამოწმე")
+        else:
+            rep.add("TP_Detail/tp_fix_log", True,
+                    f"TP_FIX events: {len(tp_fix_events)} {'(ბოლოს: ' + tp_fix_events[0].get('created_at','') + ')' if tp_fix_events else '(none)'}")
+    except Exception as e:
+        rep.add("TP_Detail/tp_fix_log", False, str(e), "WARN")
+
+    # ── add-on orders per position ────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT o.symbol, o.order_type, o.entry_price, o.qty, "
+            "o.avg_entry_after, o.tp_after, o.filled_at "
+            "FROM dca_orders o "
+            "JOIN dca_positions p ON o.position_id=p.id "
+            "WHERE p.status='OPEN' ORDER BY o.id"
+        ).fetchall()
+        orders = [dict(r) for r in rows]
+
+        initial_cnt = sum(1 for o in orders if o.get("order_type") == "INITIAL")
+        addon_cnt   = sum(1 for o in orders if str(o.get("order_type","")).startswith("ADD_ON"))
+        l3_cnt      = sum(1 for o in orders if o.get("order_type") == "L3_ADDON")
+        rot_cnt     = sum(1 for o in orders if o.get("order_type") == "ROTATION_REINVEST")
+
+        rep.add("TP_Detail/addon_orders", True,
+                f"dca_orders (ღია pos): INITIAL={initial_cnt} ADD_ON={addon_cnt} L3={l3_cnt} ROTATION={rot_cnt}")
+    except Exception as e:
+        rep.add("TP_Detail/addon_orders", False, str(e), "WARN")
+
+    # ── cooldown + days open ─────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT id, symbol, last_add_on_ts, add_on_count, opened_at, "
+            "ROUND(julianday('now')-julianday(opened_at),2) as days_open "
+            "FROM dca_positions WHERE status='OPEN'"
+        ).fetchall()
+
+        cooldown_s  = int(os.getenv("DCA_ADDON_COOLDOWN_SECONDS", "300"))
+        fc_days     = float(os.getenv("FORCE_CLOSE_MAX_DAYS", "10"))
+        now_ts      = _now_utc().timestamp()
+
+        for row in rows:
+            d        = dict(row)
+            sym      = d["symbol"]
+            last_ts  = float(d.get("last_add_on_ts") or 0)
+            days_open= float(d.get("days_open") or 0)
+            n        = int(d.get("add_on_count") or 0)
+
+            # cooldown
+            if last_ts > 0:
+                elapsed   = now_ts - last_ts
+                remaining = max(0, cooldown_s - elapsed)
+                in_cd     = remaining > 0
+                rep.add(f"TP_Detail/cooldown/{sym}",
+                        True,
+                        f"add_on={n} | cooldown={'active, ' + str(int(remaining)) + 's left' if in_cd else 'clear'}")
+
+            # days open vs force close
+            days_warn = fc_days * 0.7  # 70% of FC limit
+            ok        = days_open < fc_days
+            rep.add(f"TP_Detail/days_open/{sym}",
+                    ok,
+                    f"days_open={days_open:.1f}d | fc_limit={fc_days:.0f}d",
+                    severity="WARN" if days_open >= days_warn and ok else ("CRITICAL" if not ok else "INFO"),
+                    fix=f"{sym} FC ზღვარს უახლოვდება ({days_open:.1f}d >= {fc_days:.0f}d) — FORCE_CLOSE trigger-ის ლოდინი" if not ok else "")
+    except Exception as e:
+        rep.add("TP_Detail/cooldown", False, str(e), "WARN")
+
+
+# =============================================================================
+# SECTION 19: FUTURES DB DETAIL — columns, positions, is_mirror_engine
+# (shell audit section 5 — not in original diagnostics_pro)
+# =============================================================================
+
+def check_futures_db_detail(rep: Report, conn: sqlite3.Connection):
+    """
+    შემოწმება:
+      - futures_positions columns — is_mirror_engine, close_reason და სხვა
+      - ღია futures positions (hedge/short/mirror breakdown)
+      - FUTURES/SHORT/HEDGE/MIRROR events audit_log-ში
+    """
+    # ── columns შემოწმება ─────────────────────────────────────────
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(futures_positions)").fetchall()}
+
+        critical_cols = [
+            "is_mirror_engine", "close_reason", "is_dca_hedge",
+            "is_independent_short", "avg_entry_price", "exit_price",
+            "mirror_direction", "mirror_addons_down", "mirror_addons_up",
+            "last_mirror_addon_ts", "hedge_tp_pct", "last_short_addon_ts",
+        ]
+        missing = [c for c in critical_cols if c not in cols]
+
+        ok = len(missing) == 0
+        rep.add("Futures_DB/columns", ok,
+                f"futures_positions columns: {len(cols)} total | missing: {missing if missing else 'none'}",
+                severity="CRITICAL" if missing else "INFO",
+                fix=(
+                    f"Missing columns: {missing}\n"
+                    "Fix: deploy db.py with _migrate_futures_columns() და restart"
+                ) if missing else "")
+    except Exception as e:
+        rep.add("Futures_DB/columns", False, str(e), "CRITICAL",
+                fix="futures_positions PRAGMA fail — ცხრილი არ არსებობს?")
+
+    # ── ღია positions breakdown ───────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT * FROM futures_positions WHERE status='OPEN'"
+        ).fetchall()
+        if rows:
+            cols_names = [d[0] for d in conn.execute("PRAGMA table_info(futures_positions)").fetchall()]
+            positions  = [dict(zip(cols_names, r)) for r in rows]
+
+            hedge_cnt  = sum(1 for p in positions if int(p.get("is_dca_hedge", 0) or 0))
+            indep_cnt  = sum(1 for p in positions if int(p.get("is_independent_short", 0) or 0))
+            mirror_cnt = sum(1 for p in positions if int(p.get("is_mirror_engine", 0) or 0))
+            bear_cnt   = len(positions) - hedge_cnt - indep_cnt - mirror_cnt
+
+            rep.add("Futures_DB/open_positions", True,
+                    f"ღია futures: {len(positions)} total | "
+                    f"hedge={hedge_cnt} indep={indep_cnt} mirror={mirror_cnt} bear={bear_cnt}")
+
+            # Per position TP check
+            for pos in positions:
+                sym      = pos.get("symbol", "?")
+                tp       = float(pos.get("tp_price", 0) or 0)
+                avg_e    = float(pos.get("avg_entry_price", 0) or pos.get("entry_price", 0) or 0)
+                pos_type = ("HEDGE" if int(pos.get("is_dca_hedge", 0) or 0)
+                            else "MIRROR" if int(pos.get("is_mirror_engine", 0) or 0)
+                            else "INDEP" if int(pos.get("is_independent_short", 0) or 0)
+                            else "BEAR")
+                ok = tp > 0
+                rep.add(f"Futures_DB/tp/{sym}_{pos_type}",
+                        ok,
+                        f"type={pos_type} avg_entry={avg_e:.4f} tp={tp:.4f}",
+                        severity="WARN" if not ok else "INFO",
+                        fix=f"futures TP=0 — {sym} {pos_type} position-ი TP-ის გარეშეა!" if not ok else "")
+        else:
+            rep.add("Futures_DB/open_positions", True, "ღია futures positions: 0")
+    except Exception as e:
+        rep.add("Futures_DB/open_positions", False, str(e), "WARN")
+
+    # ── FUTURES/SHORT/HEDGE/MIRROR events ─────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT event_type, COUNT(*) as cnt FROM audit_log "
+            "WHERE event_type LIKE '%FUTURES%' OR event_type LIKE '%SHORT%' "
+            "   OR event_type LIKE '%HEDGE%' OR event_type LIKE '%MIRROR%' "
+            "GROUP BY event_type ORDER BY cnt DESC LIMIT 10"
+        ).fetchall()
+        events = [dict(r) for r in rows]
+        summary = " | ".join(f"{e['event_type']}={e['cnt']}" for e in events[:5])
+        rep.add("Futures_DB/events", True,
+                f"Futures/Short/Hedge/Mirror events: {summary if summary else 'none'}")
+    except Exception as e:
+        rep.add("Futures_DB/events", False, str(e), "WARN")
+
+
+# =============================================================================
+# SECTION 20: REGIME LOG — MARKET_REGIME_CHANGE in audit_log
+# (shell audit section 6 — new after main.py fix)
+# =============================================================================
+
+def check_regime_log(rep: Report, conn: sqlite3.Connection):
+    """
+    შემოწმება:
+      - MARKET_REGIME_CHANGE events (main.py fix #2)
+      - BEAR_BLOCK events
+      - ბოლო regime სტატუსი
+    """
+    try:
+        rows = conn.execute(
+            "SELECT event_type, message, created_at FROM audit_log "
+            "WHERE event_type='MARKET_REGIME_CHANGE' "
+            "ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        regime_events = [dict(r) for r in rows]
+
+        rep.add("Regime_Log/change_events", True,
+                f"MARKET_REGIME_CHANGE events: {len(regime_events)}" +
+                (f" (ბოლო: {regime_events[0].get('created_at','')} → {regime_events[0].get('message','')})"
+                 if regime_events else " (none yet — normal on first run)"))
+    except Exception as e:
+        rep.add("Regime_Log/change_events", False, str(e), "WARN")
+
+    # ── BEAR_BLOCK events ────────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT COUNT(*) as cnt FROM audit_log "
+            "WHERE message LIKE '%BEAR_BLOCK%' OR message LIKE '%BEAR market%'"
+        ).fetchone()
+        cnt = dict(rows)["cnt"] if rows else 0
+        rep.add("Regime_Log/bear_blocks", True,
+                f"BEAR_BLOCK events სულ: {cnt}" +
+                (" (ნორმალური — BEAR MODE ADD-ON ბლოკი)" if cnt > 0 else " (none)"))
+    except Exception as e:
+        rep.add("Regime_Log/bear_blocks", False, str(e), "WARN")
+
+
+# =============================================================================
+# SECTION 21: INFRA DETAIL — WAL, integrity, tables, kill_switch
+# (shell audit section 7 — partial overlap with check_db/check_system_state)
+# =============================================================================
+
+def check_infra_detail(rep: Report, conn: sqlite3.Connection):
+    """
+    შემოწმება (check_db-ს ავსებს):
+      - PRAGMA integrity_check
+      - PRAGMA journal_mode (WAL)
+      - tables სია + missing tables
+      - kill_switch + startup_sync_ok
+      - error events ბოლო 24h
+    """
+    # ── integrity ─────────────────────────────────────────────────
+    try:
+        result = conn.execute("PRAGMA integrity_check").fetchone()
+        ok = result and result[0] == "ok"
+        rep.add("Infra/integrity", ok,
+                f"PRAGMA integrity_check: {result[0] if result else 'failed'}",
+                severity="CRITICAL" if not ok else "INFO",
+                fix="DB corruption detected — sqlite3 backup + restore საჭიროა" if not ok else "")
+    except Exception as e:
+        rep.add("Infra/integrity", False, str(e), "CRITICAL")
+
+    # ── WAL mode ──────────────────────────────────────────────────
+    try:
+        result = conn.execute("PRAGMA journal_mode").fetchone()
+        mode = result[0] if result else "?"
+        ok   = mode == "wal"
+        rep.add("Infra/wal_mode", ok,
+                f"journal_mode={mode}",
+                severity="WARN" if not ok else "INFO",
+                fix="WAL mode არ არის ჩართული — thread-safety რისკი. db.py WAL pragma შეამოწმე" if not ok else "")
+    except Exception as e:
+        rep.add("Infra/wal_mode", False, str(e), "WARN")
+
+    # ── tables სია ────────────────────────────────────────────────
+    try:
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()}
+        expected_tables = {
+            "system_state", "trades", "oco_links", "audit_log",
+            "executed_signals", "positions", "dca_positions",
+            "dca_orders", "futures_positions", "sl_cooldown_per_symbol",
+        }
+        missing = expected_tables - tables
+        extra   = tables - expected_tables
+
+        ok = len(missing) == 0
+        rep.add("Infra/tables", ok,
+                f"tables: {len(tables)} | missing={list(missing) if missing else 'none'} | extra={list(extra) if extra else 'none'}",
+                severity="CRITICAL" if missing else "INFO",
+                fix=f"Missing tables: {list(missing)} — DB migration გაუშვი" if missing else "")
+    except Exception as e:
+        rep.add("Infra/tables", False, str(e), "CRITICAL")
+
+    # ── error events ბოლო 24h ────────────────────────────────────
+    try:
+        rows = conn.execute(
+            "SELECT event_type, message, created_at FROM audit_log "
+            "WHERE (event_type LIKE '%FAIL%' OR event_type LIKE '%ERROR%') "
+            "  AND created_at >= datetime('now','-1 day') "
+            "ORDER BY id DESC LIMIT 10"
+        ).fetchall()
+        errors = [dict(r) for r in rows]
+        ok = len(errors) == 0
+        rep.add("Infra/errors_24h", ok,
+                f"Error events ბოლო 24h: {len(errors)}",
+                severity="WARN" if errors else "INFO",
+                fix="Error events ნაპოვნია — details audit_log-ში შეამოწმე" if errors else "")
+        for e in errors[:3]:
+            rep.add("Infra/error_detail", False,
+                    f"[{e.get('created_at','')}] {e.get('event_type','')} | {str(e.get('message',''))[:80]}",
+                    severity="WARN")
+    except Exception as e:
+        rep.add("Infra/errors_24h", False, str(e), "WARN")
+
+
+# =============================================================================
+# SECTION 22: ENV MATH — TP/capital math + cross-system conflicts
+# (shell audit ENV section — extends check_env with actual math)
+# =============================================================================
+
+def check_env_math(rep: Report):
+    """
+    შემოწმება (check_env-ს ავსებს — მხოლოდ math-based checks):
+      - TP net profit calculation (tp - fee >= min_net)
+      - Capital math (quote + addon_sum <= max_capital)
+      - ADDON_SIZES count vs MAX_ADD_ONS
+      - TRIGGER_PCTS ascending order
+      - Cross-system conflicts (6 checks)
+    """
+    # ── TP MATH ───────────────────────────────────────────────────
+    try:
+        tp_pct   = float(os.getenv("DCA_TP_PCT",                "0.55"))
+        l3_pct   = float(os.getenv("CASCADE_TP_L3_PCT",         "0.35"))
+        fee      = float(os.getenv("ESTIMATED_ROUNDTRIP_FEE_PCT","0.20"))
+        min_net  = float(os.getenv("MIN_NET_PROFIT_PCT",         "0.01"))
+        tp_sync  = float(os.getenv("TP_PCT",                    "0.55"))
+
+        net_l2 = tp_pct - fee
+        net_l3 = l3_pct - fee
+
+        rep.add("ENV_Math/tp_net_l2",
+                net_l2 >= min_net,
+                f"L2: TP={tp_pct}% - FEE={fee}% = NET={net_l2:.3f}% (min={min_net}%)",
+                severity="CRITICAL" if net_l2 < 0 else ("WARN" if net_l2 < min_net else "INFO"),
+                fix=f"L2 net profit={net_l2:.3f}% < MIN_NET={min_net}% — DCA_TP_PCT გაზარდე ან FEE შეამოწმე" if net_l2 < min_net else "")
+
+        rep.add("ENV_Math/tp_net_l3",
+                net_l3 >= 0,
+                f"L3: TP={l3_pct}% - FEE={fee}% = NET={net_l3:.3f}%",
+                severity="CRITICAL" if net_l3 < 0 else "INFO",
+                fix=f"L3 net profit={net_l3:.3f}% უარყოფითია! TP hit = ზარალი!" if net_l3 < 0 else "")
+
+        rep.add("ENV_Math/tp_sync",
+                abs(tp_pct - tp_sync) < 0.001,
+                f"TP_PCT={tp_sync}% vs DCA_TP_PCT={tp_pct}%",
+                severity="WARN" if abs(tp_pct - tp_sync) >= 0.001 else "INFO",
+                fix=f"TP_PCT={tp_sync} != DCA_TP_PCT={tp_pct} — სინქრონიზაცია საჭიროა" if abs(tp_pct - tp_sync) >= 0.001 else "")
+
+        l3_lt_l2 = l3_pct < tp_pct
+        rep.add("ENV_Math/l3_lt_l2",
+                l3_lt_l2,
+                f"CASCADE_TP_L3={l3_pct}% < DCA_TP={tp_pct}% = {l3_lt_l2}",
+                severity="WARN" if not l3_lt_l2 else "INFO",
+                fix=f"L3 TP {l3_pct}% >= L2 TP {tp_pct}% — L3 TP უნდა იყოს ნაკლები (L3-ზე პატარა bounce საკმარისია)" if not l3_lt_l2 else "")
+    except Exception as e:
+        rep.add("ENV_Math/tp", False, str(e), "WARN")
+
+    # ── CAPITAL MATH ──────────────────────────────────────────────
+    try:
+        quote     = float(os.getenv("BOT_QUOTE_PER_TRADE",  "50"))
+        max_cap   = float(os.getenv("DCA_MAX_CAPITAL_USDT", "350"))
+        max_open  = int(os.getenv("MAX_OPEN_TRADES",         "6"))
+        sizes_str = os.getenv("DCA_ADDON_SIZES",             "50,65,75,65,40")
+        max_addons= int(os.getenv("DCA_MAX_ADD_ONS",          "5"))
+
+        sizes    = [float(x.strip()) for x in sizes_str.split(",") if x.strip()]
+        addon_sum= sum(sizes)
+        auto_cap = quote + addon_sum
+
+        rep.add("ENV_Math/capital",
+                max_cap >= auto_cap,
+                f"BOT_QUOTE={quote} + ADDON_SUM={addon_sum} = {auto_cap} <= MAX_CAP={max_cap}",
+                severity="WARN" if max_cap < auto_cap else "INFO",
+                fix=f"DCA_MAX_CAPITAL_USDT={max_cap} < required={auto_cap} — ADD-ONs ვერ დასრულდება" if max_cap < auto_cap else "")
+
+        rep.add("ENV_Math/sizes_count",
+                len(sizes) == max_addons,
+                f"DCA_ADDON_SIZES count={len(sizes)} | DCA_MAX_ADD_ONS={max_addons}",
+                severity="CRITICAL" if len(sizes) != max_addons else "INFO",
+                fix=f"ADDON_SIZES count={len(sizes)} != MAX_ADD_ONS={max_addons} — სიები ერთი სიგრძის უნდა იყოს" if len(sizes) != max_addons else "")
+    except Exception as e:
+        rep.add("ENV_Math/capital", False, str(e), "WARN")
+
+    # ── TRIGGER_PCTS ascending ────────────────────────────────────
+    try:
+        triggers_str = os.getenv("DCA_ADDON_TRIGGER_PCTS", "1.0,2.2,3.5,5.0,6.5")
+        triggers = [float(x.strip()) for x in triggers_str.split(",") if x.strip()]
+        ascending = all(triggers[i] < triggers[i+1] for i in range(len(triggers)-1))
+        rep.add("ENV_Math/triggers_ascending",
+                ascending,
+                f"DCA_ADDON_TRIGGER_PCTS={triggers} ascending={ascending}",
+                severity="CRITICAL" if not ascending else "INFO",
+                fix="DCA_ADDON_TRIGGER_PCTS უნდა იყოს ascending — e.g. 1.0,2.2,3.5,5.0,6.5" if not ascending else "")
+    except Exception as e:
+        rep.add("ENV_Math/triggers", False, str(e), "WARN")
+
+    # ── CROSS-SYSTEM CONFLICTS ────────────────────────────────────
+    try:
+        bot_q  = float(os.getenv("BOT_QUOTE_PER_TRADE", "50"))
+        max_q  = float(os.getenv("MAX_QUOTE_PER_TRADE",  "50"))
+        rep.add("ENV_Math/quote_conflict",
+                bot_q <= max_q,
+                f"BOT_QUOTE={bot_q} <= MAX_QUOTE={max_q}",
+                severity="CRITICAL" if bot_q > max_q else "INFO",
+                fix=f"BOT_QUOTE={bot_q} > MAX_QUOTE={max_q} — trade ბლოკდება!" if bot_q > max_q else "")
+
+        fut_fc  = float(os.getenv("FUTURES_DCA_FC_DRAWDOWN_PCT", "22.0"))
+        long_fc = float(os.getenv("FORCE_CLOSE_DRAWDOWN_PCT",    "15.0"))
+        rep.add("ENV_Math/fc_hierarchy",
+                fut_fc >= long_fc,
+                f"FUTURES_FC={fut_fc}% vs LONG_FC={long_fc}%",
+                severity="WARN" if fut_fc < long_fc else "INFO",
+                fix=f"FUTURES_FC={fut_fc}% < LONG_FC={long_fc}% — hedge LONG-ზე ადრე იხურება" if fut_fc < long_fc else "")
+
+        mirror_t  = float(os.getenv("MIRROR_TRIGGER_PCT",       "8.59"))
+        triggers_str = os.getenv("DCA_ADDON_TRIGGER_PCTS",      "1.0,2.2,3.5,5.0,6.5")
+        triggers   = [float(x.strip()) for x in triggers_str.split(",") if x.strip()]
+        max_depth  = max(triggers) if triggers else 6.5
+        rep.add("ENV_Math/mirror_vs_dca",
+                mirror_t > max_depth,
+                f"MIRROR_TRIGGER={mirror_t}% vs DCA_max_depth={max_depth}%",
+                severity="WARN" if mirror_t <= max_depth else "INFO",
+                fix=f"MIRROR_TRIGGER={mirror_t}% <= DCA depth={max_depth}% — MIRROR DCA-ზე ადრე იხსნება" if mirror_t <= max_depth else "")
+
+        daily_loss = float(os.getenv("DAILY_MAX_LOSS_USDT",    "150"))
+        max_cap2   = float(os.getenv("DCA_MAX_CAPITAL_USDT",   "350"))
+        rep.add("ENV_Math/daily_loss",
+                daily_loss >= max_cap2 * 0.1,
+                f"DAILY_MAX_LOSS={daily_loss} vs 10%_of_MaxCap={max_cap2*0.1:.0f}",
+                severity="WARN" if daily_loss < max_cap2 * 0.1 else "INFO",
+                fix=f"DAILY_MAX_LOSS={daily_loss} < 10% of position ({max_cap2*0.1:.0f}) — ძალიან სწრაფად შეჩერდება" if daily_loss < max_cap2 * 0.1 else "")
+
+        short_l1 = float(os.getenv("SHORT_L1_TRIGGER_PCT", "1.6"))
+        dca_t1   = triggers[0] if triggers else 1.0
+        rep.add("ENV_Math/short_vs_dca_trigger",
+                short_l1 >= dca_t1,
+                f"SHORT_L1_TRIGGER={short_l1}% vs DCA_TRIGGER[0]={dca_t1}%",
+                severity="WARN" if short_l1 < dca_t1 else "INFO",
+                fix=f"SHORT_L1={short_l1}% < DCA_TRIGGER[0]={dca_t1}% — SHORT LONG ADD-ON-ზე ადრე იხსნება" if short_l1 < dca_t1 else "")
+    except Exception as e:
+        rep.add("ENV_Math/conflicts", False, str(e), "WARN")
+
+
+
 def run_full_diagnostics(
     db_path: Optional[str] = None,
     base_path: str = "/opt/render/project/src",
@@ -1399,6 +1991,24 @@ def run_full_diagnostics(
 
         # 16. DCA-სპეციფიური შემოწმებები
         check_dca_positions(rep, conn)
+
+        # 17. Entry logic detail (shell audit §1)
+        check_entry_logic(rep, conn)
+
+        # 18. TP + ADD-ON detail (shell audit §2+3)
+        check_tp_and_addon_detail(rep, conn)
+
+        # 19. Futures DB columns + positions (shell audit §5)
+        check_futures_db_detail(rep, conn)
+
+        # 20. Regime log (shell audit §6 — MARKET_REGIME_CHANGE)
+        check_regime_log(rep, conn)
+
+        # 21. Infra detail — WAL, integrity, tables, errors (shell audit §7)
+        check_infra_detail(rep, conn)
+
+    # 22. ENV math + cross-conflicts (shell audit ENV section)
+    check_env_math(rep)
 
     # 14. API connectivity
     check_api_connectivity(rep)
