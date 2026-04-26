@@ -260,22 +260,30 @@ STRUCT_SOFT_REQUIRE_LAST_UP = int(os.getenv("STRUCT_SOFT_REQUIRE_LAST_UP", "1"))
 #   PAIRS_TRADING_ENABLED=true     → ჩართვა (default: false — უსაფრთხო)
 #   PAIRS_RATIO_WINDOW=20          → რამდენი სანთელი ratio history-ში (z-score გამოსათვლელად)
 #   PAIRS_DIVERGENCE_THRESHOLD=1.5 → z-score threshold BTC/ETH divergence-ისთვის
-#   PAIRS_ADDON_COOLDOWN=300       → წამები ADD-ON-ებს შორის (anti-spam)
+#   PAIRS_ADDON_COOLDOWN=600       → წამები ADD-ON-ებს შორის (anti-spam)
 #   PAIRS_LEAD_SYMBOL=BTC/USDT    → "ლიდერი" pair (ის რომელიც პირველი זזის)
-#   PAIRS_LAG_SYMBOL=ETH/USDT     → "ლაგი" pair (ის რომელზეც ADD-ON ემიტდება)
+#   PAIRS_LAG_SYMBOLS=ETH/USDT,BNB/USDT → "ლაგი" pairs (multi — ADD-ON ყველაზე)
+#   PAIRS_LAG_SYMBOL=ETH/USDT     → legacy single lag (უპირატესობა PAIRS_LAG_SYMBOLS-ს)
 #   PAIRS_MIN_LEAD_MOVE_PCT=0.3   → ლიდერის მინ. გადაადგილება trigger-ისთვის
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 PAIRS_TRADING_ENABLED      = os.getenv("PAIRS_TRADING_ENABLED", "false").strip().lower() == "true"
 PAIRS_RATIO_WINDOW         = int(os.getenv("PAIRS_RATIO_WINDOW", "20"))
 PAIRS_DIVERGENCE_THRESHOLD = float(os.getenv("PAIRS_DIVERGENCE_THRESHOLD", "1.5"))
-PAIRS_ADDON_COOLDOWN       = int(os.getenv("PAIRS_ADDON_COOLDOWN", "300"))
+PAIRS_ADDON_COOLDOWN       = int(os.getenv("PAIRS_ADDON_COOLDOWN", "600"))
 PAIRS_LEAD_SYMBOL          = os.getenv("PAIRS_LEAD_SYMBOL", "BTC/USDT").strip().upper()
 PAIRS_LAG_SYMBOL           = os.getenv("PAIRS_LAG_SYMBOL", "ETH/USDT").strip().upper()
 PAIRS_MIN_LEAD_MOVE_PCT    = float(os.getenv("PAIRS_MIN_LEAD_MOVE_PCT", "0.3"))
+# multi-lag: BTC → ETH + BNB (comma-separated, PAIRS_LAG_SYMBOL fallback თუ არ დაყენდა)
+_pairs_lag_env             = os.getenv("PAIRS_LAG_SYMBOLS", "").strip()
+PAIRS_LAG_SYMBOLS: List[str] = (
+    [s.strip().upper() for s in _pairs_lag_env.split(",") if s.strip()]
+    if _pairs_lag_env else [PAIRS_LAG_SYMBOL]
+)
 
 # in-memory state — pairs trading
-_pairs_addon_last_ts: float = 0.0          # ბოლო PAIRS_ADDON emit timestamp
-_pairs_ratio_history: List[float] = []     # rolling BTC/ETH ratio window
+_pairs_addon_last_ts: float = 0.0                    # legacy single-lag timestamp
+_pairs_addon_last_ts_per_lag: Dict[str, float] = {}  # per-lag cooldown tracker
+_pairs_ratio_history: List[float] = []               # rolling BTC/ETH ratio window
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # #TIME_BASED_TP — სკალპ ბოტის TP დროის მიხედვით
@@ -1495,53 +1503,47 @@ def _pairs_lead_move_pct(lead_closes: List[float], lookback: int = 3) -> float:
 
 def _pairs_trading_check(outbox_path: str) -> Optional[Dict[str, Any]]:
     """
-    Pairs Trading — BTC/ETH კორელაციური ADD-ON ლოგიკა.
+    Pairs Trading — BTC → ETH + BNB multi-lag კორელაციური ADD-ON ლოგიკა.
 
     Flow:
       1. PAIRS_TRADING_ENABLED=false → None (fast exit)
-      2. PAIRS_ADDON_COOLDOWN → spam protection
+      2. PAIRS_ADDON_COOLDOWN → per-lag spam protection
       3. lag_symbol-ზე ღია trade შემოწმება (ADD-ON მოითხოვს ღია position)
-      4. BTC + ETH series fetch (PAIRS_RATIO_WINDOW სანთელი)
+      4. BTC + lag series fetch (PAIRS_RATIO_WINDOW სანთელი)
       5. ratio series → z-score
       6. z-score > THRESHOLD AND BTC-ის ბოლო N სანთელი +PAIRS_MIN_LEAD_MOVE_PCT%
-         → ETH ADD-ON signal emit
+         → lag ADD-ON signal emit
       7. signal_type="PAIRS_ADDON" (main.py/execution_engine-ი ამუშავებს ADD-ON-ად)
+      8. multi-lag: PAIRS_LAG_SYMBOLS=ETH/USDT,BNB/USDT — ყველა lag-ზე შემოწმება
 
     Returns:
-      signal dict თუ ADD-ON emit მოხდა, None სხვა შემთხვევაში.
+      signal dict პირველი triggered lag-ისთვის, None სხვა შემთხვევაში.
     """
-    global _pairs_addon_last_ts, _pairs_ratio_history
+    global _pairs_addon_last_ts, _pairs_addon_last_ts_per_lag, _pairs_ratio_history
 
     if not PAIRS_TRADING_ENABLED:
         return None
 
-    # ── cooldown ────────────────────────────────────────────────
-    elapsed = time.time() - _pairs_addon_last_ts
-    if elapsed < PAIRS_ADDON_COOLDOWN:
+    # ── lead closes ერთხელ fetch-ავს — ყველა lag-ი იყენებს ──────
+    _now = time.time()
+    window = max(PAIRS_RATIO_WINDOW + 2, 10)
+    lead_closes = _pairs_fetch_closes_series(PAIRS_LEAD_SYMBOL, TIMEFRAME, window)
+    if len(lead_closes) < 3:
+        logger.debug(f"[PAIRS] INSUFFICIENT_LEAD_DATA | {PAIRS_LEAD_SYMBOL} len={len(lead_closes)}")
+        return None
+
+    lead_move_pct = _pairs_lead_move_pct(lead_closes, lookback=3)
+
+    # ── lead move საკმარისი? ─────────────────────────────────────
+    if lead_move_pct < PAIRS_MIN_LEAD_MOVE_PCT:
         if GEN_DEBUG:
             logger.debug(
-                f"[PAIRS] COOLDOWN | remaining={int(PAIRS_ADDON_COOLDOWN - elapsed)}s"
+                f"[PAIRS] LEAD_MOVE_INSUFFICIENT | lead_move={lead_move_pct:+.3f}% "
+                f"< min={PAIRS_MIN_LEAD_MOVE_PCT}% → skip all lags"
             )
         return None
 
-    # ── lag symbol-ზე ღია trade საჭიროა ────────────────────────
-    # ADD-ON ლოგიკა: ახალი position კი არ იხსნება, არსებულ position-ს ემატება $12.
-    # თუ ღია trade არ არის → ADD-ON უაზროა.
-    try:
-        lag_open = has_open_trade_for_symbol(PAIRS_LAG_SYMBOL)
-    except Exception as e:
-        logger.warning(f"[PAIRS] open_trade_check_fail | err={e} → skip")
-        return None
-
-    if not lag_open:
-        if GEN_DEBUG:
-            logger.debug(
-                f"[PAIRS] NO_OPEN_TRADE | lag={PAIRS_LAG_SYMBOL} → ADD-ON requires open position"
-            )
-        return None
-
-    # ── MAX_OPEN_TRADES guard ────────────────────────────────────
-    # ADD-ON ახალ row-ს ამატებს DB-ში — იგივე slot limit მოქმედებს
+    # ── MAX_OPEN_TRADES global guard ─────────────────────────────
     if MAX_OPEN_TRADES > 0:
         try:
             _pairs_dca_mode = os.getenv("DCA_ENABLED", "false").strip().lower() in ("1", "true", "yes")
@@ -1551,132 +1553,147 @@ def _pairs_trading_check(outbox_path: str) -> Optional[Dict[str, Any]]:
                 _total = len(get_all_open_trades() or [])
             if _total >= MAX_OPEN_TRADES:
                 if GEN_DEBUG:
-                    logger.debug(
-                        f"[PAIRS] BLOCKED_MAX_OPEN | total={_total} >= {MAX_OPEN_TRADES}"
-                    )
+                    logger.debug(f"[PAIRS] BLOCKED_MAX_OPEN | total={_total} >= {MAX_OPEN_TRADES}")
                 return None
         except Exception:
-            pass  # fail-open — სჯობს skip-ი spam-ს
+            pass
 
-    # ── BTC + ETH closes fetch ───────────────────────────────────
-    window = max(PAIRS_RATIO_WINDOW + 2, 10)
-    lead_closes = _pairs_fetch_closes_series(PAIRS_LEAD_SYMBOL, TIMEFRAME, window)
-    lag_closes  = _pairs_fetch_closes_series(PAIRS_LAG_SYMBOL,  TIMEFRAME, window)
+    # ── multi-lag loop ────────────────────────────────────────────
+    for LAG_SYM in PAIRS_LAG_SYMBOLS:
 
-    if len(lead_closes) < 3 or len(lag_closes) < 3:
-        logger.debug(f"[PAIRS] INSUFFICIENT_DATA | lead={len(lead_closes)} lag={len(lag_closes)}")
-        return None
-
-    # series-ები ერთი სიგრძის უნდა იყოს
-    min_len = min(len(lead_closes), len(lag_closes))
-    lead_closes = lead_closes[-min_len:]
-    lag_closes  = lag_closes[-min_len:]
-
-    # ── ratio series ─────────────────────────────────────────────
-    ratio_series: List[float] = []
-    for lc, ec in zip(lead_closes, lag_closes):
-        if ec <= 0:
+        # per-lag cooldown
+        _lag_last_ts = _pairs_addon_last_ts_per_lag.get(LAG_SYM, 0.0)
+        elapsed = _now - _lag_last_ts
+        if elapsed < PAIRS_ADDON_COOLDOWN:
+            if GEN_DEBUG:
+                logger.debug(
+                    f"[PAIRS] COOLDOWN | lag={LAG_SYM} remaining={int(PAIRS_ADDON_COOLDOWN - elapsed)}s"
+                )
             continue
-        ratio_series.append(lc / ec)
 
-    if len(ratio_series) < 3:
-        return None
+        # lag-ზე ღია trade საჭიროა
+        try:
+            lag_open = has_open_trade_for_symbol(LAG_SYM)
+        except Exception as e:
+            logger.warning(f"[PAIRS] open_trade_check_fail | lag={LAG_SYM} err={e} → skip")
+            continue
 
-    # ── z-score ──────────────────────────────────────────────────
-    z = _pairs_zscore(ratio_series)
-    if z is None:
-        if GEN_DEBUG:
-            logger.debug(f"[PAIRS] FLAT_RATIO | z=None → skip")
-        return None
+        if not lag_open:
+            if GEN_DEBUG:
+                logger.debug(
+                    f"[PAIRS] NO_OPEN_TRADE | lag={LAG_SYM} → ADD-ON requires open position"
+                )
+            continue
 
-    ratio_now = ratio_series[-1]
-    ratio_mean = sum(ratio_series[:-1]) / len(ratio_series[:-1])
+        # ── lag closes fetch ─────────────────────────────────────
+        lag_closes = _pairs_fetch_closes_series(LAG_SYM, TIMEFRAME, window)
+        if len(lag_closes) < 3:
+            logger.debug(f"[PAIRS] INSUFFICIENT_LAG_DATA | {LAG_SYM} len={len(lag_closes)}")
+            continue
 
-    # ── ლიდერის ბოლო სანთლების მოძრაობა ─────────────────────────
-    lead_move_pct = _pairs_lead_move_pct(lead_closes, lookback=3)
+        # series-ები ერთი სიგრძის უნდა იყოს
+        min_len = min(len(lead_closes), len(lag_closes))
+        _lead = lead_closes[-min_len:]
+        _lag  = lag_closes[-min_len:]
 
-    if GEN_DEBUG:
-        logger.info(
-            f"[PAIRS] STATUS | z={z:.3f} threshold={PAIRS_DIVERGENCE_THRESHOLD} "
-            f"ratio_now={ratio_now:.4f} ratio_mean={ratio_mean:.4f} "
-            f"lead_move={lead_move_pct:+.3f}% min_move={PAIRS_MIN_LEAD_MOVE_PCT}% "
-            f"lead={PAIRS_LEAD_SYMBOL} lag={PAIRS_LAG_SYMBOL}"
-        )
+        # ── ratio series ─────────────────────────────────────────
+        ratio_series: List[float] = []
+        for lc, ec in zip(_lead, _lag):
+            if ec <= 0:
+                continue
+            ratio_series.append(lc / ec)
 
-    # ── trigger condition ─────────────────────────────────────────
-    # z > +threshold → BTC ძვირდება ETH-თან → ETH "ჩამორჩა" → ADD-ON
-    # AND ლიდერი (BTC) ნამდვილად ავიდა (არა noise)
-    if z < PAIRS_DIVERGENCE_THRESHOLD:
-        return None
+        if len(ratio_series) < 3:
+            continue
 
-    if lead_move_pct < PAIRS_MIN_LEAD_MOVE_PCT:
+        # ── z-score ──────────────────────────────────────────────
+        z = _pairs_zscore(ratio_series)
+        if z is None:
+            if GEN_DEBUG:
+                logger.debug(f"[PAIRS] FLAT_RATIO | lag={LAG_SYM} z=None → skip")
+            continue
+
+        ratio_now  = ratio_series[-1]
+        ratio_mean = sum(ratio_series[:-1]) / len(ratio_series[:-1])
+
         if GEN_DEBUG:
             logger.info(
-                f"[PAIRS] LEAD_MOVE_INSUFFICIENT | lead_move={lead_move_pct:+.3f}% "
-                f"< min={PAIRS_MIN_LEAD_MOVE_PCT}% → skip"
+                f"[PAIRS] STATUS | lag={LAG_SYM} z={z:.3f} threshold={PAIRS_DIVERGENCE_THRESHOLD} "
+                f"ratio_now={ratio_now:.4f} ratio_mean={ratio_mean:.4f} "
+                f"lead_move={lead_move_pct:+.3f}% min_move={PAIRS_MIN_LEAD_MOVE_PCT}% "
+                f"lead={PAIRS_LEAD_SYMBOL}"
             )
-        return None
 
-    # ── ADD-ON signal emit ────────────────────────────────────────
-    lag_price = lag_closes[-1]
-    signal_id = str(uuid.uuid4())
+        # ── trigger condition ─────────────────────────────────────
+        # z > +threshold → BTC ძვირდება lag-თან → lag "ჩამორჩა" → ADD-ON
+        if z < PAIRS_DIVERGENCE_THRESHOLD:
+            continue
 
-    sig = {
-        "signal_id":        signal_id,
-        "ts_utc":           _now_utc_iso(),
-        "certified_signal": True,
-        "final_verdict":    "TRADE",
-        "signal_type":      "PAIRS_ADDON",   # execution_engine-ი ამ field-ით განასხვავებს
-        "trend":            round(lead_move_pct / 100.0, 4),
-        "atr_pct":          0.0,
-        "meta": {
-            "source":          "PAIRS_TRADING",
-            "symbol":          PAIRS_LAG_SYMBOL,
-            "lead_symbol":     PAIRS_LEAD_SYMBOL,
-            "lag_symbol":      PAIRS_LAG_SYMBOL,
-            "z_score":         round(z, 4),
-            "ratio_now":       round(ratio_now, 6),
-            "ratio_mean":      round(ratio_mean, 6),
-            "lead_move_pct":   round(lead_move_pct, 4),
-            "divergence_thr":  PAIRS_DIVERGENCE_THRESHOLD,
-            "lag_price":       lag_price,
-            "reason":          (
-                f"BTC+{lead_move_pct:.2f}% ETH_lagging "
-                f"z={z:.2f}>{PAIRS_DIVERGENCE_THRESHOLD} "
-                f"ratio={ratio_now:.4f} mean={ratio_mean:.4f}"
-            ),
-        },
-        "execution": {
-            "symbol":       PAIRS_LAG_SYMBOL,
-            "direction":    "LONG",
-            "entry":        {"type": "MARKET"},
-            "quote_amount": BOT_QUOTE_PER_TRADE,  # სტანდარტული $12
-        },
-        "adaptive": {
-            "TP_PCT":     float(os.getenv("DCA_TP_PCT", "0.55")),
-            "SL_PCT":     float(os.getenv("DCA_SL_PCT", "999.0")),
-            "REGIME":     "PAIRS_DIVERGENCE",
-            "ATR_PCT":    0.0,
-            "QUOTE_SIZE": BOT_QUOTE_PER_TRADE,
-            "TRAILING_STOP_ENABLED":  False,
-            "TRAILING_STOP_DISTANCE": 0.0,
-            "USE_PARTIAL_TP":         False,
-            "PARTIAL_TP1_PCT":        0.0,
-            "PARTIAL_TP1_SIZE":       0.0,
-            "USE_BREAKEVEN_STOP":     False,
-            "BREAKEVEN_TRIGGER_PCT":  0.0,
-        },
-    }
+        # ── ADD-ON signal emit ────────────────────────────────────
+        lag_price = _lag[-1]
+        signal_id = str(uuid.uuid4())
 
-    _pairs_addon_last_ts = time.time()
+        sig = {
+            "signal_id":        signal_id,
+            "ts_utc":           _now_utc_iso(),
+            "certified_signal": True,
+            "final_verdict":    "TRADE",
+            "signal_type":      "PAIRS_ADDON",
+            "trend":            round(lead_move_pct / 100.0, 4),
+            "atr_pct":          0.0,
+            "meta": {
+                "source":          "PAIRS_TRADING",
+                "symbol":          LAG_SYM,
+                "lead_symbol":     PAIRS_LEAD_SYMBOL,
+                "lag_symbol":      LAG_SYM,
+                "z_score":         round(z, 4),
+                "ratio_now":       round(ratio_now, 6),
+                "ratio_mean":      round(ratio_mean, 6),
+                "lead_move_pct":   round(lead_move_pct, 4),
+                "divergence_thr":  PAIRS_DIVERGENCE_THRESHOLD,
+                "lag_price":       lag_price,
+                "reason":          (
+                    f"BTC+{lead_move_pct:.2f}% {LAG_SYM}_lagging "
+                    f"z={z:.2f}>{PAIRS_DIVERGENCE_THRESHOLD} "
+                    f"ratio={ratio_now:.4f} mean={ratio_mean:.4f}"
+                ),
+            },
+            "execution": {
+                "symbol":       LAG_SYM,
+                "direction":    "LONG",
+                "entry":        {"type": "MARKET"},
+                "quote_amount": BOT_QUOTE_PER_TRADE,
+            },
+            "adaptive": {
+                "TP_PCT":     float(os.getenv("DCA_TP_PCT", "0.55")),
+                "SL_PCT":     float(os.getenv("DCA_SL_PCT", "999.0")),
+                "REGIME":     "PAIRS_DIVERGENCE",
+                "ATR_PCT":    0.0,
+                "QUOTE_SIZE": BOT_QUOTE_PER_TRADE,
+                "TRAILING_STOP_ENABLED":  False,
+                "TRAILING_STOP_DISTANCE": 0.0,
+                "USE_PARTIAL_TP":         False,
+                "PARTIAL_TP1_PCT":        0.0,
+                "PARTIAL_TP1_SIZE":       0.0,
+                "USE_BREAKEVEN_STOP":     False,
+                "BREAKEVEN_TRIGGER_PCT":  0.0,
+            },
+        }
 
-    logger.info(
-        f"[PAIRS] ADD-ON_SIGNAL | lag={PAIRS_LAG_SYMBOL} "
-        f"z={z:.3f} lead_move={lead_move_pct:+.2f}% "
-        f"ratio={ratio_now:.4f} → emitting ADD-ON ${BOT_QUOTE_PER_TRADE}"
-    )
-    append_signal(sig, outbox_path)
-    return sig
+        # per-lag cooldown timestamp update
+        _pairs_addon_last_ts_per_lag[LAG_SYM] = _now
+        _pairs_addon_last_ts = _now  # legacy compat
+
+        logger.info(
+            f"[PAIRS] ADD-ON_SIGNAL | lag={LAG_SYM} "
+            f"z={z:.3f} lead_move={lead_move_pct:+.2f}% "
+            f"ratio={ratio_now:.4f} → emitting ADD-ON ${BOT_QUOTE_PER_TRADE}"
+        )
+        append_signal(sig, outbox_path)
+        return sig
+
+    # ყველა lag-ი შემოწმდა — trigger არ მოხდა
+    return None
 
 
 def generate_signal() -> Optional[Dict[str, Any]]:
