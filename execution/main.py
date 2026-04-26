@@ -1725,7 +1725,7 @@ def main():
                 _hb_silent = (3 <= _hb_hour < 9)
 
                 # 09:00-03:00 → ყოველ 1 საათში
-                _hb_day_ok = not _hb_silent and (now - last_heartbeat_ts) >= 3600
+                _hb_day_ok = not _hb_silent and (now - last_heartbeat_ts) >= 1800
 
                 # 23:57-23:59 → Daily Summary-სთან ერთად (loop window fix)
                 _hb_midnight_ok = (_hb_hour == 23 and _hb_minute >= 57)
