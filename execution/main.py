@@ -1592,6 +1592,26 @@ def main():
                                       # normal mode: block if ANY position open for symbol
                                       _existing_blocked = _sym_dca_count > 0
 
+                                  # ── per-symbol ENTRY_COOLDOWN ────────────────────
+                                  # ENV: ENTRY_COOLDOWN_SECONDS=600 (0=disabled)
+                                  # იმავე symbol-ზე ახალი L1 position-ი მხოლოდ
+                                  # cooldown-ის გასვლის შემდეგ გაიხსნება.
+                                  # სხვა symbol-ები არ ბლოკდება → stagger effect.
+                                  _entry_cd = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "0"))
+                                  if _entry_cd > 0 and not _existing_blocked:
+                                      try:
+                                          from execution.db.repository import get_last_entry_ts_for_symbol
+                                          _last_e_ts = get_last_entry_ts_for_symbol(_sym) or 0.0
+                                          _cd_elapsed = time.time() - _last_e_ts
+                                          if _cd_elapsed < _entry_cd:
+                                              logger.info(
+                                                  f"[DEMO] ENTRY_COOLDOWN | {_sym} "
+                                                  f"remaining={int(_entry_cd - _cd_elapsed)}s"
+                                              )
+                                              _existing_blocked = True
+                                      except Exception:
+                                          pass  # DB function არ არის → skip cooldown
+
                                   _rejected = _is_real_reject or _at_max or _existing_blocked
                                   if not _rejected:
                                       _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
