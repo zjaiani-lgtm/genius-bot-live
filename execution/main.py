@@ -49,6 +49,15 @@ from typing import Optional, Dict, Any
 #   L1 count:   _LP positions L1-ად არ ითვლება MAX_OPEN_TRADES-ისთვის
 #   ENV: LP_ENABLED, LP_TRIGGER_PCT, LP_QUOTE,
 #        LP_LIVE_USE_LIMIT, LP_LIMIT_TIMEOUT_SECONDS
+#
+# FIX #21 — _check_and_open_lp სიგნალ-დამოუკიდებელი trigger
+#   პრობლემა: LP signal-driven იყო → MAX_OPEN_TRADES=3 ბლოკის გამო
+#             signal_generator L1=3/3-ზე ჩერდება → LP არასოდეს იხსნება
+#   გამოსწორება: _check_and_open_lp() ყოველ main loop-ზე (120s)
+#     L1 ღიაა AND LP არ არის → _open_lp_position() პირდაპირ
+#     L1 avg_entry_price reference, ზუსტი sym match (sym==base_sym)
+#     double-open guard: get_open_dca_position_for_symbol(lp_sym)
+#     backward compat: signal-path LP call ინარჩუნება
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1310,6 +1319,114 @@ def _open_lp_position(
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX #21: _check_and_open_lp — სიგნალ-დამოუკიდებელი LP trigger
+#
+# პრობლემა (FIX #20 bug):
+#   LP გახსნა signal-driven იყო — მაგრამ MAX_OPEN_TRADES=3 ბლოკის
+#   გამო signal_generator ახალ სიგნალს ვეღარ გამოუშვებს (L1=3/3),
+#   LP კი სიგნალს ელოდება → არასოდეს იხსნება.
+#
+# გამოსწორება:
+#   ყოველ main loop iteration-ზე (120s) შეამოწმებს:
+#     1. L1 position ღიაა sym-ზე?
+#     2. LP position უკვე ღიაა sym_LP-ზე?
+#     3. თუ L1=yes, LP=no → _open_lp_position() გამოიძახება
+#   სიგნალ-trigger-ი ინარჩუნებს backward compatibility-ს
+#   (LIVE-ზე signal path-ი LP-ს უფრო ადრე გახსნიდა).
+#
+# ENV: LP_ENABLED=true — გამორთვა შესაძლებელია
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _check_and_open_lp(engine, tp_pct: float, max_add_ons: int, max_capital: float) -> None:
+    """
+    L-Phantom loop check — ყოველ main loop-ზე გამოიძახება.
+
+    სიგნალ-დამოუკიდებელი trigger:
+      L1 ღიაა AND LP არ არის → _open_lp_position()
+
+    L1 avg_entry_price-ს იყენებს reference-ად (არა current price),
+    რადგან LP-ი L1-ის entry-ს -0.20%-ზე ქვემოთ უნდა გაიხსნას.
+
+    DEMO: ვირტუალური fill @ L1_avg × (1 - LP_TRIGGER_PCT/100)
+    LIVE: limit ან market — _open_lp_position()-ში განისაზღვრება
+    """
+    if not os.getenv("LP_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
+        return
+
+    from execution.db.repository import (
+        get_all_open_dca_positions,
+        get_open_dca_position_for_symbol,
+        log_event,
+    )
+    import uuid as _uuid_lp
+
+    # BOT_SYMBOLS-დან base symbols — L1 positions-ის სიმბოლოები
+    symbols_raw = os.getenv("BOT_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT")
+    base_symbols = [s.strip() for s in symbols_raw.split(",") if s.strip()]
+
+    # ყველა ღია position — L1-ების გასაფილტრად
+    try:
+        all_open = get_all_open_dca_positions() or []
+    except Exception as _e:
+        logger.warning(f"[LP_CHECK] DB_FAIL | err={_e}")
+        return
+
+    for base_sym in base_symbols:
+        try:
+            lp_sym = f"{base_sym}_LP"
+
+            # LP უკვე ღიაა? → skip
+            try:
+                existing_lp = get_open_dca_position_for_symbol(lp_sym)
+                if existing_lp:
+                    logger.debug(f"[LP_CHECK] ALREADY_OPEN | {lp_sym} → skip")
+                    continue
+            except Exception as _e:
+                logger.warning(f"[LP_CHECK] LP_CHECK_FAIL | {lp_sym} err={_e}")
+                continue
+
+            # L1 position ღიაა? — suffix-ის გარეშე, ზუსტი match
+            l1_pos = None
+            for p in all_open:
+                sym_raw = str(p.get("symbol", ""))
+                # ზუსტი L1: suffix არ აქვს (არ მთავრდება _L[0-9]+ ან _LP)
+                if sym_raw == base_sym:
+                    l1_pos = p
+                    break
+
+            if not l1_pos:
+                logger.debug(f"[LP_CHECK] NO_L1 | {base_sym} → LP skip")
+                continue
+
+            # L1 avg_entry_price — LP target-ის reference
+            l1_avg = float(l1_pos.get("avg_entry_price") or 0.0)
+            if l1_avg <= 0:
+                logger.warning(f"[LP_CHECK] INVALID_L1_AVG | {base_sym} avg={l1_avg} → skip")
+                continue
+
+            logger.warning(
+                f"[LP_CHECK] TRIGGER | {base_sym} L1_avg={l1_avg:.4f} "
+                f"→ opening {lp_sym}"
+            )
+
+            # signal_id — unique per LP open (loop-triggered, no parent signal)
+            lp_loop_signal_id = f"LP-LOOP-{base_sym.replace('/', '')}-{_uuid_lp.uuid4().hex[:8]}"
+
+            _open_lp_position(
+                engine=engine,
+                base_sym=base_sym,
+                l1_price=l1_avg,
+                signal_id=lp_loop_signal_id,
+                tp_pct=tp_pct,
+                max_add_ons=max_add_ons,
+                max_capital=max_capital,
+                trigger_drop_pct=float(os.getenv("LP_TRIGGER_PCT", "0.20")),
+            )
+
+        except Exception as _e:
+            logger.warning(f"[LP_CHECK] ERR | {base_sym} err={_e}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LAYER2 — Crash Detection & Parallel Trading
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
@@ -2213,6 +2330,31 @@ def main():
                     futures_engine.check_mirror_addons()
                 except Exception as _me:
                     logger.warning(f"MIRROR_ENGINE_LOOP_WARN | err={_me}")
+
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            # FIX #21: LP CHECK — სიგნალ-დამოუკიდებელი trigger
+            # L1 ღიაა AND LP არ არის → _open_lp_position()
+            # ყოველ loop-ზე (120s) — MAX_OPEN_TRADES block-ის გვერდის ავლა
+            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            if _dca_enabled and _lp_enabled_flag:
+                try:
+                    _lp_tp_pct     = float(os.getenv("DCA_TP_PCT", "0.55"))
+                    _lp_max_addons = int(os.getenv("DCA_MAX_ADD_ONS", "5"))
+                    _lp_sizes_str  = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
+                    try:
+                        _lp_addon_sum = sum(float(x.strip()) for x in _lp_sizes_str.split(",") if x.strip())
+                    except Exception:
+                        _lp_addon_sum = 70.0
+                    _lp_auto_cap = float(os.getenv("LP_QUOTE", "50.0")) + _lp_addon_sum
+                    _lp_max_cap  = float(os.getenv("DCA_MAX_CAPITAL_USDT") or _lp_auto_cap)
+                    _check_and_open_lp(
+                        engine=engine,
+                        tp_pct=_lp_tp_pct,
+                        max_add_ons=_lp_max_addons,
+                        max_capital=_lp_max_cap,
+                    )
+                except Exception as _lpe:
+                    logger.warning(f"LP_CHECK_WARN | err={_lpe}")
 
             if _dca_enabled:
                 try:
