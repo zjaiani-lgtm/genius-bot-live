@@ -36,6 +36,19 @@ from typing import Optional, Dict, Any
 #   TP: avg × 0.9945 — სავალდებულო დახურვა
 #   FC: 10 დღე / +15% drawdown — ღია ტრეიდი არ რჩება
 #   ENV: SHORT_DCA_ENABLED=true + SHORT_* params
+#
+# FIX #20 — L-PHANTOM (LP) სისტემა
+#   L1-სა და L2-ს შუა ფენა: L1 გახსნისთანავე LP იხსნება
+#   DEMO:  ვირტუალური entry @ L1_price × (1 - LP_TRIGGER_PCT/100)
+#   LIVE:  LP_LIVE_USE_LIMIT=true  → limit order @ target_price
+#          LP_LIVE_USE_LIMIT=false → market order (current price)
+#   LIVE limit: background thread ამოწმებს fill-ს ყოველ 30 წამში
+#               LP_LIMIT_TIMEOUT_SECONDS-ის შემდეგ cancel → skip
+#   regex fix:  (_L\d+|_LP)$ — ყველა exchange_sym extraction-ში
+#   CASCADE:    _LP suffix-ი sym_positions-დან გამორიცხულია
+#   L1 count:   _LP positions L1-ად არ ითვლება MAX_OPEN_TRADES-ისთვის
+#   ENV: LP_ENABLED, LP_TRIGGER_PCT, LP_QUOTE,
+#        LP_LIVE_USE_LIMIT, LP_LIMIT_TIMEOUT_SECONDS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -83,6 +96,204 @@ logger = logging.getLogger("gbm")
 
 # SIGNAL_EXPIRATION_SECONDS — outbox-დან წამოღებული ძველი signal-ი → skip
 _SIGNAL_EXPIRATION_SECONDS = 0  # DCA: disabled
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX #20: LP LIMIT ORDER TRACKER — LIVE mode background thread
+# pending_lp_orders: {order_id: {symbol, exchange_sym, lp_sym,
+#   target_price, lp_quote, tp_pct, max_add_ons, max_capital,
+#   signal_id, opened_at}}
+# thread ყოველ 30s ამოწმებს fill status-ს Binance-ზე
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_pending_lp_orders: dict = {}  # order_id → metadata
+_pending_lp_lock = None        # threading.Lock — main()-ში init
+
+
+def _lp_limit_tracker_thread(engine_ref_getter, lock) -> None:
+    """
+    LIVE LP limit order tracker — background daemon thread.
+
+    ყოველ 30 წამში:
+      1. pending orders → Binance-ზე status check
+      2. filled → open_dca_position + add_dca_order + open_trade + TG
+      3. timeout (LP_LIMIT_TIMEOUT_SECONDS) → cancel_order + log
+      4. partial fill → accept (filled qty), cancel remainder
+
+    engine_ref_getter: callable → engine instance (late binding,
+    რადგან thread main()-ში engine init-მდე შეიძლება გაეშვას)
+    """
+    import threading
+    timeout_s = int(os.getenv("LP_LIMIT_TIMEOUT_SECONDS", "300"))
+
+    while True:
+        try:
+            time.sleep(30)
+            engine = engine_ref_getter()
+            if engine is None or engine.exchange is None:
+                continue  # DEMO mode — tracker არ სჭირდება
+
+            with lock:
+                orders_snapshot = dict(_pending_lp_orders)
+
+            for order_id, meta in orders_snapshot.items():
+                try:
+                    elapsed = time.time() - meta["opened_at"]
+                    exchange_sym = meta["exchange_sym"]
+                    lp_sym = meta["lp_sym"]
+                    lp_quote = meta["lp_quote"]
+                    target_price = meta["target_price"]
+                    tp_pct = meta["tp_pct"]
+                    signal_id = meta["signal_id"]
+
+                    # Binance-ზე order status წამოღება
+                    try:
+                        order_status = engine.exchange.fetch_order(order_id, exchange_sym)
+                    except Exception as _fe:
+                        logger.warning(f"[LP_TRACKER] FETCH_FAIL | {lp_sym} order={order_id} err={_fe}")
+                        continue
+
+                    status = str(order_status.get("status", "")).lower()
+                    filled_qty = float(order_status.get("filled") or 0.0)
+                    avg_fill_price = float(
+                        order_status.get("average") or
+                        order_status.get("price") or
+                        target_price
+                    )
+
+                    # ── FILLED (სრული ან partial) ──────────────────────
+                    if status in ("closed", "filled") or filled_qty > 0:
+                        if filled_qty <= 0:
+                            # closed მაგრამ 0 fill — cancelled externally
+                            with lock:
+                                _pending_lp_orders.pop(order_id, None)
+                            logger.info(f"[LP_TRACKER] ZERO_FILL | {lp_sym} → removed")
+                            continue
+
+                        actual_quote = filled_qty * avg_fill_price
+                        tp_price = round(avg_fill_price * (1.0 + tp_pct / 100.0), 6)
+
+                        from execution.db.repository import (
+                            open_dca_position, add_dca_order, open_trade,
+                            get_open_dca_position_for_symbol,
+                        )
+
+                        # double-open guard
+                        if get_open_dca_position_for_symbol(lp_sym):
+                            with lock:
+                                _pending_lp_orders.pop(order_id, None)
+                            logger.info(f"[LP_TRACKER] ALREADY_OPEN | {lp_sym} → skip")
+                            continue
+
+                        pos_id = open_dca_position(
+                            symbol=lp_sym,
+                            initial_entry_price=avg_fill_price,
+                            initial_qty=filled_qty,
+                            initial_quote_spent=actual_quote,
+                            tp_price=tp_price,
+                            sl_price=0.0,
+                            tp_pct=tp_pct,
+                            sl_pct=999.0,
+                            max_add_ons=meta["max_add_ons"],
+                            max_capital=meta["max_capital"],
+                            max_drawdown_pct=999.0,
+                        )
+                        add_dca_order(
+                            position_id=pos_id,
+                            symbol=lp_sym,
+                            order_type="LP_INITIAL",
+                            entry_price=avg_fill_price,
+                            qty=filled_qty,
+                            quote_spent=actual_quote,
+                            avg_entry_after=avg_fill_price,
+                            tp_after=tp_price,
+                            sl_after=0.0,
+                            trigger_drawdown_pct=meta.get("trigger_drop_pct", 0.0),
+                            exchange_order_id=order_id,
+                        )
+                        open_trade(
+                            signal_id=signal_id,
+                            symbol=lp_sym,
+                            qty=filled_qty,
+                            quote_in=actual_quote,
+                            entry_price=avg_fill_price,
+                        )
+
+                        with lock:
+                            _pending_lp_orders.pop(order_id, None)
+
+                        logger.warning(
+                            f"[LP_TRACKER] FILLED | {lp_sym} "
+                            f"@ {avg_fill_price:.4f} qty={filled_qty:.6f} "
+                            f"tp={tp_price:.4f} elapsed={elapsed:.0f}s"
+                        )
+                        try:
+                            log_event(
+                                "LP_LIMIT_FILLED",
+                                f"sym={lp_sym} price={avg_fill_price:.4f} "
+                                f"qty={filled_qty:.6f} tp={tp_price:.4f} "
+                                f"elapsed={elapsed:.0f}s"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            from execution.telegram_notifier import notify_signal_created
+                            notify_signal_created(
+                                symbol=lp_sym,
+                                entry_price=avg_fill_price,
+                                quote_amount=actual_quote,
+                                tp_price=tp_price,
+                                sl_price=0.0,
+                                verdict="LP_LIMIT_FILLED",
+                                mode="LIVE",
+                            )
+                        except Exception as _tg:
+                            logger.warning(f"[LP_TRACKER] TG_FAIL | err={_tg}")
+
+                    # ── TIMEOUT → CANCEL ───────────────────────────────
+                    elif elapsed >= timeout_s:
+                        try:
+                            engine.exchange.cancel_order(order_id, exchange_sym)
+                            logger.warning(
+                                f"[LP_TRACKER] TIMEOUT_CANCEL | {lp_sym} "
+                                f"order={order_id} elapsed={elapsed:.0f}s "
+                                f">= timeout={timeout_s}s"
+                            )
+                        except Exception as _ce:
+                            logger.warning(f"[LP_TRACKER] CANCEL_FAIL | {lp_sym} err={_ce}")
+
+                        with lock:
+                            _pending_lp_orders.pop(order_id, None)
+
+                        try:
+                            log_event(
+                                "LP_LIMIT_EXPIRED",
+                                f"sym={lp_sym} order={order_id} "
+                                f"target={target_price:.4f} elapsed={elapsed:.0f}s"
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            from execution.telegram_notifier import send_telegram_message
+                            send_telegram_message(
+                                f"⏱ <b>LP Limit Order Expired</b>\n\n"
+                                f"🪙 <b>Symbol:</b> <code>{lp_sym}</code>\n"
+                                f"🎯 <b>Target:</b> <code>{target_price:.4f}</code>\n"
+                                f"⏸ Unfilled after <code>{timeout_s}s</code> → cancelled\n"
+                                f"🕒 <code>{_now_dt().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                            )
+                        except Exception:
+                            pass
+
+                    else:
+                        logger.debug(
+                            f"[LP_TRACKER] PENDING | {lp_sym} "
+                            f"order={order_id} elapsed={elapsed:.0f}s/{timeout_s}s"
+                        )
+
+                except Exception as _oe:
+                    logger.warning(f"[LP_TRACKER] ORDER_ERR | order={order_id} err={_oe}")
+
+        except Exception as _te:
+            logger.warning(f"[LP_TRACKER] THREAD_ERR | err={_te}")
 
 
 def _bootstrap_state_if_needed() -> None:
@@ -176,7 +387,6 @@ def _run_performance_report_safe(send_telegram: bool = False) -> None:
         logger.warning(f"PERF_REPORT_FAIL | err={e}")
 
 
-
 def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                   market_regime: str = "NEUTRAL",
                   futures_engine=None) -> None:
@@ -191,6 +401,9 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
       5. Add-on → drawdown trigger + recovery signals
          BEAR MODE: L2+L3 ADD-ON+rotation blocked
       6. DCA Hedge SHORT trigger → add_on_count == max_add_ons
+
+    FIX #20: exchange_sym regex გაფართოვდა (_L[0-9]+|_LP)$ —
+    LP positions-ი სწორად მუშაობს DCA loop-ში.
     """
     from execution.db.repository import (
         get_all_open_dca_positions,
@@ -210,8 +423,9 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
         sym = pos["symbol"]
         pos_id = pos["id"]
 
+        # FIX #20: (_L\d+|_LP)$ — LP suffix-ის სწორი strip
         import re as _re_sym
-        exchange_sym = _re_sym.sub(r'_L\d+$', '', sym)
+        exchange_sym = _re_sym.sub(r'(_L\d+|_LP)$', '', sym)
 
         try:
             # current price — DEMO: price_feed, LIVE: exchange
@@ -264,11 +478,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "TP")
 
                     # ── DCA hedge SHORT auto-close (BUG-1 FIX) ─────────
-                    # DCA TP hit → is_dca_hedge=1 SHORT-ი აღარ საჭიროა.
-                    # თუ hedge ჯერ არ გახსნილა → no-op (empty fetch).
-                    # თუ hedge უკვე დაიხურა futures TP-ზე → no-op (status!='OPEN').
-                    # ᲛᲜᲘᲨᲕᲜᲔᲚᲝᲕᲐᲜᲘ: Independent SHORT (is_independent_short=1) აქ
-                    # არ იხურება — მას საკუთარი TP/FC lifecycle აქვს futures_engine-ში.
                     if futures_engine is not None:
                         try:
                             futures_engine.close_dca_hedge_for_position(
@@ -323,20 +532,10 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                         exit_price = float(sell.get("average") or sell.get("price") or current_price)
                     pnl_quote = (exit_price - avg_entry) * total_qty
                     pnl_pct   = (exit_price / avg_entry - 1.0) * 100.0
-                    # pnl_quote-ის ნიშანი FC reason-ზეა დამოკიდებული:
-                    #   FC by drawdown (-15%): exit < avg_entry → pnl_quote უარყოფითია (ზარალი)
-                    #   FC by time (10d):      exit შეიძლება avg-ზე მაღლა იყოს bounce-ის შემდეგ
-                    #                          → pnl_quote დადებითი (მოგება) — არ არის გარანტირებული ზარალი
 
                     close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "FORCE_CLOSE")
 
                     # ── DCA hedge SHORT auto-close (BUG-1 FIX) ─────────
-                    # FORCE_CLOSE → is_dca_hedge=1 SHORT-ი უნდა დაიხუროს.
-                    # FORCE_CLOSE-ის დროს BTC კიდევ ეცემა → hedge SHORT სავარაუდოდ
-                    # მოგებაშია, მაგრამ DCA position-ი აღარ არსებობს hedge-ის გასამართლებლად.
-                    # ᲛᲜᲘᲨᲕᲜᲔᲚᲝᲕᲐᲜᲘ: close_dca_hedge_for_position() მხოლოდ is_dca_hedge=1-ს
-                    # ხურავს (dca_pos_id match). Independent SHORT (is_independent_short=1)
-                    # საკუთარი TP/FC lifecycle-ით იხურება — LONG FC-ზე არ იხურება.
                     if futures_engine is not None:
                         try:
                             futures_engine.close_dca_hedge_for_position(
@@ -398,7 +597,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
 
                         close_dca_position(pos_id, exit_price, total_qty, pnl_quote, pnl_pct, "SL")
 
-                            # trades ცხრილის დახურვა
                         _open_tr = get_open_trade_for_symbol(sym)
                         if not _open_tr:
                             _open_tr = get_open_trade_for_symbol(exchange_sym)
@@ -439,12 +637,10 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                 sl_price = new_sl
 
             # ── 6. Add-on check ──────────────────────────────────────────
-
             all_positions = get_all_open_dca_positions()
             addon_ok, addon_reason = dca_mgr.should_add_on(pos, current_price, ohlcv)
 
             # BEAR MODE: L2 ADD-ON ბლოკილია (SHORT-ს ეწინააღმდეგება)
-            # L3 zone: ბლოკი — ვარდნა გრძელდება, ADD-ON გაზრდის ზარალს
             if market_regime == "BEAR":
                 logger.info(f"[DCA] BEAR_BLOCK | {sym} BEAR market → L2+L3 ADD-ON+rotation blocked")
                 continue
@@ -453,7 +649,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                 logger.debug(f"[DCA] NO_ADDON | {sym} reason={addon_reason}")
 
                 # ── L3 ZONE ──────────────────────────────────────────────
-                # ADD-ON ამოიწურა → L3 zone-ში ვართ
                 n     = int(pos.get("add_on_count", 0))
                 max_n = dca_mgr.max_add_ons
 
@@ -461,8 +656,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     l3_done = int(pos.get("l3_addon_done", 0) or 0)
 
                     if not l3_done:
-                        # ① L3 ADD-ON: ჯერ ერთხელ ყიდვა L2 resource-ით
-                        # trigger: last_addon_price-დან drop >= rotation_trigger_pct
                         last_ap = float(pos.get("last_addon_price") or avg_entry)
                         if last_ap > 0:
                             drop_from_last = (last_ap - current_price) / last_ap * 100.0
@@ -479,8 +672,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                                     f"drop={drop_from_last:.2f}% < {rot_trigger:.1f}%"
                                 )
                     else:
-                        # ② L3 ADD-ON გახსნილია → LIFO rotation
-                        # trigger: last_addon_price (L3 ADD-ON price) -დან drop >= 1.5%
                         rotate_ok, rotate_reason = dca_mgr.should_rotate(pos, current_price)
                         if rotate_ok:
                             logger.warning(f"[DCA] L3_ROTATION_TRIGGER | {sym} → LIFO")
@@ -506,8 +697,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
             )
 
             try:
-                # FIX #4: exchange_sym გამოიყენება (არა sym) — Binance "BTC/USDT_L2"-ს არ იცნობს
-                # DEMO: ვირტუალური ყიდვა
                 if engine.exchange is None:
                     buy_price = current_price
                     buy_qty   = addon_size / buy_price
@@ -515,7 +704,6 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                 else:
                     buy = engine.exchange.place_market_buy_by_quote(exchange_sym, addon_size)
                     buy_price = float(buy.get("average") or buy.get("price") or current_price)
-                    # FIX #1: buy.get("filled") — Binance-ის რეალური დაფილვილი qty (slippage-გათვლილი)
                     buy_qty   = float(buy.get("filled") or buy.get("amount") or (addon_size / buy_price))
 
                 avg_result = recalculate_average(total_qty, avg_entry, buy_qty, buy_price)
@@ -523,16 +711,12 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                 new_qty    = avg_result["total_qty"]
                 new_quote  = total_quote + addon_size
 
-                # TP: position-ს ვაბარებთ — zone განსაზღვრისთვის
-                # add_on_count+1 შემდეგ: L2 zone (< max_add_ons) → 0.55%
-                #                        L3 zone (>= max_add_ons) → 0.35%
                 _pos_after_addon = dict(pos)
                 _pos_after_addon["add_on_count"] = add_on_count + 1
                 tp_sl = tp_sl_mgr.calculate(new_avg, position=_pos_after_addon)
                 new_tp = tp_sl["tp_price"]
                 new_sl = tp_sl["sl_price"]
 
-                # DB update
                 update_dca_position_after_addon(
                     pos_id,
                     new_avg_entry=new_avg,
@@ -542,12 +726,10 @@ def _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
                     new_tp_price=new_tp,
                     new_sl_price=new_sl,
                     last_add_on_ts=time.time(),
-                    last_addon_price=buy_price,  # L3 rotation trigger reference
+                    last_addon_price=buy_price,
                 )
 
                 # ── DCA HEDGE SHORT trigger ───────────────────────────
-                # add_on_count+1 == max_add_ons → L2/L3 boundary
-                # პირველი და ერთადერთი ჯერ: SHORT hedge გაიხსნება
                 _new_add_on_count = add_on_count + 1
                 _max_add_ons = dca_mgr.max_add_ons
                 if _new_add_on_count == _max_add_ons and futures_engine is not None:
@@ -617,19 +799,7 @@ def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> Non
     """
     L3 ADD-ON — L2 resource ($10) გადადის L3-ზე.
 
-    სრული flow:
-      ADD-ONs exhausted + drop >= rotation_trigger_pct (1.5%) → L3 ADD-ON
-      buy $10 @ current_price
-      avg recalculate → TP = avg × 1.0035 (L3 zone 0.35%)
-      l3_addon_done = 1 → შემდეგ iteration-ზე LIFO rotation იწყება
-
-    მათემატიკა BTC @ $69,190 (ADD-ON #5) → drop -1.5% → $68,153:
-      სულ invested: $80, avg=$71,742, qty=0.001170
-      L3 ADD-ON: $10 @ $68,153 → qty=0.000147
-      new_qty = 0.001317
-      new_avg = ($80×$71,742 + $10×$68,153) / ($80+$10) per qty
-             ≈ $71,365
-      new_tp  = $71,365 × 1.0035 = $71,615 (0.35%)
+    FIX #20: exchange_sym regex (_L[0-9]+|_LP)$ — LP positions-ი სწორად
     """
     from execution.db.repository import (
         add_dca_order,
@@ -644,13 +814,13 @@ def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> Non
     total_qty   = float(pos["total_qty"] or 0)
     total_quote = float(pos["total_quote_spent"] or 0)
 
+    # FIX #20: (_L\d+|_LP)$ regex
     import re as _re_l3
-    exchange_sym = _re_l3.sub(r'_L\d+$', '', sym)
+    exchange_sym = _re_l3.sub(r'(_L\d+|_LP)$', '', sym)
 
     try:
         l3_addon_quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
 
-        # RISK CHECK — balance საკმარისია?
         from execution.dca_risk_manager import get_risk_manager as _get_rm
         _l3_risk_ok, _l3_risk_reason = _get_rm().can_l3_operation(l3_addon_quote)
         if not _l3_risk_ok:
@@ -671,9 +841,7 @@ def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> Non
         new_qty    = avg_result["total_qty"]
         new_quote  = total_quote + l3_addon_quote
 
-        # L3 zone TP (0.35%)
         new_tp = tp_sl_mgr.calculate_rotation_tp(new_avg)
-
         drawdown_pct = (avg_entry - current_price) / avg_entry * 100.0 if avg_entry > 0 else 0.0
 
         logger.warning(
@@ -683,7 +851,6 @@ def _execute_l3_addon(engine, pos: dict, current_price: float, tp_sl_mgr) -> Non
             f"new_tp={new_tp:.4f} drawdown={drawdown_pct:.2f}%"
         )
 
-        # DB: l3_addon_done=1, last_addon_price=buy_price (LIFO trigger reference)
         update_dca_position_after_l3_addon(
             position_id=pos_id,
             new_avg_entry=new_avg,
@@ -740,16 +907,7 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
     """
     LIFO Rotation — L3 zone: ADD-ONs exhausted + price კვლავ ეცემა.
 
-    მათემატიკა:
-      LIFO unit (ყველაზე ძვირი) @ entry_price=P_high, qty=Q_high
-      sell @ current_price → proceeds = current_price × Q_high
-      realized_loss = (current_price - P_high) × Q_high  (< 0)
-      reinvest proceeds @ current_price → new_qty = Q_high (იგივე)
-      new_avg = (total_value - P_high×Q_high + current×Q_high) / total_qty
-             = old_avg - (P_high - current) × Q_high / total_qty
-      → avg ეცემა, TP ახლოვდება
-
-    vs FIFO: avg ამაღლდება (TP შორდება!) — LIFO სჯობია.
+    FIX #20: exchange_sym regex (_L[0-9]+|_LP)$ — LP positions-ი სწორად
     """
     from execution.db.repository import (
         get_dca_orders,
@@ -765,11 +923,11 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
     total_qty = float(pos["total_qty"] or 0)
     total_quote = float(pos["total_quote_spent"] or 0)
 
+    # FIX #20: (_L\d+|_LP)$ regex
     import re as _re_rot
-    exchange_sym = _re_rot.sub(r'_L\d+$', '', sym)
+    exchange_sym = _re_rot.sub(r'(_L\d+|_LP)$', '', sym)
 
     try:
-        # 1. ყველა order-ი → LIFO unit
         dca_orders = get_dca_orders(pos_id)
         if not dca_orders:
             logger.warning(f"[L3_ROT] NO_ORDERS | {sym} → skip rotation")
@@ -788,7 +946,6 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             logger.warning(f"[L3_ROT] INVALID_LIFO | {sym} price={lifo_price} qty={lifo_qty} → skip")
             return
 
-        # 2. ვირტუალური გაყიდვა — DEMO
         if engine.exchange is None:
             sell_price = current_price
         else:
@@ -796,10 +953,9 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             sell_price  = float(sell_result.get("average") or sell_result.get("price") or current_price)
 
         proceeds     = sell_price * lifo_qty
-        fee          = proceeds * 0.001   # 0.1% Binance fee
+        fee          = proceeds * 0.001
         net_proceeds = proceeds - fee
 
-        # RISK CHECK — net_proceeds საკმარისია reinvest-ისთვის?
         from execution.dca_risk_manager import get_risk_manager as _get_rm
         _rot_risk_ok, _rot_risk_reason = _get_rm().can_l3_operation(net_proceeds)
         if not _rot_risk_ok:
@@ -814,7 +970,6 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             f"qty={lifo_qty:.6f} pnl={realized_pnl:+.4f}"
         )
 
-        # 3. reinvest @ current_price
         if engine.exchange is None:
             reinvest_price = current_price
             reinvest_qty   = net_proceeds / reinvest_price
@@ -823,21 +978,15 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             reinvest_price  = float(reinvest_result.get("average") or reinvest_result.get("price") or current_price)
             reinvest_qty    = float(reinvest_result.get("filled") or reinvest_result.get("amount") or (net_proceeds / reinvest_price))
 
-        # 4. new_avg გამოთვლა — სწორი LIFO მათემატიკა
-        # total position value-დან LIFO unit-ის ზუსტი value ამოვაკლოთ
-        # (არა remaining_qty * avg_entry — ეს approximate-ია)
         remaining_qty   = total_qty - lifo_qty
         total_value     = total_qty * avg_entry
-        remaining_value = total_value - lifo_qty * lifo_price  # ზუსტი: ვაკლებთ actual entry price
+        remaining_value = total_value - lifo_qty * lifo_price
 
         new_qty   = remaining_qty + reinvest_qty
         new_value = remaining_value + reinvest_qty * reinvest_price
         new_avg   = round(new_value / new_qty, 8) if new_qty > 0 else avg_entry
 
-        # TP — L3 zone (0.35%)
         new_tp = tp_sl_mgr.calculate_rotation_tp(new_avg)
-
-        # total_quote update: LIFO unit-ის quote ამოვიღოთ, reinvest დავამატოთ
         new_total_quote = total_quote - lifo_quote + net_proceeds
 
         logger.warning(
@@ -847,7 +996,6 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             f"new_tp={new_tp:.4f} (L3 zone 0.35%)"
         )
 
-        # 5. DB განახლება
         update_dca_position_after_rotation(
             position_id=pos_id,
             new_avg_entry=new_avg,
@@ -858,7 +1006,6 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
             rotation_pnl=realized_pnl,
         )
 
-        # rotation order-ი DB-ში
         add_dca_order(
             position_id=pos_id,
             symbol=sym,
@@ -884,7 +1031,6 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
         except Exception:
             pass
 
-        # Telegram
         try:
             from execution.telegram_notifier import send_telegram_message
             send_telegram_message(
@@ -905,6 +1051,265 @@ def _execute_l3_rotation(engine, pos: dict, current_price: float, tp_sl_mgr, dca
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX #20: L-PHANTOM (LP) — L1-სა და L2-ს შუა ფენა
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+def _open_lp_position(
+    engine,
+    base_sym: str,
+    l1_price: float,
+    signal_id: str,
+    tp_pct: float,
+    max_add_ons: int,
+    max_capital: float,
+    trigger_drop_pct: float = 0.0,
+) -> None:
+    """
+    L-Phantom (LP) position გახსნა — L1 გახსნისთანავე გამოიძახება.
+
+    DEMO:
+      entry = l1_price × (1 - LP_TRIGGER_PCT/100)  ← ვირტუალური -0.20%
+      market order simulation — მყისიერი fill
+
+    LIVE + LP_LIVE_USE_LIMIT=true:
+      limit order @ target_price → Binance
+      order_id → _pending_lp_orders → tracker thread ამოწმებს fill-ს
+
+    LIVE + LP_LIVE_USE_LIMIT=false:
+      market order @ current market price (L1-ის ფასთან ახლოს)
+      ყიდულობს მყისიერად, ვირტუალური -0.20% არ ვრცელდება
+
+    Args:
+      engine:           ExecutionEngine instance
+      base_sym:         "BTC/USDT" (without suffix)
+      l1_price:         L1 entry price (reference for LP target)
+      signal_id:        parent L1 signal ID (LP ID = LP-{signal_id})
+      tp_pct:           TP percent (DCA_TP_PCT)
+      max_add_ons:      DCA_MAX_ADD_ONS
+      max_capital:      DCA_MAX_CAPITAL_USDT
+      trigger_drop_pct: drop from L1 to LP entry (for DB logging)
+    """
+    from execution.db.repository import (
+        open_dca_position,
+        add_dca_order,
+        open_trade,
+        get_open_dca_position_for_symbol,
+        log_event,
+    )
+
+    lp_sym        = f"{base_sym}_LP"
+    lp_drop_pct   = float(os.getenv("LP_TRIGGER_PCT", "0.20"))
+    lp_quote      = float(os.getenv("LP_QUOTE", "50.0"))
+    lp_live_limit = os.getenv("LP_LIVE_USE_LIMIT", "true").strip().lower() in ("1", "true", "yes")
+    lp_signal_id  = f"LP-{signal_id}"
+    target_price  = round(l1_price * (1.0 - lp_drop_pct / 100.0), 8)
+
+    # double-open guard
+    if get_open_dca_position_for_symbol(lp_sym):
+        logger.debug(f"[LP] ALREADY_OPEN | {lp_sym} → skip")
+        return
+
+    is_live = engine.exchange is not None
+
+    # ── DEMO ──────────────────────────────────────────────────────
+    if not is_live:
+        buy_price = target_price  # ვირტუალური -0.20% entry
+        buy_qty   = lp_quote / buy_price
+        tp_price  = round(buy_price * (1.0 + tp_pct / 100.0), 6)
+
+        pos_id = open_dca_position(
+            symbol=lp_sym,
+            initial_entry_price=buy_price,
+            initial_qty=buy_qty,
+            initial_quote_spent=lp_quote,
+            tp_price=tp_price,
+            sl_price=0.0,
+            tp_pct=tp_pct,
+            sl_pct=999.0,
+            max_add_ons=max_add_ons,
+            max_capital=max_capital,
+            max_drawdown_pct=999.0,
+        )
+        add_dca_order(
+            position_id=pos_id,
+            symbol=lp_sym,
+            order_type="LP_INITIAL",
+            entry_price=buy_price,
+            qty=buy_qty,
+            quote_spent=lp_quote,
+            avg_entry_after=buy_price,
+            tp_after=tp_price,
+            sl_after=0.0,
+            trigger_drawdown_pct=lp_drop_pct,
+            exchange_order_id=lp_signal_id,
+        )
+        open_trade(
+            signal_id=lp_signal_id,
+            symbol=lp_sym,
+            qty=buy_qty,
+            quote_in=lp_quote,
+            entry_price=buy_price,
+        )
+        logger.warning(
+            f"[LP] DEMO_OPENED | {lp_sym} entry={buy_price:.4f} "
+            f"(L1={l1_price:.4f} -{lp_drop_pct}%) "
+            f"tp={tp_price:.4f} quote={lp_quote}"
+        )
+        try:
+            log_event(
+                "LP_OPENED_DEMO",
+                f"sym={lp_sym} entry={buy_price:.4f} tp={tp_price:.4f} "
+                f"l1={l1_price:.4f} drop={lp_drop_pct}%"
+            )
+        except Exception:
+            pass
+        try:
+            from execution.telegram_notifier import notify_signal_created
+            notify_signal_created(
+                symbol=lp_sym,
+                entry_price=buy_price,
+                quote_amount=lp_quote,
+                tp_price=tp_price,
+                sl_price=0.0,
+                verdict="LP_BUY",
+                mode="DEMO",
+            )
+        except Exception as _tg:
+            logger.warning(f"[LP] TG_FAIL | err={_tg}")
+        return
+
+    # ── LIVE + LIMIT ORDER ────────────────────────────────────────
+    if lp_live_limit:
+        try:
+            # qty = lp_quote / target_price (approximate — limit order)
+            limit_qty = round(lp_quote / target_price, 6)
+            # BinanceSpotClient-ს place_limit_buy უნდა ჰქონდეს
+            # signature: place_limit_buy(symbol, qty, price) → order dict
+            order = engine.exchange.place_limit_buy(base_sym, limit_qty, target_price)
+            order_id = str(order.get("id", ""))
+
+            if not order_id:
+                logger.warning(f"[LP] LIMIT_NO_ID | {lp_sym} → fallback market")
+                raise ValueError("no order_id from limit order")
+
+            # tracker thread-ში რეგისტრაცია
+            with _pending_lp_lock:
+                _pending_lp_orders[order_id] = {
+                    "exchange_sym":    base_sym,
+                    "lp_sym":          lp_sym,
+                    "target_price":    target_price,
+                    "lp_quote":        lp_quote,
+                    "tp_pct":          tp_pct,
+                    "max_add_ons":     max_add_ons,
+                    "max_capital":     max_capital,
+                    "signal_id":       lp_signal_id,
+                    "opened_at":       time.time(),
+                    "trigger_drop_pct": lp_drop_pct,
+                }
+
+            logger.warning(
+                f"[LP] LIVE_LIMIT_PLACED | {lp_sym} "
+                f"target={target_price:.4f} qty={limit_qty:.6f} "
+                f"order_id={order_id} "
+                f"timeout={os.getenv('LP_LIMIT_TIMEOUT_SECONDS', '300')}s"
+            )
+            try:
+                log_event(
+                    "LP_LIMIT_PLACED",
+                    f"sym={lp_sym} target={target_price:.4f} "
+                    f"qty={limit_qty:.6f} order_id={order_id}"
+                )
+            except Exception:
+                pass
+            try:
+                from execution.telegram_notifier import send_telegram_message
+                send_telegram_message(
+                    f"📋 <b>LP Limit Order განთავსდა</b>\n\n"
+                    f"🪙 <b>Symbol:</b> <code>{lp_sym}</code>\n"
+                    f"🎯 <b>Target:</b> <code>{target_price:.4f}</code> "
+                    f"(<code>-{lp_drop_pct}%</code> from L1)\n"
+                    f"💵 <b>Quote:</b> <code>{lp_quote} USDT</code>\n"
+                    f"⏱ <b>Timeout:</b> <code>{os.getenv('LP_LIMIT_TIMEOUT_SECONDS', '300')}s</code>\n"
+                    f"🕒 <code>{_now_dt().strftime('%Y-%m-%d %H:%M:%S')}</code>"
+                )
+            except Exception:
+                pass
+            return
+
+        except Exception as _le:
+            logger.warning(f"[LP] LIMIT_FAIL | {lp_sym} err={_le} → fallback market")
+            # limit order fail → market order fallback
+
+    # ── LIVE + MARKET ORDER (LP_LIVE_USE_LIMIT=false ან limit fallback) ──
+    try:
+        buy = engine.exchange.place_market_buy_by_quote(base_sym, lp_quote)
+        buy_price = float(buy.get("average") or buy.get("price") or l1_price)
+        buy_qty   = float(buy.get("filled") or buy.get("amount") or (lp_quote / buy_price))
+        tp_price  = round(buy_price * (1.0 + tp_pct / 100.0), 6)
+
+        pos_id = open_dca_position(
+            symbol=lp_sym,
+            initial_entry_price=buy_price,
+            initial_qty=buy_qty,
+            initial_quote_spent=lp_quote,
+            tp_price=tp_price,
+            sl_price=0.0,
+            tp_pct=tp_pct,
+            sl_pct=999.0,
+            max_add_ons=max_add_ons,
+            max_capital=max_capital,
+            max_drawdown_pct=999.0,
+        )
+        add_dca_order(
+            position_id=pos_id,
+            symbol=lp_sym,
+            order_type="LP_INITIAL",
+            entry_price=buy_price,
+            qty=buy_qty,
+            quote_spent=lp_quote,
+            avg_entry_after=buy_price,
+            tp_after=tp_price,
+            sl_after=0.0,
+            trigger_drawdown_pct=abs(buy_price - l1_price) / l1_price * 100.0 if l1_price > 0 else 0.0,
+            exchange_order_id=str(buy.get("id", "")),
+        )
+        open_trade(
+            signal_id=lp_signal_id,
+            symbol=lp_sym,
+            qty=buy_qty,
+            quote_in=lp_quote,
+            entry_price=buy_price,
+        )
+        logger.warning(
+            f"[LP] LIVE_MARKET_OPENED | {lp_sym} entry={buy_price:.4f} "
+            f"tp={tp_price:.4f} quote={lp_quote}"
+        )
+        try:
+            log_event(
+                "LP_OPENED_LIVE_MARKET",
+                f"sym={lp_sym} entry={buy_price:.4f} tp={tp_price:.4f} "
+                f"l1={l1_price:.4f}"
+            )
+        except Exception:
+            pass
+        try:
+            from execution.telegram_notifier import notify_signal_created
+            notify_signal_created(
+                symbol=lp_sym,
+                entry_price=buy_price,
+                quote_amount=lp_quote,
+                tp_price=tp_price,
+                sl_price=0.0,
+                verdict="LP_BUY",
+                mode="LIVE",
+            )
+        except Exception as _tg:
+            logger.warning(f"[LP] TG_FAIL | err={_tg}")
+
+    except Exception as e:
+        logger.error(f"[LP] LIVE_MARKET_FAIL | {lp_sym} err={e}")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # LAYER2 — Crash Detection & Parallel Trading
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
@@ -918,20 +1323,19 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
       4. ბალანსი საკმარისია? → გახსენი Layer 2
 
     ENV:
-      LAYER2_ENABLED=true          ← ჩართვა/გამორთვა
-      LAYER2_DROP_PCT=1.5          ← HIGH-დან რამდენი % ვარდნაზე გაიხსნოს
-      LAYER2_QUOTE=12.0            ← Layer 2-ის trade ზომა USDT
-      LAYER2_SYMBOLS=BTC/USDT,...  ← სიმბოლოები
-      LAYER2_DEMO_ENABLED=false    ← DEMO-ზე ჩართვა (default: false)
-      SMART_ADDON_BUFFER=12        ← min free USDT buffer
+      LAYER2_ENABLED=true
+      LAYER2_DROP_PCT=1.5
+      LAYER2_QUOTE=12.0
+      LAYER2_SYMBOLS=BTC/USDT,...
+      LAYER2_DEMO_ENABLED=false
+      SMART_ADDON_BUFFER=12
     """
     if not os.getenv("LAYER2_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
         return
 
     mode = os.getenv("MODE", "DEMO").upper()
-    is_live = engine.exchange is not None  # LIVE: BinanceSpotClient, DEMO: None
+    is_live = engine.exchange is not None
 
-    # DEMO მხარდაჭერა — LAYER2_DEMO_ENABLED=true ENV-ით ჩართვა
     demo_enabled = os.getenv("LAYER2_DEMO_ENABLED", "false").strip().lower() in ("1", "true", "yes")
     if not is_live and not demo_enabled:
         logger.debug("[LAYER2] DEMO mode → skipped (set LAYER2_DEMO_ENABLED=true to enable)")
@@ -953,7 +1357,6 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
     tp_pct      = float(os.getenv("DCA_TP_PCT", "0.55"))
     buffer      = float(os.getenv("SMART_ADDON_BUFFER", "12.0"))
 
-    # USDT ბალანსი
     if is_live:
         try:
             free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
@@ -961,7 +1364,6 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
             logger.warning(f"[LAYER2] balance_fetch_fail | err={_e}")
             return
     else:
-        # DEMO: DEMO_INITIAL_BALANCE - invested
         try:
             from execution.db.repository import get_all_open_dca_positions
             _initial  = float(os.getenv("DEMO_INITIAL_BALANCE", "3200.0"))
@@ -973,7 +1375,6 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
 
     for sym in symbols:
         try:
-            # current price
             if is_live:
                 current_price = float(engine.exchange.fetch_last_price(sym) or 0.0)
             else:
@@ -983,7 +1384,6 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
             if current_price <= 0:
                 continue
 
-            # 24h HIGH
             try:
                 ticker = engine.price_feed.fetch_ticker(sym)
                 high_24h = float(
@@ -1009,14 +1409,12 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 logger.debug(f"[LAYER2] NO_CRASH | {sym} drop={drop_from_high:.2f}% < {drop_pct:.1f}%")
                 continue
 
-            # Layer 2 უკვე ღიაა?
             sym_l2 = f"{sym}_L2"
             existing_l2 = get_open_dca_position_for_symbol(sym_l2)
             if existing_l2:
                 logger.debug(f"[LAYER2] ALREADY_OPEN | {sym_l2}")
                 continue
 
-            # ბალანსი საკმარისია?
             required = quote + buffer
             if free_usdt < required:
                 logger.warning(
@@ -1030,7 +1428,6 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 f"drop={drop_from_high:.2f}% >= {drop_pct:.1f}% → opening Layer 2 [{mode}]"
             )
 
-            # ყიდვა
             if is_live:
                 buy = engine.exchange.place_market_buy_by_quote(sym, quote)
                 buy_price = float(buy.get("average") or buy.get("price") or current_price)
@@ -1079,7 +1476,7 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 entry_price=buy_price,
             )
 
-            free_usdt -= quote  # in-memory balance update
+            free_usdt -= quote
 
             try:
                 log_event(
@@ -1121,25 +1518,9 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     """
     Cascade DCA — Rolling Exchange სტრატეგია.
 
-    Layer-ის მიხედვით drop_pct და tp_pct იცვლება:
-      L2-L3:  drop=1.5%  tp=0.55%
-      L4-L7:  drop=2.0%  tp=0.65%
-      L8-L10: drop=5.0%  tp=1.00%
-      L10+:   CASCADE_MAX_LAYERS=10 → გაჩერება
-
-    ENV:
-      CASCADE_ENABLED=true
-      CASCADE_START_LAYER=2
-      CASCADE_DROP_PCT=1.5
-      CASCADE_DROP_L4_PCT=2.0
-      CASCADE_DROP_L8_PCT=5.0
-      CASCADE_TP_L3_PCT=0.65
-      CASCADE_TP_L8_PCT=1.00
-      CASCADE_MAX_LAYERS=10
-      CASCADE_RESUME_LAYER=10
-      CASCADE_SYMBOLS=BTC/USDT,BNB/USDT,ETH/USDT
-      CASCADE_DEMO_ENABLED=false   ← DEMO-ზე ჩართვა (default: false)
-      SMART_ADDON_BUFFER=12
+    FIX #20: sym_positions filter-ში _LP გამორიცხულია.
+    LP-ს საკუთარი lifecycle აქვს — CASCADE-მა არ უნდა გაყიდოს.
+    exchange_sym extraction regex: (_L[0-9]+|_LP)$ ნაცვლად _L[0-9]+$
     """
     if not os.getenv("CASCADE_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
         return
@@ -1147,7 +1528,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
     mode    = os.getenv("MODE", "DEMO").upper()
     is_live = engine.exchange is not None
 
-    # DEMO მხარდაჭერა — CASCADE_DEMO_ENABLED=true ENV-ით ჩართვა
     demo_enabled = os.getenv("CASCADE_DEMO_ENABLED", "false").strip().lower() in ("1", "true", "yes")
     if not is_live and not demo_enabled:
         logger.debug("[CASCADE] DEMO mode → skipped (set CASCADE_DEMO_ENABLED=true to enable)")
@@ -1202,7 +1582,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
         try:
             exchange_sym = sym
 
-            # current price
             if is_live:
                 current_price = float(engine.exchange.fetch_last_price(exchange_sym) or 0.0)
             else:
@@ -1212,9 +1591,15 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
             if current_price <= 0:
                 continue
 
+            # FIX #20: _LP suffix-ი CASCADE-ის sym_positions-დან გამორიცხულია.
+            # LP-ს საკუთარი TP/FC lifecycle აქვს _run_dca_loop-ში.
+            # CASCADE-მა LP არ უნდა გაყიდოს "oldest" სახით.
             sym_positions = [
                 p for p in all_positions
-                if _re_cas.sub(r'_L\d+$', '', str(p.get("symbol", "")).upper()) == sym.upper()
+                if (
+                    _re_cas.sub(r'(_L\d+|_LP)$', '', str(p.get("symbol", "")).upper()) == sym.upper()
+                    and not str(p.get("symbol", "")).upper().endswith("_LP")
+                )
             ]
 
             if len(sym_positions) < 2:
@@ -1262,7 +1647,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                 logger.debug(f"[CASCADE] {sym} | drop={drop_from_newest:.2f}% < {drop_pct:.1f}% → wait")
                 continue
 
-            # ბალანსი
             if is_live:
                 try:
                     free_usdt = float(engine.exchange.fetch_balance_free("USDT") or 0.0)
@@ -1306,7 +1690,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                     pnl_quote, pnl_pct, "CASCADE_EXCHANGE"
                 )
 
-                # trades ცხრილი — sym პირველი, fallback-ებით
                 open_tr = get_open_trade_for_symbol(oldest_sym)
                 if not open_tr:
                     open_tr = get_open_trade_for_symbol(exchange_sym)
@@ -1350,7 +1733,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                 logger.error(f"[CASCADE] SELL_FAIL | {oldest_sym} err={_se}")
                 continue
 
-            # ── ახალი Layer გახსნა ──────────────────────────────────
             if net_proceeds < 5.0:
                 logger.warning(f"[CASCADE] LOW_PROCEEDS | {net_proceeds:.4f} < $5 → skip new layer")
                 continue
@@ -1435,7 +1817,6 @@ def _check_cascade_exchange(engine, tp_sl_mgr) -> None:
                     f"tp={tp_price:.4f} quote={buy_quote:.4f} [{mode}]"
                 )
 
-                # CASCADE DEPTH WARNING — L7+
                 new_layer_num = layer_num + 1
                 _warn_from = int(os.getenv("CASCADE_WARN_FROM_LAYER", "7"))
                 if new_layer_num >= _warn_from:
@@ -1485,10 +1866,6 @@ def _start_bot_api_server() -> None:
     Bot API Server — Dashboard-ისთვის DB data-ს აბრუნებს.
     GET /api/stats  → positions + trades + stats JSON
     GET /health     → liveness check
-
-    ENV:
-      BOT_API_ENABLED=true   ← ჩართვა/გამორთვა (default: true)
-      BOT_API_PORT=5001      ← port (default: 5001)
     """
     if not os.getenv("BOT_API_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
         return
@@ -1559,32 +1936,40 @@ def main():
     last_tg_report_ts = 0.0
     last_daily_summary_date = None
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # E: HEARTBEAT — ყოველ N წამს Telegram-ზე "ბოტი ცოცხალია"
-    # HEARTBEAT_INTERVAL_SECONDS=600 (default: 10 წუთი)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     heartbeat_every_s = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "600"))
     last_heartbeat_ts = 0.0
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # C: DAILY LOSS LIMIT — დღიური ზარალის ჭერი
-    # DAILY_MAX_LOSS_USDT=5.0 (default: $5 = 5% of $100)
-    # თუ დღიური ზარალი > limit → PAUSE until next day
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     daily_max_loss = float(os.getenv("DAILY_MAX_LOSS_USDT", "5.0"))
-    _daily_loss_date = ""    # რომელ დღეზე ვთვლით
-    _daily_loss_total = 0.0  # დღის ზარალი
+    _daily_loss_date = ""
+    _daily_loss_total = 0.0
 
     init_db()
     _bootstrap_state_if_needed()
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # TP FIX — Take Profit ავტომატური გასწორება (memory-safe!)
-    # Binance API არ სჭირდება — მხოლოდ DB-ს კითხულობს
-    # L1-L2: TP=avg×1.0055  |  L3-L10: TP=avg×1.0065
-    # 10s delay — kill_switch DB conflict-ის თავიდანაცილება
-    # TP_FIX_ENABLED=true  ← ჩართვა/გამორთვა (default: true)
+    # FIX #20: LP LIMIT TRACKER — threading.Lock init + thread start
+    # engine late-binding: lambda → tracker thread-ი engine init-ის
+    # შემდეგ მიიღებს სწორ reference-ს (engine = None სანამ init-ს)
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    import threading as _main_threading
+    global _pending_lp_lock
+    _pending_lp_lock = _main_threading.Lock()
+
+    _engine_holder = [None]  # mutable container for late binding
+
+    def _get_engine():
+        return _engine_holder[0]
+
+    _lp_tracker = _main_threading.Thread(
+        target=_lp_limit_tracker_thread,
+        args=(_get_engine, _pending_lp_lock),
+        daemon=True,
+        name="lp_limit_tracker",
+    )
+    _lp_tracker.start()
+    logger.info("LP_LIMIT_TRACKER | background thread started")
+
+    # TP FIX — startup
     if os.getenv("TP_FIX_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
         try:
             import threading as _tp_thread
@@ -1612,14 +1997,7 @@ def main():
         except Exception as _tpe:
             logger.warning(f"TP_FIX_THREAD_FAIL | err={_tpe}")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX #5: QTY SYNC — Binance vs DB qty სინქრონიზაცია
-    # buy_qty bug-ის გამო DB qty > Binance qty → TP გაყიდვა ვერ ხდება
-    # 20s delay — main loop DB init-ის შემდეგ გაეშვება (DB conflict თავიდანაცილება)
-    # QTY_SYNC_ENABLED=true     ← ჩართვა/გამორთვა
-    # QTY_SYNC_TOLERANCE=0.005  ← 0.5% სხვაობაზე გასწორება
-    # QTY_SYNC_DELAY=20         ← delay წამებში (default: 20)
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # QTY SYNC
     if os.getenv("QTY_SYNC_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
         try:
             import threading as _qty_thread
@@ -1648,20 +2026,11 @@ def main():
         except Exception as _qe:
             logger.warning(f"QTY_SYNC_THREAD_FAIL | err={_qe}")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # BOT API SERVER — Dashboard-ისთვის DB data /api/stats endpoint-ზე
-    # BOT_API_ENABLED=true, BOT_API_PORT=5001
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     try:
         _start_bot_api_server()
     except Exception as _ae:
         logger.warning(f"BOT_API_START_FAIL | err={_ae}")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # LIVE DASHBOARD — background thread, port 8080
-    # URL: https://your-render-url.onrender.com/dashboard
-    # DASHBOARD_ENABLED=true ENV-ით ჩართვა/გამორთვა
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     if os.getenv("DASHBOARD_ENABLED", "true").strip().lower() in ("1", "true", "yes"):
         try:
             from execution.dashboard import start_dashboard
@@ -1672,23 +2041,14 @@ def main():
 
     engine = ExecutionEngine()
 
+    # FIX #20: engine late-binding — tracker thread-ი ახლა სწორ instance-ს ხედავს
+    _engine_holder[0] = engine
+
     generate_once = _try_import_generator()
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX C-2: MarketRegimeEngine — loop-გარეთ, ᲔᲠᲗᲘ instance სამუდამოდ
-    # ძველი კოდი ყოველ ტიკზე ახალ instance-ს ქმნიდა → state იკარგებოდა
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     regime_engine = MarketRegimeEngine()
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # FIX C-1: inject_regime_engine — execution_engine-ს regime_engine
-    # გადაეცემა, რათა TP/SL close-ზე in-memory SL counter სწორად reset-ს.
-    # გარეშე: _regime_engine=None → notify_outcome() არასოდეს გამოიძახება
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     engine.inject_regime_engine(regime_engine)
 
-    # DCA managers init
-    # DCA MODE: DCA_ENABLED ENV-დან — default true (DCA ბოტია)
     _dca_enabled = os.getenv("DCA_ENABLED", "true").strip().lower() in ("1", "true", "yes")
     dca_mgr   = get_dca_manager()   if _dca_enabled else None
     tp_sl_mgr = get_tp_sl_manager() if _dca_enabled else None
@@ -1696,14 +2056,20 @@ def main():
     if _dca_enabled:
         logger.info(f"DCA_ENABLED | max_add_ons={os.getenv('DCA_MAX_ADD_ONS', '5')} max_capital={os.getenv('DCA_MAX_CAPITAL_USDT', 'AUTO')}")
 
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # SMART LONG + SHORT — Futures Engine init
-    # FUTURES_ENABLED=true + FUTURES_MODE=DEMO → ვირტუალური SHORT
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     futures_engine = get_futures_engine()
     logger.info(
         f"FUTURES_ENGINE | enabled={futures_engine.enabled} "
         f"mode={futures_engine.mode} lev={futures_engine.leverage}x"
+    )
+
+    # FIX #20: LP system startup log
+    _lp_enabled_flag = os.getenv("LP_ENABLED", "true").strip().lower() in ("1", "true", "yes")
+    logger.info(
+        f"LP_SYSTEM | enabled={_lp_enabled_flag} "
+        f"trigger={os.getenv('LP_TRIGGER_PCT', '0.20')}% "
+        f"quote={os.getenv('LP_QUOTE', '50')} "
+        f"live_limit={os.getenv('LP_LIVE_USE_LIMIT', 'true')} "
+        f"timeout={os.getenv('LP_LIMIT_TIMEOUT_SECONDS', '300')}s"
     )
 
     logger.info(f"GENIUS BOT MAN worker starting | MODE={mode}")
@@ -1723,13 +2089,7 @@ def main():
                 time.sleep(sleep_s)
                 continue
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # B: PRICE CACHE — ყოველ loop-ზე ერთხელ fetch, cache-დან კითხვა
-            # 9 API call → 3 API call (rate limit risk ↓, სიჩქარე ↑)
-            # _market_regime — default NEUTRAL (FUTURES block-ის წინ)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            _market_regime: str = "NEUTRAL"  # ← safe default, FUTURES loop-ში განახლდება
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+            _market_regime: str = "NEUTRAL"
             _price_cache: dict = {}
             _symbols_to_cache = [s.strip() for s in os.getenv(
                 "BOT_SYMBOLS", "BTC/USDT,BNB/USDT,ETH/USDT"
@@ -1741,24 +2101,18 @@ def main():
                             engine.exchange.fetch_last_price(_sym) or 0.0
                         )
                     else:
-                        # DEMO: public API
                         _t = engine.price_feed.fetch_ticker(_sym)
                         _price_cache[_sym] = float(_t.get("last") or 0.0)
                 except Exception as _pe:
                     logger.warning(f"PRICE_CACHE_FAIL | {_sym} err={_pe}")
                     _price_cache[_sym] = 0.0
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # C: DAILY LOSS — დღის reset შემოწმება
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             _today = _now_dt().date().isoformat()
             if _today != _daily_loss_date:
                 _daily_loss_date = _today
                 _daily_loss_total = 0.0
                 logger.info(f"DAILY_LOSS_RESET | date={_today} limit={daily_max_loss}")
 
-            # L3_ROTATION_LOSS events DB-დან — daily loss tracking
-            # L3 rotation realized loss-ები + force_close-ები
             try:
                 from execution.db.repository import _fetchall
                 import re as _re_loss
@@ -1780,7 +2134,6 @@ def main():
             except Exception:
                 pass
 
-            # DAILY LOSS LIMIT — limit-ს გადაცდა → skip ვაჭრობა
             if daily_max_loss > 0 and _daily_loss_total <= -daily_max_loss:
                 logger.warning(
                     f"DAILY_LOSS_LIMIT | loss={_daily_loss_total:.4f} >= limit={daily_max_loss} → skip"
@@ -1799,11 +2152,6 @@ def main():
                 time.sleep(sleep_s)
                 continue
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # FIX #14: TP_FIX — ყოველ loop-ზე TP სისწორის შემოწმება
-            # ADD-ON-ის შემდეგ TP შეიძლება avg-ზე დაბლა დარჩეს → გასწორება
-            # memory-safe: მხოლოდ DB-ს კითხულობს, Binance API არ სჭირდება
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
                 try:
                     from execution.tp_fix import run_tp_fix
@@ -1815,20 +2163,12 @@ def main():
                 except Exception as _tfe:
                     logger.warning(f"TP_FIX_LOOP_WARN | err={_tfe}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # FUTURES — TP/SL check + FC (ყველა regime-ზე)
-            # BEAR regime SHORT (ძველი) — წაშლილია, ახალი Independent SHORT-ით
-            # ჩანაცვლდა (price-level trigger, საკუთარი TP/FC lifecycle)
-            # DCA hedge SHORT და Independent SHORT TP/FC — check_tp_sl() ფარავს
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 from execution.signal_generator import _detect_market_regime_24h
                 _prev_regime = _market_regime
                 _market_regime = _detect_market_regime_24h()
                 futures_engine.check_tp_sl()
 
-                # REGIME LOG — audit_log-ში ჩაწერა regime ცვლილებისას
-                # ან ყოველ 10 loop-ზე (debug-ისთვის)
                 if _market_regime != _prev_regime:
                     try:
                         log_event(
@@ -1844,10 +2184,6 @@ def main():
             except Exception as _fe:
                 logger.warning(f"FUTURES_LOOP_WARN | err={_fe}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # DCA LOOP — add-on check + TP/SL + breakeven + force close
-            # BEAR MODE: ADD-ON ბლოკილია (_market_regime გადაეცემა)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
                 try:
                     _run_dca_loop(engine, dca_mgr, tp_sl_mgr, risk_mgr,
@@ -1856,12 +2192,6 @@ def main():
                 except Exception as e:
                     logger.warning(f"DCA_LOOP_WARN | err={e}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # DCA HEDGE SHORT — ADD-ON + L3 EXCHANGE check
-            # LONG-ის DCA ADD-ON-ების სიმეტრიული mirror SHORT-ში:
-            #   ADD-ON: BTC bounce ↑ → avg_short ↑ → TP_short ↑
-            #   L3:     ADD-ONs exhausted + ↑ → EXCHANGE (close+reopen ↑)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled and futures_engine.enabled:
                 try:
                     futures_engine.check_dca_hedge_addons()
@@ -1869,14 +2199,6 @@ def main():
                 except Exception as _he:
                     logger.warning(f"HEDGE_CHECK_WARN | err={_he}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # FIX #19: INDEPENDENT SHORT DCA — სარკე სტრატეგია
-            # LONG L1 გახსნის შემდეგ: SHORT იხსნება -1.6%-ზე (L2-L3 შუა)
-            # ADD-ONs ვარდნაზე: -1.0%, -2.2%, -3.5% from SHORT L1
-            # TP: avg × 0.9945 → სავალდებულო დახურვა
-            # FC: 10 days / +15% drawdown → ღია ტრეიდი არ რჩება
-            # SHORT_DCA_ENABLED=true ENV-ით ჩართვა
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled and futures_engine.enabled and futures_engine.short_dca_enabled:
                 try:
                     futures_engine.check_independent_short_open()
@@ -1884,15 +2206,6 @@ def main():
                 except Exception as _se:
                     logger.warning(f"SHORT_DCA_LOOP_WARN | err={_se}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # GENIUS MIRROR ENGINE — bilateral DCA (FIX-S7)
-            # L2/L3 midpoint (-8.59% L1-დან) → SHORT იხსნება
-            # ADD-ONs DOWN: ვარდნა გრძელდება → avg↓ TP↓
-            # ADD-ONs UP:   bounce → avg_short↑ TP ახლოვდება
-            # TP:  0.55% — scalp hybrid
-            # FC:  drawdown only (-15%) — time FC გაუქმებულია
-            # MIRROR_ENGINE_ENABLED=true ENV-ით ჩართვა
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled and futures_engine.enabled and futures_engine.mirror_enabled:
                 try:
                     futures_engine.check_mirror_tp_sl()
@@ -1901,22 +2214,12 @@ def main():
                 except Exception as _me:
                     logger.warning(f"MIRROR_ENGINE_LOOP_WARN | err={_me}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # LAYER 2 — Crash Detection & Parallel Trading
-            # LIVE: ყოველთვის აქტიური (LAYER2_ENABLED=true)
-            # DEMO: LAYER2_DEMO_ENABLED=true ENV-ით ჩართვა
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
                 try:
                     _check_and_open_layer2(engine, tp_sl_mgr)
                 except Exception as _l2e:
                     logger.warning(f"LAYER2_CHECK_WARN | err={_l2e}")
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # CASCADE — Rolling Exchange სტრატეგია
-            # LIVE: ყოველთვის აქტიური (CASCADE_ENABLED=true)
-            # DEMO: CASCADE_DEMO_ENABLED=true ENV-ით ჩართვა
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             if _dca_enabled:
                 try:
                     _check_cascade_exchange(engine, tp_sl_mgr)
@@ -1943,12 +2246,6 @@ def main():
 
                     logger.info(f"Signal received | id={signal_id} | verdict={verdict}")
 
-                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                    # SIGNAL_EXPIRATION_SECONDS — ძველი signal-ი → skip
-                    # signal_generator-ი წერს sig["ts_utc"] (UTC ISO)
-                    # თუ signal-ი outbox-ში SIGNAL_EXPIRATION_SECONDS-ზე
-                    # მეტია → გამოტოვება (stale signal)
-                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                     if _SIGNAL_EXPIRATION_SECONDS > 0:
                         try:
                             from datetime import datetime, timezone
@@ -1976,37 +2273,21 @@ def main():
                         except Exception as e:
                             logger.warning(f"EXPIRY_CHECK_FAIL | id={signal_id} err={e} → skip check")
 
-                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                    # FIX C-3: SELL signal — regime check bypass
-                    # SELL (TREND_REVERSAL / PROTECTIVE_SELL) ყოველთვის
-                    # სრულდება, SKIP_TRADING-ი მას ვერ ბლოკავს.
-                    # ძველი კოდი SELL-საც ჩერდებოდა SIDEWAYS-ზე!
-                    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                     if verdict == "SELL":
                         source = sig.get("meta", {}).get("source", "UNKNOWN")
                         if source == "PROTECTIVE_SELL":
-                            # crash guard — ATR EXTREME + KILL risk → გაყიდვა
                             logger.warning(
                                 f"[AUTO] PROTECTIVE_SELL → executing | "
                                 f"id={signal_id} source={source}"
                             )
                             engine.execute_signal(sig)
                         else:
-                            # TREND_REVERSAL / RSI_OVERBOUGHT — DCA-ში ბლოკი
-                            # DCA TP-ს ელოდება, არ გაყიდის ვარდნაზე
                             logger.info(
                                 f"[AUTO] SELL blocked (DCA holds) | "
                                 f"id={signal_id} source={source}"
                             )
 
                     elif verdict == "TRADE":
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # PAIRS_ADDON — BTC/ETH კორელაციური ADD-ON
-                        # signal_type="PAIRS_ADDON" → ADD-ON ლოგიკა:
-                        #   ახალი position კი არა, არსებული ETH position-ის
-                        #   avg-ს ვამცირებთ $12 ADD-ON-ით.
-                        #   dca_position_manager-ი ჩვეულებრივ ამუშავებს.
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
                         if sig.get("signal_type") == "PAIRS_ADDON":
                             _pa_sym = str((sig.get("execution") or {}).get("symbol", ""))
                             logger.info(
@@ -2015,7 +2296,6 @@ def main():
                                 f"lead_move={sig.get('meta', {}).get('lead_move_pct', '?')}%"
                             )
                             if engine.exchange is None and _dca_enabled and _pa_sym:
-                                # DEMO: ADD-ON ვირტუალური შესრულება
                                 try:
                                     from execution.db.repository import (
                                         get_open_dca_position_for_symbol,
@@ -2080,217 +2360,236 @@ def main():
                                         )
                                 except Exception as _pa_err:
                                     logger.warning(f"[PAIRS_ADDON] EXEC_FAIL | err={_pa_err}")
-                            # PAIRS_ADDON → signal handled, არ გავგრძელდეთ ჩვეულებრივ TRADE path-ზე
                             pass
 
                         else:
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                        # GAP-2 FIX: main.py-ი აღარ ახდენს TP/SL-ის recalc-ს.
-                        # signal_generator-მა უკვე გაითვლა adaptive (TP/SL + MTF bonus)
-                        # და sig["adaptive"]-ში ჩაწერა.
-                        # main.py-ი მხოლოდ SKIP safety-net-ია:
-                        # თუ სიგნალის emit-სა და execution-ს შორის (20 წამი)
-                        # ბაზარი BEAR/VOLATILE/SIDEWAYS-ად გადაბრუნდა → ბლოკავს.
-                        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-                          trend   = float(sig.get("trend",     0) or 0)
-                          atr_pct = float(sig.get("atr_pct",   0) or 0)
-                          symbol  = str((sig.get("execution") or {}).get("symbol", ""))
+                            trend   = float(sig.get("trend",     0) or 0)
+                            atr_pct = float(sig.get("atr_pct",   0) or 0)
+                            symbol  = str((sig.get("execution") or {}).get("symbol", ""))
 
-                          regime  = regime_engine.detect_regime(trend=trend, atr_pct=atr_pct)
+                            regime  = regime_engine.detect_regime(trend=trend, atr_pct=atr_pct)
 
-                          # DCA MODE: regime block გათიშულია — ვაჭრობა ყველა რეჟიმში
-                          # if regime in ("BEAR", "VOLATILE", "SIDEWAYS"): → disabled
-                          logger.info(f"[AUTO] regime={regime} trend={trend:.3f} atr={atr_pct:.3f} → DCA mode, no block")
+                            logger.info(f"[AUTO] regime={regime} trend={trend:.3f} atr={atr_pct:.3f} → DCA mode, no block")
 
-                          logger.info(
-                              f"[AUTO] Regime={regime} trend={trend:.3f} "
-                              f"atr_pct={atr_pct:.3f} symbol={symbol} "
-                              f"TP={sig.get('adaptive', {}).get('TP_PCT', 'n/a')}% "
-                              f"SL={sig.get('adaptive', {}).get('SL_PCT', 'n/a')}% "
-                              f"mtf={sig.get('meta', {}).get('mtf_alignment', 'N/A')} "
-                              f"| id={signal_id}"
-                          )
+                            logger.info(
+                                f"[AUTO] Regime={regime} trend={trend:.3f} "
+                                f"atr_pct={atr_pct:.3f} symbol={symbol} "
+                                f"TP={sig.get('adaptive', {}).get('TP_PCT', 'n/a')}% "
+                                f"SL={sig.get('adaptive', {}).get('SL_PCT', 'n/a')}% "
+                                f"mtf={sig.get('meta', {}).get('mtf_alignment', 'N/A')} "
+                                f"| id={signal_id}"
+                            )
 
-                          engine.execute_signal(sig)
+                            engine.execute_signal(sig)
 
-                          # ── DEMO: DCA position გახსნა ──────────────────
-                          # FIX: EXEC_REJECT check — თუ engine-მა reject-ი გააკეთა
-                          # (ABOVE_MIN_OPEN_TRADES, MAX_OPEN_TRADES, და სხვა),
-                          # mark_signal_id_executed() უკვე გამოიძახა → skip DEMO open.
-                          # signal_id_already_executed() → True = rejected ან executed
-                          if engine.exchange is None and _dca_enabled:
-                              try:
-                                  from execution.db.repository import (
-                                      open_dca_position, add_dca_order, open_trade,
-                                      get_open_dca_position_for_symbol,
-                                      get_executed_signal_action,
-                                      get_all_open_trades,
-                                      get_all_open_dca_positions,
-                                  )
-                                  _sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
+                            # ── DEMO: DCA position გახსნა ──────────────────
+                            if engine.exchange is None and _dca_enabled:
+                                try:
+                                    from execution.db.repository import (
+                                        open_dca_position, add_dca_order, open_trade,
+                                        get_open_dca_position_for_symbol,
+                                        get_executed_signal_action,
+                                        get_all_open_trades,
+                                        get_all_open_dca_positions,
+                                    )
+                                    _sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
 
-                                  # ── REJECT CHECK ──────────────────────────────────────────
-                                  # FIX: signal_id_already_executed() → True for BOTH:
-                                  #   "TRADE_DEMO"  (ნორმალური შესრულება) — DCA MUST open
-                                  #   "REJECT_*"    (ნამდვილი reject)     — DCA must NOT open
-                                  # გამოსწორება: action სტრიქონით ვანსხვავებთ.
-                                  # TRADE_DEMO engine-ში simulate_market_entry() = no-op,
-                                  # ამიტომ DCA position-ი main.py-ში იხსნება.
-                                  _exec_action = get_executed_signal_action(signal_id)
-                                  _REAL_REJECTS = {
-                                      "REJECT_MAX_OPEN_TRADES",
-                                      "REJECT_ABOVE_MIN_OPEN",
-                                      "REJECT_MAX_POSITIONS",
-                                      "REJECT_ACTIVE_OCO",
-                                      "REJECT_OPEN_TRADE_RACE",
-                                      "REJECT_MIN_NOTIONAL",
-                                      "REJECT_PORTFOLIO_EXPOSURE",
-                                  }
-                                  _is_real_reject = _exec_action in _REAL_REJECTS
+                                    _exec_action = get_executed_signal_action(signal_id)
+                                    _REAL_REJECTS = {
+                                        "REJECT_MAX_OPEN_TRADES",
+                                        "REJECT_ABOVE_MIN_OPEN",
+                                        "REJECT_MAX_POSITIONS",
+                                        "REJECT_ACTIVE_OCO",
+                                        "REJECT_OPEN_TRADE_RACE",
+                                        "REJECT_MIN_NOTIONAL",
+                                        "REJECT_PORTFOLIO_EXPOSURE",
+                                    }
+                                    _is_real_reject = _exec_action in _REAL_REJECTS
 
-                                  if _is_real_reject:
-                                      logger.info(
-                                          f"[DEMO] SKIP_REJECTED | {_sym} "
-                                          f"action={_exec_action} id={signal_id}"
-                                      )
+                                    if _is_real_reject:
+                                        logger.info(
+                                            f"[DEMO] SKIP_REJECTED | {_sym} "
+                                            f"action={_exec_action} id={signal_id}"
+                                        )
 
-                                  # FIX: count L1-only positions — _L2/_L3 CASCADE layers
-                                  # არ ჩაითვლება (execution_engine-ის ლოგიკა მირორდება).
-                                  # ძველი: len(get_all_open_dca_positions()) → _L2/_L3 ჩათვლით
-                                  # = double-counting → DEMO-ში ახალი positions ვეღარ იხსნებოდა.
-                                  import re as _re_main_cnt
-                                  _all_dca_cnt = get_all_open_dca_positions() or []
-                                  _l1_open_cnt = sum(
-                                      1 for _p in _all_dca_cnt
-                                      if not _re_main_cnt.search(r'_L\d+$', str(_p.get("symbol", "")))
-                                  )
-                                  _max_open_cnt = int(os.getenv("MAX_OPEN_TRADES", "6"))
-                                  _at_max = _l1_open_cnt >= _max_open_cnt
-                                  if _at_max:
-                                      logger.info(
-                                          f"[DEMO] SKIP_MAX_OPEN | {_sym} "
-                                          f"l1_open={_l1_open_cnt} >= MAX_OPEN_TRADES={_max_open_cnt}"
-                                      )
+                                    # FIX #20: (_L\d+|_LP)$ — LP positions L1-ად არ ითვლება
+                                    import re as _re_main_cnt
+                                    _all_dca_cnt = get_all_open_dca_positions() or []
+                                    _l1_open_cnt = sum(
+                                        1 for _p in _all_dca_cnt
+                                        if not _re_main_cnt.search(r'(_L\d+|_LP)$', str(_p.get("symbol", "")))
+                                    )
+                                    _max_open_cnt = int(os.getenv("MAX_OPEN_TRADES", "6"))
+                                    _at_max = _l1_open_cnt >= _max_open_cnt
+                                    if _at_max:
+                                        logger.info(
+                                            f"[DEMO] SKIP_MAX_OPEN | {_sym} "
+                                            f"l1_open={_l1_open_cnt} >= MAX_OPEN_TRADES={_max_open_cnt}"
+                                        )
 
-                                  # ALLOW_DCA_DUPLICATE: ერთი symbol-ი 2 L1 position
-                                  # _existing = get_open_dca_position_for_symbol(_sym) → True/False
-                                  # DUPLICATE mode: count vs MAX_DCA_PER_SYMBOL limit
-                                  _allow_dup = os.getenv("ALLOW_DCA_DUPLICATE", "false").strip().lower() in ("1", "true", "yes")
-                                  _max_dca_per_sym = int(os.getenv("MAX_DCA_PER_SYMBOL", "1"))
-                                  try:
-                                      from execution.db.repository import count_open_dca_positions_for_symbol
-                                      _sym_dca_count = count_open_dca_positions_for_symbol(_sym)
-                                  except Exception:
-                                      _sym_dca_count = 1 if get_open_dca_position_for_symbol(_sym) else 0
+                                    _allow_dup = os.getenv("ALLOW_DCA_DUPLICATE", "false").strip().lower() in ("1", "true", "yes")
+                                    _max_dca_per_sym = int(os.getenv("MAX_DCA_PER_SYMBOL", "1"))
+                                    try:
+                                        from execution.db.repository import count_open_dca_positions_for_symbol
+                                        _sym_dca_count = count_open_dca_positions_for_symbol(_sym)
+                                    except Exception:
+                                        _sym_dca_count = 1 if get_open_dca_position_for_symbol(_sym) else 0
 
-                                  if _allow_dup:
-                                      # duplicate mode: block only if count >= MAX_DCA_PER_SYMBOL
-                                      _existing_blocked = _sym_dca_count >= _max_dca_per_sym
-                                  else:
-                                      # normal mode: block if ANY position open for symbol
-                                      _existing_blocked = _sym_dca_count > 0
+                                    if _allow_dup:
+                                        _existing_blocked = _sym_dca_count >= _max_dca_per_sym
+                                    else:
+                                        _existing_blocked = _sym_dca_count > 0
 
-                                  # ── per-symbol ENTRY_COOLDOWN ────────────────────
-                                  # ENV: ENTRY_COOLDOWN_SECONDS=600 (0=disabled)
-                                  # იმავე symbol-ზე ახალი L1 position-ი მხოლოდ
-                                  # cooldown-ის გასვლის შემდეგ გაიხსნება.
-                                  # სხვა symbol-ები არ ბლოკდება → stagger effect.
-                                  _entry_cd = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "0"))
-                                  if _entry_cd > 0 and not _existing_blocked:
-                                      try:
-                                          from execution.db.repository import get_last_entry_ts_for_symbol
-                                          _last_e_ts = get_last_entry_ts_for_symbol(_sym) or 0.0
-                                          _cd_elapsed = time.time() - _last_e_ts
-                                          if _cd_elapsed < _entry_cd:
-                                              logger.info(
-                                                  f"[DEMO] ENTRY_COOLDOWN | {_sym} "
-                                                  f"remaining={int(_entry_cd - _cd_elapsed)}s"
-                                              )
-                                              _existing_blocked = True
-                                      except Exception:
-                                          pass  # DB function არ არის → skip cooldown
+                                    _entry_cd = int(os.getenv("ENTRY_COOLDOWN_SECONDS", "0"))
+                                    if _entry_cd > 0 and not _existing_blocked:
+                                        try:
+                                            from execution.db.repository import get_last_entry_ts_for_symbol
+                                            _last_e_ts = get_last_entry_ts_for_symbol(_sym) or 0.0
+                                            _cd_elapsed = time.time() - _last_e_ts
+                                            if _cd_elapsed < _entry_cd:
+                                                logger.info(
+                                                    f"[DEMO] ENTRY_COOLDOWN | {_sym} "
+                                                    f"remaining={int(_entry_cd - _cd_elapsed)}s"
+                                                )
+                                                _existing_blocked = True
+                                        except Exception:
+                                            pass
 
-                                  _rejected = _is_real_reject or _at_max or _existing_blocked
-                                  if not _rejected:
-                                      _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
-                                      _price = _price_cache.get(_sym, 0.0)
-                                      if _price <= 0:
-                                          _t = engine.price_feed.fetch_ticker(_sym)
-                                          _price = float(_t.get("last") or 0.0)
-                                      if _price > 0:
-                                          _qty = _quote / _price
-                                          _tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
-                                          _tp = round(_price * (1.0 + _tp_pct / 100.0), 6)
-                                          _quote_pt  = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
-                                          _sizes_str = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
-                                          try:
-                                              _addon_sum = sum(float(x.strip()) for x in _sizes_str.split(",") if x.strip())
-                                          except Exception:
-                                              _addon_sum = 70.0
-                                          _auto_cap = _quote_pt + _addon_sum
-                                          _max_cap  = float(os.getenv("DCA_MAX_CAPITAL_USDT") or _auto_cap)
-                                          _pos_id = open_dca_position(
-                                              symbol=_sym,
-                                              initial_entry_price=_price,
-                                              initial_qty=_qty,
-                                              initial_quote_spent=_quote,
-                                              tp_price=_tp,
-                                              sl_price=0.0,
-                                              tp_pct=_tp_pct,
-                                              sl_pct=999.0,
-                                              max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
-                                              max_capital=_max_cap,
-                                              max_drawdown_pct=999.0,
-                                          )
-                                          # INITIAL order — dca_orders ცხრილი
-                                          # საჭიროა get_lifo_unit()-ისთვის (L3 rotation)
-                                          add_dca_order(
-                                              position_id=_pos_id,
-                                              symbol=_sym,
-                                              order_type="INITIAL",
-                                              entry_price=_price,
-                                              qty=_qty,
-                                              quote_spent=_quote,
-                                              avg_entry_after=_price,
-                                              tp_after=_tp,
-                                              sl_after=0.0,
-                                              trigger_drawdown_pct=0.0,
-                                              exchange_order_id=signal_id,
-                                          )
-                                          open_trade(
-                                              signal_id=signal_id,
-                                              symbol=_sym,
-                                              qty=_qty,
-                                              quote_in=_quote,
-                                              entry_price=_price,
-                                          )
-                                          logger.info(
-                                              f"[DEMO] DCA_OPENED | {_sym} "
-                                              f"price={_price:.4f} qty={_qty:.6f} "
-                                              f"tp={_tp:.4f} quote={_quote}"
-                                          )
-                                          # ── TELEGRAM: 🚀 NEW SIGNAL OPENED ─────────────
-                                          # FIX: DEMO mode-ში execution_engine `return`-ს
-                                          # აკეთებს notify_signal_created-მდე (LIVE path).
-                                          # DCA position გახსნის შემდეგ TG notification ხდება.
-                                          try:
-                                              from execution.telegram_notifier import notify_signal_created
-                                              notify_signal_created(
-                                                  symbol=_sym,
-                                                  entry_price=_price,
-                                                  quote_amount=_quote,
-                                                  tp_price=_tp,
-                                                  sl_price=0.0,
-                                                  verdict=str(sig.get("final_verdict", "BUY")),
-                                                  mode=os.getenv("MODE", "DEMO"),
-                                              )
-                                          except Exception as _tg_new:
-                                              logger.warning(f"[DEMO] TG_NEW_SIGNAL_FAIL | {_sym} err={_tg_new}")
-                              except Exception as _de:
-                                  logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
+                                    _rejected = _is_real_reject or _at_max or _existing_blocked
+                                    if not _rejected:
+                                        _quote = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
+                                        _price = _price_cache.get(_sym, 0.0)
+                                        if _price <= 0:
+                                            _t = engine.price_feed.fetch_ticker(_sym)
+                                            _price = float(_t.get("last") or 0.0)
+                                        if _price > 0:
+                                            _qty = _quote / _price
+                                            _tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
+                                            _tp = round(_price * (1.0 + _tp_pct / 100.0), 6)
+                                            _quote_pt  = float(os.getenv("BOT_QUOTE_PER_TRADE", "12.0"))
+                                            _sizes_str = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
+                                            try:
+                                                _addon_sum = sum(float(x.strip()) for x in _sizes_str.split(",") if x.strip())
+                                            except Exception:
+                                                _addon_sum = 70.0
+                                            _auto_cap = _quote_pt + _addon_sum
+                                            _max_cap  = float(os.getenv("DCA_MAX_CAPITAL_USDT") or _auto_cap)
+                                            _pos_id = open_dca_position(
+                                                symbol=_sym,
+                                                initial_entry_price=_price,
+                                                initial_qty=_qty,
+                                                initial_quote_spent=_quote,
+                                                tp_price=_tp,
+                                                sl_price=0.0,
+                                                tp_pct=_tp_pct,
+                                                sl_pct=999.0,
+                                                max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
+                                                max_capital=_max_cap,
+                                                max_drawdown_pct=999.0,
+                                            )
+                                            add_dca_order(
+                                                position_id=_pos_id,
+                                                symbol=_sym,
+                                                order_type="INITIAL",
+                                                entry_price=_price,
+                                                qty=_qty,
+                                                quote_spent=_quote,
+                                                avg_entry_after=_price,
+                                                tp_after=_tp,
+                                                sl_after=0.0,
+                                                trigger_drawdown_pct=0.0,
+                                                exchange_order_id=signal_id,
+                                            )
+                                            open_trade(
+                                                signal_id=signal_id,
+                                                symbol=_sym,
+                                                qty=_qty,
+                                                quote_in=_quote,
+                                                entry_price=_price,
+                                            )
+                                            logger.info(
+                                                f"[DEMO] DCA_OPENED | {_sym} "
+                                                f"price={_price:.4f} qty={_qty:.6f} "
+                                                f"tp={_tp:.4f} quote={_quote}"
+                                            )
+                                            try:
+                                                from execution.telegram_notifier import notify_signal_created
+                                                notify_signal_created(
+                                                    symbol=_sym,
+                                                    entry_price=_price,
+                                                    quote_amount=_quote,
+                                                    tp_price=_tp,
+                                                    sl_price=0.0,
+                                                    verdict=str(sig.get("final_verdict", "BUY")),
+                                                    mode=os.getenv("MODE", "DEMO"),
+                                                )
+                                            except Exception as _tg_new:
+                                                logger.warning(f"[DEMO] TG_NEW_SIGNAL_FAIL | {_sym} err={_tg_new}")
+
+                                            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                            # FIX #20: LP OPEN — L1 გახსნის შემდეგ მყისიერად
+                                            # LP_ENABLED=true ENV-ით კონტროლდება
+                                            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                                            if _lp_enabled_flag:
+                                                try:
+                                                    _lp_sizes_str = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
+                                                    try:
+                                                        _lp_addon_sum = sum(float(x.strip()) for x in _lp_sizes_str.split(",") if x.strip())
+                                                    except Exception:
+                                                        _lp_addon_sum = 70.0
+                                                    _lp_auto_cap = float(os.getenv("LP_QUOTE", "50.0")) + _lp_addon_sum
+                                                    _lp_max_cap  = float(os.getenv("DCA_MAX_CAPITAL_USDT") or _lp_auto_cap)
+
+                                                    _open_lp_position(
+                                                        engine=engine,
+                                                        base_sym=_sym,
+                                                        l1_price=_price,
+                                                        signal_id=signal_id,
+                                                        tp_pct=_tp_pct,
+                                                        max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
+                                                        max_capital=_lp_max_cap,
+                                                        trigger_drop_pct=float(os.getenv("LP_TRIGGER_PCT", "0.20")),
+                                                    )
+                                                except Exception as _lp_err:
+                                                    logger.error(f"[LP] OPEN_AFTER_L1_FAIL | {_sym} err={_lp_err}")
+
+                                except Exception as _de:
+                                    logger.warning(f"[DEMO] DCA_OPEN_FAIL | err={_de}")
+
+                            # ── LIVE: DCA position + LP ────────────────────
+                            elif engine.exchange is not None and _dca_enabled:
+                                # LIVE-ში execution_engine.execute_signal() ახდენს
+                                # ყიდვას და DB ჩაწერას — LP-ს ვუმატებთ შემდეგ
+                                if _lp_enabled_flag:
+                                    try:
+                                        _live_sym = str((sig.get("execution") or {}).get("symbol", "BTC/USDT"))
+                                        _live_price = _price_cache.get(_live_sym, 0.0)
+                                        if _live_price <= 0:
+                                            _live_price = float(engine.exchange.fetch_last_price(_live_sym) or 0.0)
+                                        if _live_price > 0:
+                                            _live_tp_pct = float(os.getenv("DCA_TP_PCT", "0.55"))
+                                            _live_sizes_str = os.getenv("DCA_ADDON_SIZES", "12,15,18,15,10")
+                                            try:
+                                                _live_addon_sum = sum(float(x.strip()) for x in _live_sizes_str.split(",") if x.strip())
+                                            except Exception:
+                                                _live_addon_sum = 70.0
+                                            _live_lp_cap = float(os.getenv("LP_QUOTE", "50.0")) + _live_addon_sum
+                                            _live_max_cap = float(os.getenv("DCA_MAX_CAPITAL_USDT") or _live_lp_cap)
+
+                                            _open_lp_position(
+                                                engine=engine,
+                                                base_sym=_live_sym,
+                                                l1_price=_live_price,
+                                                signal_id=signal_id,
+                                                tp_pct=_live_tp_pct,
+                                                max_add_ons=int(os.getenv("DCA_MAX_ADD_ONS", "5")),
+                                                max_capital=_live_max_cap,
+                                                trigger_drop_pct=float(os.getenv("LP_TRIGGER_PCT", "0.20")),
+                                            )
+                                    except Exception as _lp_live_err:
+                                        logger.error(f"[LP] LIVE_OPEN_FAIL | err={_lp_live_err}")
 
                     else:
-                        # HOLD ან სხვა — უბრალოდ log
                         logger.info(f"[AUTO] Unsupported verdict={verdict} | id={signal_id} → skip")
 
                 else:
@@ -2306,26 +2605,13 @@ def main():
                 _run_performance_report_safe(send_telegram=True)
                 last_tg_report_ts = now
 
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-            # E: HEARTBEAT — Smart Schedule (Asia/Tbilisi):
-            # 09:00-03:00 → ყოველ 1 საათში (3600s)
-            # 03:00-09:00 → გაჩუმება 😴 (ძილის საათები)
-            # 23:57-23:59 → Daily Summary-სთან ერთად (always)
-            # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
             try:
                 _hb_now    = _now_dt()
                 _hb_hour   = _hb_now.hour
                 _hb_minute = _hb_now.minute
 
-                # 03:00-09:00 → გაჩუმება (ძილი)
-                # 03:00 ≤ hour < 09:00 → silent
                 _hb_silent = (3 <= _hb_hour < 9)
-
-                # 09:00-03:00 → ყოველ 1 საათში
                 _hb_day_ok = not _hb_silent and (now - last_heartbeat_ts) >= 1800
-
-                # 23:57-23:59 → Daily Summary-სთან ერთად (loop window fix)
                 _hb_midnight_ok = (_hb_hour == 23 and _hb_minute >= 57)
 
                 if _hb_day_ok or _hb_midnight_ok:
@@ -2355,9 +2641,6 @@ def main():
                 now_local = _now_dt()
                 today_str = now_local.date().isoformat()
 
-                # FIX: LOOP_SLEEP=120s > 23:59 window=60s → 50% miss rate!
-                # გაფართოება: 57,58,59 → 180s window > 120s loop → 100% guaranteed
-                # last_daily_summary_date guard → double-send შეუძლებელია
                 if (
                     now_local.hour == 23
                     and now_local.minute in (57, 58, 59)
