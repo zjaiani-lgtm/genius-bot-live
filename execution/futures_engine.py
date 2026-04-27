@@ -39,11 +39,20 @@
 #   FIX-S4: check_dca_hedge_l3() — true LIFO: cheapest unit sell → reinvest proceeds
 #            (არა full position close + fixed $20 reopen)
 #   FIX-S5: per-position cooldown dict (არა global timestamp)
+#   FIX-S7: _fetch_price() — (_L\d+|_LP)$ suffix strip
+#            პრობლემა: LP positions (BTC/USDT_LP) DB-ში "BTC/USDT_LP" symbol-ით
+#            ინახება. check_tp_sl() ყველა futures_positions row-ს ამუშავებს.
+#            _fetch_price("BTC/USDT_LP") → Binance: "does not have market symbol"
+#            გამოსწორება: _fetch_price()-ში regex strip ერთი ადგილი → ყველა
+#            caller (check_tp_sl, _close_short, check_dca_hedge_addons,
+#            check_dca_hedge_l3, check_independent_short_addons,
+#            check_mirror_addons, check_mirror_tp_sl) ავტომატურად დაფარულია.
 # ============================================================
 from __future__ import annotations
 
 import os
 import logging
+import re as _re_sym
 import time
 import uuid
 from datetime import datetime, timezone
@@ -162,7 +171,7 @@ def _open_short_db(
     mode: str,
     is_dca_hedge: int = 0,
     dca_pos_id: int = 0,
-    hedge_tp_pct: float = 3.5,  # FIX-S6: stored at open for ADD-ON TP recalc consistency
+    hedge_tp_pct: float = 3.5,
 ) -> int:
     from execution.db.db import get_connection
     now = datetime.now(timezone.utc).isoformat()
@@ -235,22 +244,16 @@ def _ensure_addon_cols() -> None:
                 ("sl_price_addon",        "REAL DEFAULT 0.0"),
                 ("is_dca_hedge",          "INTEGER DEFAULT 0"),
                 ("dca_pos_id",            "INTEGER DEFAULT 0"),
-                # INDEPENDENT SHORT DCA — ახალი სარკე სისტემა
-                ("is_independent_short",  "INTEGER DEFAULT 0"),  # 1=independent SHORT DCA
-                ("long_ref_price",        "REAL DEFAULT 0.0"),   # LONG L1 entry reference
-                # FIX BUG-3: ADD-ON cooldown DB-ში (restart-safe)
-                # in-memory _short_addon_cooldown_map → Render restart-ზე იკარგება
-                ("last_short_addon_ts",   "REAL DEFAULT 0.0"),   # unix timestamp last addon
-                # FIX-S6: hedge TP tier — stored at open, ADD-ON recalc-ზე გამოიყენება
-                # DEFAULT 3.5 → ძველი rows backward compat (bear tier)
-                ("hedge_tp_pct",          "REAL DEFAULT 3.5"),   # TP% used at open (regime-based)
-                # GENIUS MIRROR ENGINE columns
-                ("is_mirror_engine",      "INTEGER DEFAULT 0"),   # 1 = MIRROR ENGINE position
-                ("mirror_direction",      "TEXT DEFAULT ''"),      # 'DOWN' or 'UP' — ADD-ON direction
-                ("mirror_addons_down",    "INTEGER DEFAULT 0"),   # ქვევით ADD-ON count
-                ("mirror_addons_up",      "INTEGER DEFAULT 0"),   # ზევით ADD-ON count
-                ("mirror_long_ref_price", "REAL DEFAULT 0.0"),    # LONG L1 entry reference
-                ("last_mirror_addon_ts",  "REAL DEFAULT 0.0"),    # cooldown timestamp
+                ("is_independent_short",  "INTEGER DEFAULT 0"),
+                ("long_ref_price",        "REAL DEFAULT 0.0"),
+                ("last_short_addon_ts",   "REAL DEFAULT 0.0"),
+                ("hedge_tp_pct",          "REAL DEFAULT 3.5"),
+                ("is_mirror_engine",      "INTEGER DEFAULT 0"),
+                ("mirror_direction",      "TEXT DEFAULT ''"),
+                ("mirror_addons_down",    "INTEGER DEFAULT 0"),
+                ("mirror_addons_up",      "INTEGER DEFAULT 0"),
+                ("mirror_long_ref_price", "REAL DEFAULT 0.0"),
+                ("last_mirror_addon_ts",  "REAL DEFAULT 0.0"),
             ]
             for col, col_def in migrations:
                 if col not in cols:
@@ -305,47 +308,30 @@ class FuturesEngine:
         self.exchange_trigger_pct = _ef("FUTURES_EXCHANGE_TRIGGER_PCT", 2.5)
 
         # ── DCA HEDGE SHORT CASCADE პარამეტრები ──────────────
-        # ყველა პარამეტრი ENV-კონტროლირებადია
         self.dca_hedge_quote      = _ef("FUTURES_DCA_HEDGE_QUOTE",    20.0)
-        # FIX-S6: DUAL-REGIME HEDGE TP
-        # BULL market: hedge იხსნება LONG TP-ს მახლობლად → 0.7% სწრაფი close
-        # BEAR market: hedge LONG-ის სრული DCA cycle-ს მიჰყვება → 3.5% protection
-        # ძველი FUTURES_DCA_HEDGE_TP_PCT → BEAR tier-ის default (backward compat)
         self.dca_hedge_tp_pct_bull = _ef("FUTURES_DCA_HEDGE_TP_PCT_BULL", 0.7)
         self.dca_hedge_tp_pct_bear = _ef("FUTURES_DCA_HEDGE_TP_PCT_BEAR", 3.5)
-        # legacy fallback: თუ მხოლოდ FUTURES_DCA_HEDGE_TP_PCT მითითებულია
         _legacy_tp = _ef("FUTURES_DCA_HEDGE_TP_PCT", 0.0)
         if _legacy_tp > 0:
-            # legacy ENV → bear tier-ად ჩაიწერება, bull tier default 0.7%
             self.dca_hedge_tp_pct_bear = _legacy_tp
-        self.dca_hedge_tp_pct     = self.dca_hedge_tp_pct_bear  # backward compat alias
+        self.dca_hedge_tp_pct     = self.dca_hedge_tp_pct_bear
         self.dca_hedge_max_addons = _ei("FUTURES_DCA_MAX_ADDONS",        5)
         self.dca_hedge_l3_trigger_pct = _ef("FUTURES_DCA_L3_TRIGGER_PCT", 1.5)
 
-        # FIX-S1: multi-level triggers — indexed by add_on_count
-        # ENV: FUTURES_DCA_ADDON_TRIGGER_PCTS=1.0,2.2,3.5,5.0,6.5
-        # mirror of DCA DCA_ADDON_TRIGGER_PCTS (ზევით bounce %-ები)
         self.dca_hedge_addon_trigger_pcts = _parse_list_float(
             "FUTURES_DCA_ADDON_TRIGGER_PCTS",
             [1.0, 2.2, 3.5, 5.0, 6.5],
         )
         self.dca_hedge_addon_quote = _ef("FUTURES_DCA_ADDON_QUOTE", 12.0)
 
-        # FIX-S3: Force Close — ENV-კონტროლირებადი
-        # SHORT FC: days ან +drawdown% (ზევით — SHORT-ისთვის ზარალი)
         self.dca_hedge_fc_max_days     = _ef("FUTURES_DCA_FC_MAX_DAYS",     10.0)
         self.dca_hedge_fc_drawdown_pct = _ef("FUTURES_DCA_FC_DRAWDOWN_PCT", 22.0)
 
-        # FIX-S5: per-position cooldown (არა global timestamp)
-        # key: pos_id → last_addon_ts
         self._hedge_addon_cooldown_map: Dict[int, float] = {}
-        self._hedge_addon_cooldown_s = 180  # 3 წუთი ADD-ON-ებს შორის
+        self._hedge_addon_cooldown_s = 180
         self._last_hedge_l3_ts: float = 0.0
 
         # ── INDEPENDENT SHORT DCA პარამეტრები ────────────────
-        # სარკე სისტემა: LONG-ის L2-L3 midpoint-ზე SHORT იხსნება
-        # ADD-ONs ვარდნაზე (LONG ADD-ON-ების სარკე)
-        # TP + FC — სავალდებულო დახურვა, ღია ტრეიდი არ რჩება
         self.short_dca_enabled       = _eb("SHORT_DCA_ENABLED",        False)
         self.short_l1_trigger_pct    = _ef("SHORT_L1_TRIGGER_PCT",      1.6)
         self.short_addon_trigger_pcts = _parse_list_float(
@@ -357,16 +343,10 @@ class FuturesEngine:
         self.short_fc_max_days       = _ef("SHORT_FC_MAX_DAYS",         10.0)
         self.short_fc_drawdown_pct   = _ef("SHORT_FC_DRAWDOWN_PCT",     15.0)
 
-        # per-position cooldown for independent SHORT ADD-ONs
         self._short_addon_cooldown_map: Dict[int, float] = {}
-        self._short_addon_cooldown_s = 300  # 5 წუთი ADD-ON-ებს შორის
+        self._short_addon_cooldown_s = 300
 
         # ── GENIUS MIRROR ENGINE ──────────────────────────────
-        # bilateral DCA: L2/L3 midpoint-ზე იხსნება SHORT
-        # ADD-ONs ქვევით (ვარდნა): avg↓ TP↓ → bounce ნაკლები სჭირდება
-        # ADD-ONs ზევით (bounce):  avg↑ TP ახლოვდება
-        # TP:  avg × (1 - mirror_tp_pct%)  — 0.55% scalp
-        # FC:  drawdown only — time FC გაუქმებულია
         self.mirror_enabled            = _eb("MIRROR_ENGINE_ENABLED",    False)
         self.mirror_trigger_pct        = _ef("MIRROR_TRIGGER_PCT",        8.59)
         self.mirror_l1_quote           = _ef("MIRROR_L1_QUOTE",           25.0)
@@ -428,16 +408,41 @@ class FuturesEngine:
         )
 
     def _fetch_price(self, symbol: str) -> float:
-        """ახლანდელი ფასი — public API (DEMO/LIVE ორივეზე)."""
+        """
+        ახლანდელი ფასი — public API (DEMO/LIVE ორივეზე).
+
+        FIX-S7: (_L\\d+|_LP)$ suffix strip.
+        DB-ში position-ი ინახება "BTC/USDT_LP" symbol-ით (DCA layer label).
+        Binance API-ს ეს სიმბოლო არ იცნობს — მხოლოდ "BTC/USDT" იცის.
+        ყველა caller (check_tp_sl, _close_short, check_dca_hedge_addons,
+        check_dca_hedge_l3, check_independent_short_addons,
+        check_mirror_addons, check_mirror_tp_sl) ავტომატურად დაფარულია
+        ამ ერთი ადგილის fix-ით.
+
+        strip examples:
+          "BTC/USDT_LP" → "BTC/USDT"
+          "BTC/USDT_L2" → "BTC/USDT"
+          "BTC/USDT_L3" → "BTC/USDT"
+          "BTC/USDT"    → "BTC/USDT"  (unchanged)
+          "ETH/USDT_LP" → "ETH/USDT"
+          "BNB/USDT_LP" → "BNB/USDT"
+        """
+        # FIX-S7: strip DCA layer suffix before Binance API call
+        clean_symbol = _re_sym.sub(r'(_L\d+|_LP)$', '', symbol)
+        if clean_symbol != symbol:
+            logger.debug(
+                f"[FUTURES] PRICE_STRIP | {symbol} → {clean_symbol} "
+                f"(DCA suffix removed for Binance API)"
+            )
         try:
             import ccxt
             exchange = ccxt.binance({"enableRateLimit": True})
-            ticker = exchange.fetch_ticker(symbol)
+            ticker = exchange.fetch_ticker(clean_symbol)
             price = float(ticker.get("last") or 0.0)
-            logger.debug(f"[FUTURES] PRICE | {symbol}={price:.4f}")
+            logger.debug(f"[FUTURES] PRICE | {clean_symbol}={price:.4f}")
             return price
         except Exception as e:
-            logger.warning(f"[FUTURES] PRICE_FAIL | {symbol} err={e}")
+            logger.warning(f"[FUTURES] PRICE_FAIL | {clean_symbol} err={e}")
             return 0.0
 
     def _get_btc_24h_change(self) -> float:
@@ -456,65 +461,45 @@ class FuturesEngine:
 
     # ────────────────────────────────────────────────────────
     # INTERNAL: _get_hedge_tp_pct  [FIX-S6 — dual-regime TP]
-    # BULL: 0.7% — LONG TP (0.55%)-ზე ოდნავ მეტი → hedge TP ადრე ჭრება
-    # BEAR: 3.5% — სრული DCA protection lifecycle
-    # NEUTRAL: bear tier (conservative)
     # ────────────────────────────────────────────────────────
     def _get_hedge_tp_pct(self, market_regime: str = "NEUTRAL") -> float:
         """
         regime-based hedge TP %.
 
         BULL:    FUTURES_DCA_HEDGE_TP_PCT_BULL (default 0.7%)
-                 ლოგიკა: BULL-ზე LONG TP=0.55% სწრაფად ჭრება.
-                 hedge-ი 0.7%-ზე LONG TP-ს მახლობლად იხურება profit-ში.
-                 LONG FC-ზე hedge-ი close_dca_hedge_for_position()-ით
-                 ნებისმიერ შემთხვევაში დაიხურება.
-
         BEAR:    FUTURES_DCA_HEDGE_TP_PCT_BEAR (default 3.5%)
-                 ლოგიკა: BEAR-ზე BTC ღრმად ეცემა.
-                 hedge-ი 3.5% TP-ზე მოგებაში გამოდის LONG ADD-ON-ების
-                 ზარალს ანაზღაურებს.
-
         NEUTRAL: bear tier (conservative default)
         """
         regime = str(market_regime).upper()
         if regime == "BULL":
             return self.dca_hedge_tp_pct_bull
-        return self.dca_hedge_tp_pct_bear  # BEAR + NEUTRAL
+        return self.dca_hedge_tp_pct_bear
 
     # ────────────────────────────────────────────────────────
     # INTERNAL: _close_short  [FIX-S2]
-    # PnL = avg_entry_price × qty (არა original entry_price)
-    # ADD-ON-ის შემდეგ avg_entry_price განახლდება DB-ში →
-    # _close_short-ი ამ განახლებულ avg-ს კითხულობს → PnL სწორია
     # ────────────────────────────────────────────────────────
     def _close_short(self, pos: Dict[str, Any], reason: str = "MANUAL") -> None:
         """
         ერთი SHORT position-ის დახურვა.
 
         FIX-S2: PnL-ი avg_entry_price-ზეა (არა entry_price).
-        ADD-ON-ის შემდეგ avg_entry_price > entry_price (SHORT-ი ძვირდება) →
-        PnL = (avg_entry - exit) × qty — ზუსტი weighted average PnL.
-
-        edge case: avg_entry_price=0 (ძველი DB row მიგრაციამდე) →
-        fallback entry_price — არ ინახება ზარალი.
+        FIX-S7: _fetch_price() ახლა suffix-ს სტრიპავს — LP positions სწორად.
         """
         try:
             symbol      = str(pos.get("symbol", ""))
             pos_id      = int(pos.get("id", 0))
             qty         = float(pos.get("qty", 0.0))
 
-            # FIX-S2: avg_entry_price გამოიყენება (entry_price-ის მაგივრად)
             avg_entry   = float(pos.get("avg_entry_price", 0.0) or 0.0)
             entry_price = float(pos.get("entry_price", 0.0))
             if avg_entry <= 0:
-                avg_entry = entry_price  # fallback ძველი DB rows-ისთვის
+                avg_entry = entry_price
 
+            # FIX-S7: _fetch_price strips "_LP"/"_L2" suffix internally
             exit_price = self._fetch_price(symbol)
             if exit_price <= 0:
-                exit_price = avg_entry  # safe fallback
+                exit_price = avg_entry
 
-            # SHORT PnL: avg_entry > exit → profit; avg_entry < exit → loss
             price_diff = avg_entry - exit_price
             pnl_quote  = round(price_diff * qty, 4)
             pnl_pct    = round((price_diff / avg_entry) * 100.0 * self.leverage, 2) if avg_entry > 0 else 0.0
@@ -550,7 +535,6 @@ class FuturesEngine:
             except Exception:
                 pass
 
-            # FIX-S5: cleanup per-position cooldown (hedge + independent)
             self._hedge_addon_cooldown_map.pop(pos_id, None)
             self._short_addon_cooldown_map.pop(pos_id, None)
 
@@ -636,8 +620,7 @@ class FuturesEngine:
     def close_all_shorts(self, reason: str = "BULL_MARKET") -> None:
         """
         BULL market → BEAR hedge SHORT-ების დახურვა.
-        DCA hedge SHORT-ები (is_dca_hedge=1) არ იხურება —
-        ისინი DCA position lifecycle-ს მიყვება.
+        DCA hedge SHORT-ები (is_dca_hedge=1) არ იხურება.
         """
         if not self.enabled:
             return
@@ -666,21 +649,16 @@ class FuturesEngine:
             self._close_short(pos, reason=reason)
 
     # ────────────────────────────────────────────────────────
-    # PUBLIC: check_tp_sl  [FIX-S3 — FC დამატება]
+    # PUBLIC: check_tp_sl  [FIX-S3 + FIX-S7]
     # ────────────────────────────────────────────────────────
     def check_tp_sl(self) -> None:
         """
         main loop-ში ყოველ iteration-ზე.
 
-        FIX-S3: Force Close დამატება hedge SHORT-ებისთვის:
-          - FC by time: opened_at + FUTURES_DCA_FC_MAX_DAYS
-          - FC by drawdown: current > avg_entry × (1 + FUTURES_DCA_FC_DRAWDOWN_PCT%)
-            (SHORT-ისთვის ზევით მოძრაობა = ზარალი)
-
-        edge cases:
-          - opened_at NULL → FC by time skip (safe)
-          - avg_entry_price = 0 → FC by drawdown skip (safe)
-          - non-hedge SHORTs: FC skip (მხოლოდ BEAR SHORTs — TP-ს ელოდება)
+        FIX-S3: Force Close hedge SHORT-ებისთვის.
+        FIX-S7: _fetch_price() ახლა suffix-ს სტრიპავს —
+                LP positions-ი (BTC/USDT_LP) სწორად ამუშავდება.
+                PRICE_FAIL WARNING-ი აღარ გამოჩნდება.
         """
         if not self.enabled:
             return
@@ -695,6 +673,7 @@ class FuturesEngine:
             is_hedge  = int(pos.get("is_dca_hedge", 0) or 0)
             is_indep  = int(pos.get("is_independent_short", 0) or 0)
 
+            # FIX-S7: _fetch_price strips suffix internally
             current_price = self._fetch_price(symbol)
             if current_price <= 0:
                 continue
@@ -718,16 +697,12 @@ class FuturesEngine:
                 continue
 
             # ── FIX-S3: Force Close ──────────────────────────
-            # hedge SHORTs: FUTURES_DCA_FC_* params
-            # independent SHORTs: SHORT_FC_* params
             if not is_hedge and not is_indep:
-                continue  # BEAR SHORT — FC არ ვრთავთ (TP-ს ელოდება)
+                continue
 
             if is_indep:
-                # INDEPENDENT SHORT — საკუთარი FC params
                 fc_reason = self._check_independent_short_fc(pos, current_price, avg_entry)
             else:
-                # DCA HEDGE SHORT — hedge FC params
                 fc_reason = self._check_hedge_force_close(pos, current_price, avg_entry)
 
             if fc_reason:
@@ -752,7 +727,7 @@ class FuturesEngine:
                     )
                 except Exception as _tg:
                     logger.warning(f"[FUTURES] FC_TG_FAIL | err={_tg}")
-                continue  # FC დასრულდა — შემდეგ position-ზე გადასვლა
+                continue
 
     def _check_hedge_force_close(
         self,
@@ -760,15 +735,7 @@ class FuturesEngine:
         current_price: float,
         avg_entry: float,
     ) -> Optional[str]:
-        """
-        Returns FC reason string ან None.
-
-        FC by time: opened_at → days_open >= dca_hedge_fc_max_days
-        FC by drawdown: current >= avg_entry × (1 + fc_drawdown_pct%)
-          SHORT-ისთვის ზევით მოძრაობა = ზარალი
-          FC drawdown % = (current - avg_entry) / avg_entry × 100
-        """
-        # ── FC by time ──────────────────────────────────────
+        """FC check for hedge SHORT positions."""
         if self.dca_hedge_fc_max_days > 0:
             opened_at_str = str(pos.get("opened_at", "") or "")
             if opened_at_str:
@@ -784,7 +751,6 @@ class FuturesEngine:
                 except Exception as _e:
                     logger.warning(f"[FUTURES] FC_TIME_PARSE_FAIL | err={_e}")
 
-        # ── FC by drawdown (SHORT: ზევით = ზარალი) ─────────
         if self.dca_hedge_fc_drawdown_pct > 0 and avg_entry > 0:
             upside_pct = (current_price - avg_entry) / avg_entry * 100.0
             if upside_pct >= self.dca_hedge_fc_drawdown_pct:
@@ -809,7 +775,7 @@ class FuturesEngine:
         open_shorts = _get_open_shorts()
         for pos in open_shorts:
             if int(pos.get("is_dca_hedge", 0) or 0):
-                continue  # hedge shorts — ცალკე მეთოდი
+                continue
             try:
                 symbol       = str(pos.get("symbol", ""))
                 pos_id       = int(pos.get("id", 0))
@@ -821,6 +787,7 @@ class FuturesEngine:
                 if add_on_count >= self.max_addons:
                     continue
 
+                # FIX-S7: _fetch_price strips suffix internally
                 current_price = self._fetch_price(symbol)
                 if current_price <= 0:
                     continue
@@ -873,6 +840,7 @@ class FuturesEngine:
                 if add_on_count < 1:
                     continue
 
+                # FIX-S7: _fetch_price strips suffix internally
                 current_price = self._fetch_price(symbol)
                 if current_price <= 0:
                     continue
@@ -912,11 +880,7 @@ class FuturesEngine:
     ) -> bool:
         """
         DCA L2/L3 boundary → SHORT hedge გახსნა.
-        trigger: add_on_count == max_add_ons
-
         FIX-S6: market_regime → dual TP tier
-          BULL: tp=0.7% (სწრაფი close LONG TP-სთან)
-          BEAR: tp=3.5% (სრული protection)
         """
         if not self.enabled:
             return False
@@ -924,7 +888,6 @@ class FuturesEngine:
         try:
             from execution.db.db import get_connection
             with get_connection() as conn:
-                # FIX-DUP: pos_id-level check (original)
                 row = conn.execute(
                     "SELECT id FROM futures_positions "
                     "WHERE dca_pos_id=? AND is_dca_hedge=1 AND status='OPEN'",
@@ -933,10 +896,6 @@ class FuturesEngine:
                 if row:
                     logger.debug(f"[HEDGE] ALREADY_OPEN | dca_pos_id={dca_pos_id} → skip")
                     return False
-                # FIX-DUP: symbol-level guard — ALLOW_DCA_DUPLICATE=true-ზე
-                # ერთი symbol-ი 2 L1 position-ს ქმნის (სხვადასხვა dca_pos_id).
-                # ორივე ADD-ON#5-ზე hedge-ს ხსნიდა → double capital drain.
-                # symbol-ზე უკვე ღია hedge? → skip (1 hedge per symbol max).
                 sym_row = conn.execute(
                     "SELECT id FROM futures_positions "
                     "WHERE symbol=? AND is_dca_hedge=1 AND status='OPEN'",
@@ -961,9 +920,8 @@ class FuturesEngine:
                 return False
         except Exception as e:
             logger.warning(f"[HEDGE] BALANCE_CHECK_FAIL | err={e} → blocking hedge (safe)")
-            return False  # balance check-ის შეცდომა → safe-side: hedge არ გაიხსნება
+            return False
 
-        # FIX-S6: regime-based TP
         _hedge_tp_pct = self._get_hedge_tp_pct(market_regime)
         tp_price = round(current_price * (1.0 - _hedge_tp_pct / 100.0), 6)
         qty      = round((hedge_quote * self.leverage) / current_price, 6)
@@ -1017,29 +975,12 @@ class FuturesEngine:
         return True
 
     # ────────────────────────────────────────────────────────
-    # PUBLIC: check_dca_hedge_addons  [FIX-S1 + FIX-S5]
+    # PUBLIC: check_dca_hedge_addons  [FIX-S1 + FIX-S5 + FIX-S7]
     # ────────────────────────────────────────────────────────
     def check_dca_hedge_addons(self) -> None:
         """
         DCA hedge SHORT CASCADE — ADD-ON შემოწმება.
-
-        FIX-S1: multi-level triggers indexed by add_on_count:
-          ADD-ON #1: entry × (1 + triggers[0]) = entry × 1.010  (+1.0%)
-          ADD-ON #2: entry × (1 + triggers[1]) = entry × 1.022  (+2.2%)
-          ADD-ON #3: entry × (1 + triggers[2]) = entry × 1.035  (+3.5%)
-          ADD-ON #4: entry × (1 + triggers[3]) = entry × 1.050  (+5.0%)
-          ADD-ON #5: entry × (1 + triggers[4]) = entry × 1.065  (+6.5%)
-
-        trigger reference: entry_price (ორიგინალი SHORT entry, ფიქსირებული)
-        ეს სწორია — DCA-ს მსგავსად: avg_entry-დან კი არა,
-        original entry-დან ვითვლით drawdown/bounce %-ს.
-
-        FIX-S5: per-position cooldown — BTC ADD-ON არ ბლოკავს ETH-ს.
-
-        edge cases:
-          - add_on_count >= len(triggers) → no trigger defined → skip
-          - add_on_count >= max_addons → exhausted → skip (L3 აიღებს)
-          - entry_price = 0 → skip (invalid pos)
+        FIX-S7: _fetch_price() strips suffix internally.
         """
         if not self.enabled:
             return
@@ -1069,11 +1010,9 @@ class FuturesEngine:
                 if entry_price <= 0:
                     continue
 
-                # ADD-ONs exhausted → L3 აიღებს
                 if add_on_count >= self.dca_hedge_max_addons:
                     continue
 
-                # trigger list bounds check
                 if add_on_count >= len(self.dca_hedge_addon_trigger_pcts):
                     logger.warning(
                         f"[HEDGE] ADDON_NO_TRIGGER | {symbol} "
@@ -1081,7 +1020,6 @@ class FuturesEngine:
                     )
                     continue
 
-                # FIX-S5: per-position cooldown
                 last_ts = self._hedge_addon_cooldown_map.get(pos_id, 0.0)
                 if (time.time() - last_ts) < self._hedge_addon_cooldown_s:
                     remaining = int(self._hedge_addon_cooldown_s - (time.time() - last_ts))
@@ -1091,11 +1029,11 @@ class FuturesEngine:
                     )
                     continue
 
+                # FIX-S7: _fetch_price strips suffix internally
                 current_price = self._fetch_price(symbol)
                 if current_price <= 0:
                     continue
 
-                # FIX-S1: indexed trigger
                 trigger_pct   = self.dca_hedge_addon_trigger_pcts[add_on_count]
                 trigger_price = entry_price * (1.0 + trigger_pct / 100.0)
 
@@ -1108,12 +1046,8 @@ class FuturesEngine:
                     )
                     continue
 
-                # ADD-ON — weighted avg გათვლა
                 total_quote = quote_in + self.dca_hedge_addon_quote
                 new_avg     = (avg_entry * quote_in + current_price * self.dca_hedge_addon_quote) / total_quote
-                # FIX-S6: hedge_tp_pct per-position (stored at open) — not global self.dca_hedge_tp_pct
-                # BULL-opened hedge: 0.7%, BEAR-opened hedge: 3.5%
-                # DEFAULT 3.5 for old rows that pre-date FIX-S6 (backward compat via column DEFAULT)
                 _pos_hedge_tp_pct = float(pos.get("hedge_tp_pct") or self.dca_hedge_tp_pct_bear)
                 new_tp      = round(new_avg * (1.0 - _pos_hedge_tp_pct / 100.0), 6)
                 new_qty     = round((total_quote * self.leverage) / new_avg, 6)
@@ -1139,7 +1073,6 @@ class FuturesEngine:
                     )
                     conn.commit()
 
-                # FIX-S5: per-position cooldown განახლება
                 self._hedge_addon_cooldown_map[pos_id] = time.time()
 
                 try:
@@ -1178,41 +1111,13 @@ class FuturesEngine:
                 logger.error(f"[HEDGE] ADDON_ERR | {pos.get('symbol')} err={e}")
 
     # ────────────────────────────────────────────────────────
-    # PUBLIC: check_dca_hedge_l3  [FIX-S4 — true LIFO]
+    # PUBLIC: check_dca_hedge_l3  [FIX-S4 + FIX-S7]
     # ────────────────────────────────────────────────────────
     def check_dca_hedge_l3(self) -> None:
         """
         DCA hedge L3 — ADD-ONs exhausted + BTC კვლავ ↑.
-
-        FIX-S4: TRUE LIFO (არა full position close):
-          ყველაზე იაფი SHORT unit = lowest entry_price (ყველაზე დიდი ზარალი)
-          unit sell proceeds → reinvest @ current (higher = better SHORT entry)
-          avg_short ↑, TP_short ↑
-
-        SHORT LIFO unit = cheapest buy (lowest entry_price ADD-ON):
-          ლოგიკა: ყველაზე დაბალი entry_price ADD-ON იყო ყველაზე ადრე,
-          BTC ეცა → ეს unit ყველაზე ძვირად გაიყიდება ახლა (ახლა BTC ამაღლდა).
-          wait — SHORT-ისთვის: ეგ unit -ს ყველაზე მეტი ზარალი აქვს
-          (entry LOW, exit HIGH = SHORT ზარალი).
-          სწორი LIFO: ყველაზე LOW entry ADD-ON → sell (realize loss) → reinvest HIGH.
-          new entry = HIGH → TP = HIGH × (1 - 3.5%) → TP ახლოვდება current-თან.
-
-        implementation:
-          1. DB-დან hedge unit-ების ADD-ON ჩანაწერები — ვერ ვინახავთ ცალ-ცალკე.
-             გამოსავალი: avg_entry_price-დან ვთვლით unit-ს.
-             LIFO unit: entry_price (ორიგინალი) — ყველაზე დაბალი ADD-ON ფასი.
-          2. unit qty = dca_hedge_quote / entry_price (initial unit)
-          3. proceeds = unit_qty × current_price × (1 - 0.001 fee)
-          4. reinvest proceeds @ current → new partial qty
-          5. remaining position = (total_qty - unit_qty) + new_partial_qty
-          6. new_avg = weighted average
-
-        edge case: თუ LIFO unit qty > total qty/2 →
-          reinvest-ი მთელი position-ის სიდიდეს ცვლის → cap at 50% of total_qty.
-
-        NOTE: ეს approximation-ია (exact per-unit DB tracking-ის გარეშე).
-        Production-grade დამატება: dca_hedge_orders ცხრილი (like dca_orders).
-        ახლა: initial unit LIFO — ყველაზე მარტივი და სწორი approximation.
+        FIX-S4: TRUE LIFO.
+        FIX-S7: _fetch_price() strips suffix internally.
         """
         if not self.enabled:
             return
@@ -1240,7 +1145,6 @@ class FuturesEngine:
                 pos_id       = int(pos.get("id", 0))
                 entry_price  = float(pos.get("entry_price", 0.0))
                 add_on_count = int(pos.get("add_on_count", 0) or 0)
-                dca_pos_id   = int(pos.get("dca_pos_id", 0) or 0)
                 total_qty    = float(pos.get("qty", 0.0))
                 total_quote  = float(pos.get("quote_in", 0.0))
                 avg_entry    = float(pos.get("avg_entry_price", 0.0) or entry_price)
@@ -1251,13 +1155,11 @@ class FuturesEngine:
                 if entry_price <= 0 or total_qty <= 0:
                     continue
 
+                # FIX-S7: _fetch_price strips suffix internally
                 current_price = self._fetch_price(symbol)
                 if current_price <= 0:
                     continue
 
-                # L3 trigger: avg_entry-დან (entry_price-ის მაგივრად)
-                # avg_entry = weighted average after ADD-ONs
-                # trigger reference: avg_entry × (1 + L3_TRIGGER_PCT%)
                 l3_trigger = avg_entry * (1.0 + self.dca_hedge_l3_trigger_pct / 100.0)
                 if current_price < l3_trigger:
                     logger.debug(
@@ -1273,22 +1175,17 @@ class FuturesEngine:
                     f"trigger={l3_trigger:.2f} → LIFO rotation"
                 )
 
-                # FIX-S4: TRUE LIFO
-                # LIFO unit = initial hedge (entry_price = ყველაზე დაბალი = ყველაზე "ძვირი" ზარალი)
-                # unit quote = dca_hedge_quote (initial quote)
-                lifo_entry   = entry_price                              # ყველაზე დაბალი entry
-                lifo_quote   = self.dca_hedge_quote                     # initial hedge quote
+                lifo_entry   = entry_price
+                lifo_quote   = self.dca_hedge_quote
                 lifo_qty     = round(lifo_quote * self.leverage / lifo_entry, 6)
 
-                # safety cap: max 50% of total position
                 if lifo_qty > total_qty * 0.5:
                     lifo_qty = round(total_qty * 0.5, 6)
 
-                # SHORT LIFO sell (realized loss since lifo_entry < current)
                 sell_proceeds  = lifo_qty * current_price
-                fee            = sell_proceeds * 0.001   # 0.1% Binance fee
+                fee            = sell_proceeds * 0.001
                 net_proceeds   = sell_proceeds - fee
-                realized_pnl   = (lifo_entry - current_price) * lifo_qty - fee  # negative
+                realized_pnl   = (lifo_entry - current_price) * lifo_qty - fee
 
                 logger.warning(
                     f"[HEDGE] L3_LIFO_SELL | {symbol} "
@@ -1296,27 +1193,19 @@ class FuturesEngine:
                     f"qty={lifo_qty:.6f} pnl={realized_pnl:+.4f}"
                 )
 
-                # reinvest net_proceeds @ current_price (ახლა ძვირი = SHORT-ისთვის უკეთესი)
                 reinvest_qty  = round(net_proceeds * self.leverage / current_price, 6)
 
-                # new position avg:
-                # remaining = total - lifo_qty (old units at various entries)
-                # new avg = weighted:
-                # remaining_value = total_qty × avg_entry - lifo_qty × lifo_entry
                 remaining_qty   = total_qty - lifo_qty
                 total_value     = total_qty * avg_entry
-                remaining_value = total_value - lifo_qty * lifo_entry  # ზუსტი LIFO
+                remaining_value = total_value - lifo_qty * lifo_entry
 
                 new_qty   = remaining_qty + reinvest_qty
                 new_value = remaining_value + reinvest_qty * current_price
                 new_avg   = round(new_value / new_qty, 6) if new_qty > 0 else avg_entry
 
-                # TP = new_avg × (1 - tp_pct%)
-                # FIX-S6: hedge_tp_pct per-position (stored at open) — not global
                 _pos_hedge_tp_pct_l3 = float(pos.get("hedge_tp_pct") or self.dca_hedge_tp_pct_bear)
                 new_tp = round(new_avg * (1.0 - _pos_hedge_tp_pct_l3 / 100.0), 6)
 
-                # total_quote update
                 new_total_quote = total_quote - lifo_quote + net_proceeds
 
                 logger.warning(
@@ -1326,7 +1215,6 @@ class FuturesEngine:
                     f"new_tp={new_tp:.4f}"
                 )
 
-                # DB განახლება — position in-place (არ ვხურავთ, ვასწორებთ)
                 from execution.db.db import get_connection
                 with get_connection() as conn:
                     conn.execute(
@@ -1377,21 +1265,13 @@ class FuturesEngine:
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: close_dca_hedge_for_position  [BUG-1 FIX]
-    # DCA TP / FORCE_CLOSE → hedge SHORT-ის დახურვა
     # ────────────────────────────────────────────────────────
     def close_dca_hedge_for_position(
         self,
         dca_pos_id: int,
         reason: str = "DCA_CLOSED",
     ) -> None:
-        """
-        DCA position დაიხურა → შესაბამისი hedge SHORT-ების დახურვა.
-
-        edge cases:
-          - hedge ჯერ არ გახსნილა → empty fetch → no-op ✓
-          - hedge უკვე დაიხურა TP-ზე → status!='OPEN' → no-op ✓
-          - L3 rotation-ის შემდეგ position in-place განახლდა (არ დაიხურა) → ✓
-        """
+        """DCA position დაიხურა → შესაბამისი hedge SHORT-ების დახურვა."""
         if not self.enabled:
             return
 
@@ -1432,12 +1312,7 @@ class FuturesEngine:
         current_price: float,
         avg_entry: float,
     ) -> Optional[str]:
-        """
-        FC check for independent SHORT DCA positions.
-        SHORT-ისთვის ზევით მოძრაობა = ზარალი.
-        FC by time: SHORT_FC_MAX_DAYS
-        FC by drawdown: (current - avg) / avg >= SHORT_FC_DRAWDOWN_PCT%
-        """
+        """FC check for independent SHORT DCA positions."""
         if self.short_fc_max_days > 0:
             opened_at_str = str(pos.get("opened_at", "") or "")
             if opened_at_str:
@@ -1460,35 +1335,19 @@ class FuturesEngine:
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: open_independent_short
-    # LONG L1 გახსნის შემდეგ — price-level trigger-ზე SHORT
     # ────────────────────────────────────────────────────────
     def open_independent_short(
         self,
         symbol: str,
         long_entry_price: float,
     ) -> bool:
-        """
-        Independent SHORT DCA — LONG L1-ის გახსნის შემდეგ გამოიძახება.
-
-        trigger: current_price <= long_entry_price * (1 - SHORT_L1_TRIGGER_PCT%)
-        SHORT L1 opens at: long_entry_price * 0.984  (-1.6%)
-
-        ეს არ არის hedge — LONG-ის სიცოცხლეს არ მიყვება.
-        საკუთარი TP + FC lifecycle.
-
-        edge cases:
-          - SHORT_DCA_ENABLED=false → skip
-          - already open for this symbol → skip (duplicate guard)
-          - current_price > trigger → skip (not yet)
-          - long_entry_price=0 → skip (invalid)
-        """
+        """Independent SHORT DCA — LONG L1-ის გახსნის შემდეგ."""
         if not self.enabled or not self.short_dca_enabled:
             return False
 
         if long_entry_price <= 0:
             return False
 
-        # duplicate guard — symbol-ზე უკვე ღია independent SHORT?
         try:
             from execution.db.db import get_connection
             with get_connection() as conn:
@@ -1504,7 +1363,7 @@ class FuturesEngine:
             logger.warning(f"[SHORT_DCA] CHECK_FAIL | {symbol} err={e}")
             return False
 
-        # price check — trigger not yet reached?
+        # FIX-S7: _fetch_price strips suffix internally
         current_price = self._fetch_price(symbol)
         if current_price <= 0:
             return False
@@ -1518,8 +1377,7 @@ class FuturesEngine:
             )
             return False
 
-        # balance check — same pattern as hedge
-        short_quote = self.short_addon_quote  # L1 = same size as ADD-ON ($25)
+        short_quote = self.short_addon_quote
         try:
             from execution.dca_risk_manager import get_risk_manager as _rm
             bal_ok, bal_reason = _rm().can_l3_operation(short_quote)
@@ -1530,7 +1388,6 @@ class FuturesEngine:
             logger.warning(f"[SHORT_DCA] BALANCE_CHECK_FAIL | {symbol} err={e} → blocking (safe)")
             return False
 
-        # TP = entry * (1 - short_tp_pct%)
         tp_price = round(current_price * (1.0 - self.short_tp_pct / 100.0), 6)
         qty      = round((short_quote * self.leverage) / current_price, 6)
         sig_id   = f"SINDEP-{symbol.replace('/', '')}-{uuid.uuid4().hex[:8]}"
@@ -1598,20 +1455,9 @@ class FuturesEngine:
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: check_independent_short_open
-    # ყოველ loop-ზე — ყველა LONG position-ზე SHORT trigger check
     # ────────────────────────────────────────────────────────
     def check_independent_short_open(self) -> None:
-        """
-        ყოველ main loop iteration-ზე გამოიძახება.
-        ყოველ ღია LONG DCA position-ზე შეამოწმებს:
-          - SHORT უკვე ღიაა? → skip
-          - current_price <= long_entry * (1 - 1.6%)? → open_independent_short()
-
-        edge cases:
-          - SHORT_DCA_ENABLED=false → skip
-          - LONG position-ი არ არის → skip (nothing to mirror)
-          - per-symbol: 1 SHORT max (duplicate guard in open_independent_short)
-        """
+        """ყოველ loop-ზე — ყველა LONG position-ზე SHORT trigger check."""
         if not self.enabled or not self.short_dca_enabled:
             return
 
@@ -1625,17 +1471,11 @@ class FuturesEngine:
         if not long_positions:
             return
 
-        import re as _re_sym
+        import re as _re_ind
         for pos in long_positions:
             try:
                 sym = str(pos.get("symbol", ""))
-                # base symbol only (no _L2/_L3 suffix)
-                exchange_sym = _re_sym.sub(r'_L\d+$', '', sym)
-                # FIX BUG-1 (SHORT_DCA): initial_entry_price ONLY — avg_entry_price
-                # ცვლილდება ADD-ON-ებთან ერთად და trigger price-ს ცვლიდა.
-                # spec: "long_ref_price ფიქსირდება ერთხელ" = LONG-ის initial_entry_price.
-                # 0.0 falsy-ია → or-chain-ი avg-ზე ვარდებოდა (bug).
-                # ახლა: None ან 0.0 → skip (safe, არ fallback ცვალებად ფასზე).
+                exchange_sym = _re_ind.sub(r'_L\d+$', '', sym)
                 _ie = pos.get("initial_entry_price")
                 long_entry = float(_ie) if _ie is not None else 0.0
                 if long_entry <= 0:
@@ -1646,29 +1486,9 @@ class FuturesEngine:
 
     # ────────────────────────────────────────────────────────
     # PUBLIC: check_independent_short_addons
-    # ვარდნაზე ADD-ONs — LONG ADD-ON-ების სარკე
     # ────────────────────────────────────────────────────────
     def check_independent_short_addons(self) -> None:
-        """
-        ყოველ loop-ზე — ღია independent SHORT-ებზე ADD-ON შემოწმება.
-
-        trigger: current_price <= entry_price * (1 - addon_trigger_pcts[add_on_count])
-        trigger reference: entry_price (SHORT L1 original entry — ფიქსირებული)
-
-        ADD-ON direction: ვარდნაზე (ქვევით) — LONG-ის სარკე
-          SHORT A1: entry * (1 - 1.0%) = -1.0% from SHORT L1
-          SHORT A2: entry * (1 - 2.2%) = -2.2% from SHORT L1
-          SHORT A3: entry * (1 - 3.5%) = -3.5% from SHORT L1
-
-        avg update: weighted average (avg drops as we add lower)
-        TP update: new_avg * (1 - short_tp_pct%) — TP ახლოვდება bounce-ზე
-
-        edge cases:
-          - add_on_count >= max_addons → exhausted, skip
-          - add_on_count >= len(triggers) → no trigger defined, skip
-          - current_price > trigger → not yet, skip
-          - per-position cooldown 300s spam guard
-        """
+        """ყოველ loop-ზე — ღია independent SHORT-ებზე ADD-ON შემოწმება."""
         if not self.enabled or not self.short_dca_enabled:
             return
 
@@ -1708,18 +1528,15 @@ class FuturesEngine:
                     )
                     continue
 
-                # per-position cooldown — DB-based (restart-safe, BUG-3 FIX)
-                # in-memory map Render restart-ზე იბინდება → double ADD-ON-ის რისკი.
-                # ახლა: last_short_addon_ts column futures_positions-ში.
                 last_ts = float(pos.get("last_short_addon_ts") or 0.0)
                 if (time.time() - last_ts) < self._short_addon_cooldown_s:
                     continue
 
+                # FIX-S7: _fetch_price strips suffix internally
                 current_price = self._fetch_price(symbol)
                 if current_price <= 0:
                     continue
 
-                # trigger: ქვევით (SHORT ADD-ON on DROP)
                 trigger_pct   = self.short_addon_trigger_pcts[add_on_count]
                 trigger_price = entry_price * (1.0 - trigger_pct / 100.0)
 
@@ -1731,7 +1548,6 @@ class FuturesEngine:
                     )
                     continue
 
-                # balance check
                 try:
                     from execution.dca_risk_manager import get_risk_manager as _rm
                     bal_ok, bal_reason = _rm().can_l3_operation(self.short_addon_quote)
@@ -1742,7 +1558,6 @@ class FuturesEngine:
                     logger.warning(f"[SHORT_DCA] ADDON_BALANCE_FAIL | {symbol} err={_be} → skip")
                     continue
 
-                # ADD-ON — weighted avg (ვარდნაზე avg ეცემა)
                 total_quote = quote_in + self.short_addon_quote
                 new_avg     = (avg_entry * quote_in + current_price * self.short_addon_quote) / total_quote
                 new_tp      = round(new_avg * (1.0 - self.short_tp_pct / 100.0), 6)
@@ -1771,7 +1586,6 @@ class FuturesEngine:
                          _now_ts, pos_id)
                     )
                     conn.commit()
-                # in-memory map also updated (fast path for same-session rapid checks)
                 self._short_addon_cooldown_map[pos_id] = _now_ts
 
                 try:
@@ -1824,7 +1638,6 @@ class FuturesEngine:
             "symbols":     [p.get("symbol") for p in open_shorts],
         }
 
-
     # ════════════════════════════════════════════════════════════
     # GENIUS MIRROR ENGINE — PUBLIC API
     # ════════════════════════════════════════════════════════════
@@ -1835,21 +1648,10 @@ class FuturesEngine:
         long_l1_price: float,
         long_pos_id: int,
     ) -> bool:
-        """
-        GENIUS MIRROR ENGINE — SHORT გახსნა L2/L3 midpoint-ზე.
-
-        trigger: current_price <= long_l1_price × (1 - mirror_trigger_pct%)
-        entry:   ≈ -8.59% LONG L1-დან (ADD-ON#4 და #5 შუა)
-
-        DB flags:
-          is_mirror_engine=1
-          mirror_direction='DOWN'   ← ველოდები ვარდნის გაგრძელებას
-          mirror_long_ref_price=long_l1_price
-        """
+        """GENIUS MIRROR ENGINE — SHORT გახსნა L2/L3 midpoint-ზე."""
         if not self.enabled or not self.mirror_enabled:
             return False
 
-        # duplicate guard — 1 MIRROR position per symbol
         try:
             from execution.db.db import get_connection
             with get_connection() as conn:
@@ -1865,6 +1667,7 @@ class FuturesEngine:
             logger.warning(f"[MIRROR] DUP_CHECK_FAIL | {symbol} err={e}")
             return False
 
+        # FIX-S7: _fetch_price strips suffix internally
         current_price = self._fetch_price(symbol)
         if current_price <= 0:
             return False
@@ -1936,21 +1739,7 @@ class FuturesEngine:
             return False
 
     def check_mirror_addons(self) -> None:
-        """
-        GENIUS MIRROR ENGINE — ADD-ON check ყოველ 120s-ზე.
-
-        direction=DOWN: BTC კვლავ ეცემა → ADD-ON ქვევით
-          trigger: entry_price × (1 - trigger_pcts[n]%)
-          avg ↓ → TP ↓ → bounce ნაკლები სჭირდება
-
-        direction=UP: BTC bounce-ს იწყებს → ADD-ON ზევით
-          trigger: entry_price × (1 + trigger_pcts[n]%)
-          avg_short ↑ → TP ახლოვდება
-
-        direction switch:
-          DOWN→UP: BTC TP-ს გადასცდა ქვევით (bounce დაიწყო)
-          UP→DOWN: BTC კვლავ ეცემა bounce-ის შემდეგ
-        """
+        """GENIUS MIRROR ENGINE — ADD-ON check ყოველ 120s-ზე."""
         if not self.enabled or not self.mirror_enabled:
             return
 
@@ -1981,20 +1770,17 @@ class FuturesEngine:
             addons_up     = int(pos.get("mirror_addons_up")   or 0)
             last_addon_ts = float(pos.get("last_mirror_addon_ts") or 0)
 
-            # cooldown check
             now_ts = time.time()
             if now_ts - last_addon_ts < self._mirror_addon_cooldown_s:
                 continue
 
+            # FIX-S7: _fetch_price strips suffix internally
             current_price = self._fetch_price(symbol)
             if current_price <= 0:
                 continue
 
-            # ── direction=DOWN: ADD-ON ქვევით ──────────────────
             if direction == "DOWN":
                 if addons_down >= self.mirror_max_addons_down:
-                    # max DOWN ADD-ONs ამოიწურა →
-                    # TP-ს ვერ ვჭრით ქვევით → direction UP-ზე გადავდივართ
                     logger.info(
                         f"[MIRROR] DOWN_EXHAUSTED | {symbol} "
                         f"addons_down={addons_down}/{self.mirror_max_addons_down} "
@@ -2024,7 +1810,6 @@ class FuturesEngine:
                     )
                     continue
 
-                # ADD-ON ქვევით
                 addon_qty  = round(
                     (self.mirror_addon_quote * self.mirror_leverage) / current_price, 6
                 )
@@ -2071,7 +1856,6 @@ class FuturesEngine:
                 except Exception as e:
                     logger.error(f"[MIRROR] ADDON_DOWN_FAIL | {symbol} err={e}")
 
-            # ── direction=UP: ADD-ON ზევით (bounce) ────────────
             elif direction == "UP":
                 if addons_up >= self.mirror_max_addons_up:
                     logger.info(
@@ -2092,7 +1876,6 @@ class FuturesEngine:
                     )
                     continue
 
-                # ADD-ON ზევით — SHORT avg ამაღლდება
                 addon_qty  = round(
                     (self.mirror_addon_quote * self.mirror_leverage) / current_price, 6
                 )
@@ -2140,14 +1923,7 @@ class FuturesEngine:
                     logger.error(f"[MIRROR] ADDON_UP_FAIL | {symbol} err={e}")
 
     def check_mirror_tp_sl(self) -> None:
-        """
-        GENIUS MIRROR ENGINE — TP + FC check ყოველ 120s-ზე.
-
-        TP:  current_price <= tp_price → CLOSE (SHORT მოგება)
-        FC:  (current_price - avg_entry) / avg_entry >= mirror_fc_drawdown_pct%
-             → CLOSE (BTC ზევით = SHORT ზარალი)
-        FC by time: გაუქმებულია — GENIUS MIRROR ENGINE design decision
-        """
+        """GENIUS MIRROR ENGINE — TP + FC check ყოველ 120s-ზე."""
         if not self.enabled or not self.mirror_enabled:
             return
 
@@ -2174,11 +1950,11 @@ class FuturesEngine:
             qty       = float(pos["qty"]              or 0)
             quote_in  = float(pos["quote_in"]         or 0)
 
+            # FIX-S7: _fetch_price strips suffix internally
             current_price = self._fetch_price(symbol)
             if current_price <= 0:
                 continue
 
-            # ── TP check ────────────────────────────────────────
             if tp_price > 0 and current_price <= tp_price:
                 pnl = round((avg_entry - current_price) * qty * (1 - 0.001), 4)
                 pnl_pct = round((avg_entry - current_price) / avg_entry * 100, 4)
@@ -2186,7 +1962,6 @@ class FuturesEngine:
                                    qty, quote_in, pnl, pnl_pct, "TP")
                 continue
 
-            # ── FC check (drawdown only — time გაუქმებულია) ────
             if avg_entry > 0:
                 upside_pct = (current_price - avg_entry) / avg_entry * 100.0
                 if upside_pct >= self.mirror_fc_drawdown_pct:
@@ -2258,13 +2033,7 @@ class FuturesEngine:
             logger.error(f"[MIRROR] CLOSE_FAIL | {symbol} id={pos_id} err={e}")
 
     def check_mirror_engine_open(self) -> None:
-        """
-        GENIUS MIRROR ENGINE — trigger check ყოველ 120s-ზე.
-
-        ყოველ OPEN LONG position-ზე:
-          trigger_price = initial_entry_price × (1 - mirror_trigger_pct%)
-          current_price <= trigger_price → open_mirror_short()
-        """
+        """GENIUS MIRROR ENGINE — trigger check ყოველ 120s-ზე."""
         if not self.enabled or not self.mirror_enabled:
             return
 
@@ -2277,14 +2046,13 @@ class FuturesEngine:
 
         for pos in long_positions:
             symbol      = str(pos.get("symbol", ""))
-            import re as _re
-            exchange_sym = _re.sub(r'_L\d+$', '', symbol)
+            import re as _re_mir
+            exchange_sym = _re_mir.sub(r'_L\d+$', '', symbol)
 
             if exchange_sym not in self.symbols:
                 continue
 
-            # მხოლოდ L1 positions (initial entry — no _L2/_L3 suffix)
-            if _re.search(r'_L\d+$', symbol):
+            if _re_mir.search(r'_L\d+$', symbol):
                 continue
 
             long_l1_price = float(pos.get("initial_entry_price") or 0)
