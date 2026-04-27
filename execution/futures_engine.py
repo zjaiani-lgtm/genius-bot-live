@@ -47,6 +47,18 @@
 #            caller (check_tp_sl, _close_short, check_dca_hedge_addons,
 #            check_dca_hedge_l3, check_independent_short_addons,
 #            check_mirror_addons, check_mirror_tp_sl) ავტომატურად დაფარულია.
+#   FIX-S8: check_independent_short_open() + check_mirror_engine_open() — LP filter
+#            პრობლემა: regex r'_L\d+\$' → "BTC/USDT_LP" ვერ strip-ავს (_LP != _L\d+)
+#            შედეგი: SHORT DCA და MIRROR ENGINE LP position-ებზე იხსნებოდა
+#            (Symbol: BTC/USDT_LP) — Telegram-შიც ჩანდა
+#            გამოსწორება: ორი ფუნქცია, 4 ადგილი:
+#              check_independent_short_open():
+#                regex: r'_L\d+\$' → r'(_L\d+|_LP)\$'
+#                + L1 filter: _re_ind.search(r'(_L\d+|_LP)\$', sym) → continue
+#              check_mirror_engine_open():
+#                regex: r'_L\d+\$' → r'(_L\d+|_LP)\$'
+#                L1 filter: r'_L\d+\$' → r'(_L\d+|_LP)\$'
+#            SHORT/MIRROR მხოლოდ L1 positions-ზე trigger-დება
 # ============================================================
 from __future__ import annotations
 
@@ -1475,7 +1487,13 @@ class FuturesEngine:
         for pos in long_positions:
             try:
                 sym = str(pos.get("symbol", ""))
-                exchange_sym = _re_ind.sub(r'_L\d+$', '', sym)
+                # FIX: (_L\d+|_LP)$ — LP suffix-იც strip-ს
+                # "BTC/USDT_LP" → "BTC/USDT" (ადრე: "BTC/USDT_LP" → SHORT იხსნებოდა LP-ზე)
+                exchange_sym = _re_ind.sub(r'(_L\d+|_LP)$', '', sym)
+                # L1 only: _L2, _L3, _LP suffix-იანი positions-ი skip
+                # SHORT მხოლოდ L1 position-ზე უნდა გაიხსნას
+                if _re_ind.search(r'(_L\d+|_LP)$', sym):
+                    continue
                 _ie = pos.get("initial_entry_price")
                 long_entry = float(_ie) if _ie is not None else 0.0
                 if long_entry <= 0:
@@ -2047,12 +2065,16 @@ class FuturesEngine:
         for pos in long_positions:
             symbol      = str(pos.get("symbol", ""))
             import re as _re_mir
-            exchange_sym = _re_mir.sub(r'_L\d+$', '', symbol)
+            # FIX: (_L\d+|_LP)$ — LP suffix-იც strip-ს
+            # "BTC/USDT_LP" → "BTC/USDT" (ადრე: "BTC/USDT_LP" → MIRROR იხსნებოდა LP-ზე)
+            exchange_sym = _re_mir.sub(r'(_L\d+|_LP)$', '', symbol)
 
             if exchange_sym not in self.symbols:
                 continue
 
-            if _re_mir.search(r'_L\d+$', symbol):
+            # FIX: (_L\d+|_LP)$ — L1 only filter
+            # LP positions (_LP) skip — MIRROR მხოლოდ L1-ზე უნდა გაიხსნას
+            if _re_mir.search(r'(_L\d+|_LP)$', symbol):
                 continue
 
             long_l1_price = float(pos.get("initial_entry_price") or 0)
