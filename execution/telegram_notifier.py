@@ -346,7 +346,7 @@ def notify_performance_snapshot(stats: Dict[str, Any]) -> None:
         )
 
     msg = (
-        f"📊 <b>GENIUS-ALGO-BOT-DEMO PERFORMANCE</b>\n\n"
+        f"📊 <b>GENIUS-PHANTOM-BOT-DEMO PERFORMANCE</b>\n\n"
         f"✅ <b>Closed trades:</b> <code>{int(stats.get('closed_trades', 0))}</code>\n"
         f"🏆 <b>Wins:</b> <code>{int(stats.get('wins', 0))}</code>\n"
         f"❌ <b>Losses:</b> <code>{int(stats.get('losses', 0))}</code>\n"
@@ -364,7 +364,7 @@ def notify_performance_snapshot(stats: Dict[str, Any]) -> None:
 
 def notify_daily_close_summary(daily_stats: Dict[str, Any]) -> None:
     msg = (
-        f"🌙 <b>DAILY DCA CLOSE SUMMARY</b>\n\n"
+        f"🌙 <b>DAILY Phantom CLOSE SUMMARY</b>\n\n"
         f"📅 <b>Date:</b> <code>{_escape_html(daily_stats.get('date', ''))}</code>\n"
         f"🕛 <b>Window:</b> <code>00:00 - 23:59 Asia/Tbilisi</code>\n\n"
         f"✅ <b>Closed today:</b> <code>{int(daily_stats.get('closed_trades', 0))}</code>\n"
@@ -395,10 +395,10 @@ def notify_dca_position_opened(
     max_add_ons: int = 3,
     max_capital: float = 40.0,
 ) -> None:
-    """ახალი DCA position გახსნილია."""
+    """ახალი Phantom position გახსნილია."""
     tp_pct_f = float(tp_pct)
     msg = (
-        f"📈 <b>DCA POSITION OPENED</b>\n\n"
+        f"📈 <b>Phantom POSITION OPENED</b>\n\n"
         f"🪙 <b>Symbol:</b> <code>{_escape_html(symbol)}</code>\n"
         f"💰 <b>Entry:</b> <code>{_fmt_price(entry_price)}</code> USDT\n"
         f"📦 <b>Size:</b> <code>{_fmt_plain(quote_spent, 2)}</code> USDT\n"
@@ -422,9 +422,9 @@ def notify_dca_addon(
     drawdown_pct: float = 0.0,
     recovery_score: int = 0,
 ) -> None:
-    """DCA add-on order გახსნილია."""
+    """Phantom add-on order გახსნილია."""
     msg = (
-        f"➕ <b>DCA ADD-ON #{addon_number}</b>\n\n"
+        f"➕ <b>Phantom ADD-ON #{addon_number}</b>\n\n"
         f"🪙 <b>Symbol:</b> <code>{_escape_html(symbol)}</code>\n"
         f"📉 <b>Drawdown:</b> <code>{_fmt_pct(-drawdown_pct)}</code> from avg\n"
         f"💰 <b>Add-on price:</b> <code>{_fmt_price(addon_price)}</code>\n"
@@ -450,17 +450,17 @@ def notify_dca_closed(
     add_on_count: int,
     stats: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """DCA position დახურულია."""
+    """Phantom position დახურულია."""
     outcome_upper = str(outcome or "").upper()
 
     if outcome_upper == "TP":
-        title = "✅ <b>DCA POSITION CLOSED — TP HIT</b>"
+        title = "✅ <b>Phantom POSITION CLOSED — TP HIT</b>"
     elif outcome_upper == "SL":
-        title = "🛑 <b>DCA POSITION CLOSED — SL HIT</b>"
+        title = "🛑 <b>Phantom POSITION CLOSED — SL HIT</b>"
     elif outcome_upper == "FORCE_CLOSE":
-        title = "⚠️ <b>DCA POSITION FORCE CLOSED</b>"
+        title = "⚠️ <b>Phantom POSITION FORCE CLOSED</b>"
     else:
-        title = f"📦 <b>DCA POSITION CLOSED — {_escape_html(outcome_upper)}</b>"
+        title = f"📦 <b>Phantom POSITION CLOSED — {_escape_html(outcome_upper)}</b>"
 
     msg = (
         f"{title}\n\n"
@@ -495,7 +495,7 @@ def notify_dca_breakeven(
 ) -> None:
     """Breakeven protection ამოქმედდა."""
     msg = (
-        f"🔒 <b>DCA BREAKEVEN ACTIVATED</b>\n\n"
+        f"🔒 <b>Phantom BREAKEVEN ACTIVATED</b>\n\n"
         f"🪙 <b>Symbol:</b> <code>{_escape_html(symbol)}</code>\n"
         f"📊 <b>Avg entry:</b> <code>{_fmt_price(avg_entry_price)}</code>\n"
         f"✅ <b>Position protected at breakeven</b>\n"
@@ -557,7 +557,7 @@ def notify_heartbeat(
     mem_str = f" | 💾 <code>{memory_mb:.0f}MB</code>" if memory_mb > 0 else ""
 
     msg = (
-        f"💚 <b>GENIUS ALGO BOT DEMO</b>\n\n"
+        f"💚 <b>GENIUS Phantom BOT DEMO</b>\n\n"
         f"📂 <b>Open:</b> <code>{open_count}</code> | 💰 <code>{_fmt_plain(open_capital, 2)} USDT</code>\n"
         f"₿ BTC <code>{_fmt_price(btc, 0)}</code> | "
         f"Ξ ETH <code>{_fmt_price(eth, 0)}</code> | "
@@ -758,7 +758,7 @@ def notify_market_regime_change(
     elif new_regime == "BULL":
         action = "✅ L1 positions ALLOWED | SHORT-ები დაიხურება"
     else:
-        action = "➡️ DCA ჩვეულებრივ გრძელდება"
+        action = "➡️ Phantom ჩვეულებრივ გრძელდება"
 
     msg = (
         f"📊 <b>MARKET REGIME CHANGE</b>\n\n"
