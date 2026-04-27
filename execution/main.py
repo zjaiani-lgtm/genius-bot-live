@@ -58,6 +58,15 @@ from typing import Optional, Dict, Any
 #     L1 avg_entry_price reference, ზუსტი sym match (sym==base_sym)
 #     double-open guard: get_open_dca_position_for_symbol(lp_sym)
 #     backward compat: signal-path LP call ინარჩუნება
+#
+# FIX #22 — LAYER2 trigger: 24h HIGH-based → L1-based
+#   პრობლემა: 24h HIGH spike (ღამის pump/შეცდომა) → HIGH=8k, L1=5k
+#             L2 trigger = 8k × 0.985 = 6.5k → L1-ზე მაღლა!
+#             L2 არასოდეს გაიხსნება (ბაზარი ვარდნისასაც კი)
+#   გამოსწორება: L2 trigger = L1 avg_entry_price × (1 - LAYER2_DROP_PCT/100)
+#     L1 open AND price < L1 × 0.985 → L2 გახსნა
+#     L1 არ არის? → L2 skip (L2 L1-ის გარეშე აზრი არ აქვს)
+#     drop_from_high → drop_from_l1 (4 ადგილი LAYER2 ფუნქციაში)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1501,29 +1510,38 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
             if current_price <= 0:
                 continue
 
+            # FIX #22: L1-based trigger (ნაცვლად 24h HIGH-based)
+            # პრობლემა: 24h HIGH spike → L2 trigger L1-ზე მაღლა →
+            #           L2 არასოდეს trigger-ს (edge case bug)
+            # გამოსწორება: L1 avg_entry_price-დან LAYER2_DROP_PCT% ქვემოთ
+            # L1 არ არის? → skip (L2 L1-ის გარეშე აზრი არ აქვს)
             try:
-                ticker = engine.price_feed.fetch_ticker(sym)
-                high_24h = float(
-                    ticker.get("high") or
-                    ticker.get("info", {}).get("highPrice") or 0.0
+                from execution.db.repository import (
+                    get_open_dca_position_for_symbol as _get_l1_for_l2,
                 )
+                _l1_pos = _get_l1_for_l2(sym)
             except Exception:
-                high_24h = 0.0
+                _l1_pos = None
 
-            if high_24h <= 0:
-                logger.debug(f"[LAYER2] NO_HIGH | {sym} → skip")
+            if not _l1_pos:
+                logger.debug(f"[LAYER2] NO_L1 | {sym} → L2 skip (no L1 open)")
                 continue
 
-            drop_from_high = (high_24h - current_price) / high_24h * 100.0
+            l1_entry = float(_l1_pos.get("avg_entry_price") or 0.0)
+            if l1_entry <= 0:
+                logger.debug(f"[LAYER2] INVALID_L1_ENTRY | {sym} l1_entry={l1_entry} → skip")
+                continue
+
+            drop_from_l1 = (l1_entry - current_price) / l1_entry * 100.0
 
             logger.info(
                 f"[LAYER2] CHECK | {sym} price={current_price:.4f} "
-                f"high24h={high_24h:.4f} drop={drop_from_high:.2f}% "
+                f"l1_entry={l1_entry:.4f} drop_from_l1={drop_from_l1:.2f}% "
                 f"trigger={drop_pct:.1f}% mode={mode}"
             )
 
-            if drop_from_high < drop_pct:
-                logger.debug(f"[LAYER2] NO_CRASH | {sym} drop={drop_from_high:.2f}% < {drop_pct:.1f}%")
+            if drop_from_l1 < drop_pct:
+                logger.debug(f"[LAYER2] NO_CRASH | {sym} drop={drop_from_l1:.2f}% < {drop_pct:.1f}%")
                 continue
 
             sym_l2 = f"{sym}_L2"
@@ -1542,7 +1560,7 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
 
             logger.warning(
                 f"[LAYER2] CRASH_DETECTED | {sym} "
-                f"drop={drop_from_high:.2f}% >= {drop_pct:.1f}% → opening Layer 2 [{mode}]"
+                f"drop_from_l1={drop_from_l1:.2f}% >= {drop_pct:.1f}% → opening Layer 2 [{mode}]"
             )
 
             if is_live:
@@ -1580,7 +1598,7 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 avg_entry_after=buy_price,
                 tp_after=tp_price,
                 sl_after=0.0,
-                trigger_drawdown_pct=drop_from_high,
+                trigger_drawdown_pct=drop_from_l1,
                 exchange_order_id=str(buy.get("id", "")),
             )
 
@@ -1599,7 +1617,7 @@ def _check_and_open_layer2(engine, tp_sl_mgr) -> None:
                 log_event(
                     "LAYER2_OPENED",
                     f"sym={sym_l2} entry={buy_price:.4f} "
-                    f"tp={tp_price:.4f} drop={drop_from_high:.2f}% "
+                    f"tp={tp_price:.4f} drop_from_l1={drop_from_l1:.2f}% "
                     f"pos_id={pos_id} mode={mode}"
                 )
             except Exception:
